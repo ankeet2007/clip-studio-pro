@@ -1,0 +1,283 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: Clip Studio API specification
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: clips
+    description: Clip processing operations
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      description: Returns server health status
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /clips:
+    get:
+      operationId: listClips
+      tags: [clips]
+      summary: List all clips
+      description: Returns all clip jobs, newest first
+      responses:
+        "200":
+          description: List of clips
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Clip"
+
+    post:
+      operationId: createClip
+      tags: [clips]
+      summary: Create a clip job
+      description: Submits a new clip processing job
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateClipBody"
+      responses:
+        "201":
+          description: Clip job created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Clip"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /clips/{id}:
+    get:
+      operationId: getClip
+      tags: [clips]
+      summary: Get a clip by ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Clip details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Clip"
+        "404":
+          description: Clip not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+    delete:
+      operationId: deleteClip
+      tags: [clips]
+      summary: Delete a clip
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Clip deleted
+        "404":
+          description: Clip not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /clips/{id}/retry:
+    post:
+      operationId: retryClip
+      tags: [clips]
+      summary: Retry a failed clip
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Clip reset and re-queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Clip"
+        "400":
+          description: Clip not in error state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Clip not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /clips/stats:
+    get:
+      operationId: getClipStats
+      tags: [clips]
+      summary: Get clip processing statistics
+      description: Returns aggregate stats about clips
+      responses:
+        "200":
+          description: Clip statistics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClipStats"
+
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+      required:
+        - error
+
+    Clip:
+      type: object
+      properties:
+        id:
+          type: integer
+        youtubeUrl:
+          type: ["string", "null"]
+        startTime:
+          type: string
+        endTime:
+          type: string
+        headline:
+          type: string
+        mode:
+          type: string
+          enum: [edited, raw]
+        sourceType:
+          type: string
+          enum: [youtube, local]
+        localFileName:
+          type: ["string", "null"]
+        status:
+          type: string
+          enum: [pending, processing, done, error]
+        progress:
+          type: integer
+          minimum: 0
+          maximum: 100
+        errorMessage:
+          type: ["string", "null"]
+        outputFilename:
+          type: ["string", "null"]
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        captionsEnabled:
+          type: boolean
+          default: true
+        transcript:
+          type: ["string", "null"]
+      required:
+        - id
+        - youtubeUrl
+        - startTime
+        - endTime
+        - headline
+        - mode
+        - sourceType
+        - localFileName
+        - status
+        - progress
+        - errorMessage
+        - outputFilename
+        - createdAt
+        - updatedAt
+        - captionsEnabled
+
+    CreateClipBody:
+      type: object
+      properties:
+        youtubeUrl:
+          type: string
+        startTime:
+          type: string
+          description: "Start timestamp in HH:MM:SS format"
+        endTime:
+          type: string
+          description: "End timestamp in HH:MM:SS format"
+        headline:
+          type: string
+          default: ""
+        mode:
+          type: string
+          enum: [edited, raw]
+          default: edited
+        captionsEnabled:
+          type: boolean
+          default: true
+      required:
+        - youtubeUrl
+        - startTime
+        - endTime
+
+    ClipStats:
+      type: object
+      properties:
+        total:
+          type: integer
+        pending:
+          type: integer
+        processing:
+          type: integer
+        done:
+          type: integer
+        error:
+          type: integer
+      required:
+        - total
+        - pending
+        - processing
+        - done
+        - error
