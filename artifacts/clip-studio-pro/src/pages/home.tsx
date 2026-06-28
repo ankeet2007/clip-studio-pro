@@ -107,6 +107,39 @@ function secsToHMS(s: number): string {
   return [h, m, sec].map((v) => String(v).padStart(2, "0")).join(":");
 }
 
+/**
+ * Copies text to the clipboard, working over plain HTTP too. The modern
+ * navigator.clipboard API only exists in a secure context (HTTPS or localhost);
+ * this app is served over http on a LAN IP, so we fall back to the legacy
+ * execCommand("copy") approach via a hidden textarea.
+ */
+async function copyTextToClipboard(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // fall through to the legacy path
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.top = "0";
+    ta.style.left = "-9999px";
+    ta.setAttribute("readonly", "");
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 export default function Home() {
   const queryClient = useQueryClient();
   const { toast } = useToast();
@@ -245,11 +278,11 @@ export default function Home() {
       `- Source channel: ${values.sourceChannel || "(unknown)"}\n` +
       `- Clip length: ~${dur}s\n` +
       `- Source video: ${values.youtubeUrl || "(n/a)"}`;
-    try {
-      await navigator.clipboard.writeText(prompt);
+    const ok = await copyTextToClipboard(prompt);
+    if (ok) {
       toast({ title: "Prompt copied", description: "Paste it into your Gemini app, then paste the hook back here." });
-    } catch {
-      toast({ title: "Copy failed", description: "Clipboard unavailable — long-press to copy manually.", variant: "destructive" });
+    } else {
+      toast({ title: "Copy failed", description: "Couldn't access the clipboard. Long-press the box to copy manually.", variant: "destructive" });
     }
   }
 
