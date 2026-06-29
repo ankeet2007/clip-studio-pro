@@ -548,6 +548,38 @@ async function downloadSegment(
   throw lastError;
 }
 
+/**
+ * Parses AI auto-zoom moments (a string the user pastes from Gemini) into seconds.
+ * Accepts plain seconds ("3, 9, 16") or timestamps ("0:03 0:09"), comma/space/semicolon
+ * separated. Clamps inside the clip, dedupes, sorts, caps at 12.
+ */
+function parseZoomMoments(raw: string, duration: number): number[] {
+  if (!raw || !raw.trim()) return [];
+  const toks = raw.split(/[\s,;]+/).filter(Boolean);
+  const secs: number[] = [];
+  for (const tok of toks) {
+    let s: number;
+    if (tok.includes(":")) {
+      const parts = tok.split(":").map(Number);
+      if (parts.some((n) => Number.isNaN(n))) continue;
+      s = parts.reduce((a, n) => a * 60 + n, 0);
+    } else {
+      s = Number(tok);
+    }
+    if (!Number.isFinite(s)) continue;
+    if (s < 0.5 || s > duration - 0.3) continue;
+    secs.push(Math.round(s * 10) / 10);
+  }
+  return [...new Set(secs)].sort((a, b) => a - b).slice(0, 12);
+}
+
+/** Evenly-spaced punches (~every 5s) when auto-zoom is on but no AI moments were given. */
+function defaultZoomMoments(duration: number): number[] {
+  const out: number[] = [];
+  for (let t = 5; t < duration - 0.5; t += 5) out.push(t);
+  return out.slice(0, 12);
+}
+
 export async function processClip(
   youtubeUrl: string | null,
   startTime: string,
@@ -563,7 +595,9 @@ export async function processClip(
   captionsEnabled = true,
   outroEnabled = true,
   voiceoverEnabled = false,
-  voiceoverHook = ""
+  voiceoverHook = "",
+  punchInEnabled = false,
+  zoomMoments = ""
 ): Promise<void> {
   const isLocalFile = !!localFilePath;
   const ytDlp = findYtDlp();
@@ -706,6 +740,25 @@ export async function processClip(
       }
     }
 
+    // AI auto-zoom: punch the framing in at specific moments the user got from Gemini
+    // (or evenly-spaced defaults). Implemented as a lanczos animated scale + centre crop
+    // — NOT zoompan, which blurred badly and forced the output to 25/30fps. This keeps the
+    // source frame rate and stays sharp. Each moment is a smooth gaussian zoom "punch".
+    let punchInChain = "";
+    if (punchInEnabled) {
+      const parsed = parseZoomMoments(zoomMoments, duration);
+      const moments = parsed.length ? parsed : defaultZoomMoments(duration);
+      const H = 0.18;   // punch strength (peak ≈ 1.18x)
+      const W = 0.45;   // punch half-width in seconds (smooth in/out)
+      const terms = moments.map(
+        (t) => `${H}*exp(-((t-${t.toFixed(2)})/${W})*((t-${t.toFixed(2)})/${W}))`
+      );
+      const zExpr = `1+${terms.join("+")}`;
+      // No commas in zExpr (avoids filtergraph arg-splitting); eval=frame animates per frame.
+      punchInChain = `,scale=w=ceil(${videoW}*(${zExpr})/2)*2:h=ceil(${videoH}*(${zExpr})/2)*2:eval=frame:flags=lanczos,crop=${videoW}:${videoH}`;
+      logger.info({ moments, source: parsed.length ? "ai" : "default" }, "AI auto-zoom punches applied");
+    }
+
     // Step 3: Build ffmpeg filter graph
     // Inputs: [0] = downloaded video clip, [1] = headline PNG (if headline is set)
     const extraInputs: string[] = [];
@@ -714,14 +767,17 @@ export async function processClip(
       // (true "immersive" look), the other is the sharp centred video.
       `[0:v]split=2[vsrc][vbg]`,
       `[vbg]scale=216:384:force_original_aspect_ratio=increase,crop=216:384,gblur=sigma=9,scale=${canvasW}:${canvasH}:flags=bilinear,eq=brightness=-0.30:saturation=1.15[bg]`,
-      `[vsrc]scale=${videoW}:${videoH}:force_original_aspect_ratio=increase:flags=lanczos,crop=${videoW}:${videoH},unsharp=5:5:1.0:5:5:0.0[vid]`,
+      `[vsrc]scale=${videoW}:${videoH}:force_original_aspect_ratio=increase:flags=lanczos,crop=${videoW}:${videoH}${punchInChain},unsharp=5:5:1.0:5:5:0.0[vid]`,
       `[bg][vid]overlay=0:${videoY}[composedv]`,
       // Soft dark scrims behind the title and handle so white text stays legible
       // over the blurred backdrop.
       `[composedv]drawbox=x=0:y=0:w=${canvasW}:h=${videoY}:color=black@0.30:t=fill[scrimtop]`,
       `[scrimtop]drawbox=x=0:y=${videoY + videoH}:w=${canvasW}:h=${canvasH - videoY - videoH}:color=black@0.30:t=fill[composedsc]`,
       `[composedsc]drawbox=x=0:y=${videoY - 3}:w=${canvasW}:h=3:color=FF0000:t=fill[composedac]`,
-      sourceChannel && sourceChannel.trim() ? `[composedac]drawtext=text='📎 ${sourceChannel.trim().replace(/'/g,"")}':fontsize=24:fontcolor=white@0.85:x=w-text_w-16:y=${videoY + videoH - 36}:shadowx=1:shadowy=1:shadowcolor=black@0.9[composed]` : `[composedac]null[composed]`,
+      // ffmpeg drawtext: the colon must be backslash-escaped even inside single
+      // quotes ('Credit\: KSI'), else the filtergraph fails to parse. \\ in the
+      // template literal -> a single literal backslash in the filter string.
+      sourceChannel && sourceChannel.trim() ? `[composedac]drawtext=text='Credit\\: ${sourceChannel.trim().replace(/'/g,"")}':fontsize=24:fontcolor=white@0.85:x=w-text_w-16:y=${videoY + videoH - 36}:shadowx=1:shadowy=1:shadowcolor=black@0.9[composed]` : `[composedac]null[composed]`,
     ];
     let prevLabel = "composed";
 
@@ -804,6 +860,9 @@ export async function processClip(
     // last 3s so it's already quiet by the time the subscribe screen appears.
     const audioFilterChain: string[] = [];
     if (hasAudio) {
+      // Correct any initial audio/video offset introduced by yt-dlp's keyframe-imprecise
+      // section cut (video and audio can start a hair apart → lips out of sync at the start).
+      audioFilterChain.push("aresample=async=1");
       audioFilterChain.push("loudnorm=I=-14:TP=-1.5:LRA=11");
       if (outroEnabled) {
         audioFilterChain.push(`afade=t=out:st=${Math.max(0, duration - 3)}:d=3`);
@@ -875,7 +934,7 @@ export async function processClip(
       if (captionsEnabled) try {
         const srtPath = path.join(outputDir, `clip_${clipId}_captions.srt`);
         const transcriptPath = path.join(outputDir, `clip_${clipId}_transcript.txt`);
-        const captionScript = path.join(os.homedir(), "myapp/scripts/generate_captions.sh");
+        const captionScript = path.join(os.homedir(), "myapp/scripts/generate_captions_pro.sh");
         const captionedPath = path.join(outputDir, `clip_${clipId}_captioned.mp4`);
 
         if (fs.existsSync(captionScript)) {
@@ -904,35 +963,55 @@ export async function processClip(
             // NB: Anton is great for the PIL-rendered headline, but libass
             // double-renders it into a ghosted outline — captions use DejaVu Sans.
             const assPath = path.join(outputDir, `clip_${clipId}_captions.ass`);
-            const karaokeScript = path.join(os.homedir(), "myapp/scripts/karaoke_captions.py");
+            // DTW karaoke: word-level highlighting from whisper's per-token DTW
+            // timestamps (JSON emitted alongside the SRT by generate_captions_pro.sh),
+            // so each word lights up exactly when spoken. Falls back to the plain
+            // SRT burn if the JSON/converter is missing or yields no Dialogue lines.
+            const dtwJsonPath = srtPath.replace(/\.srt$/, ".json");
+            const karaokeScript = path.join(os.homedir(), "myapp/scripts/karaoke_captions_pro.py");
             let subFilter = `subtitles=${srtPath}:fontsdir=${FONTS_DIR}:force_style='FontName=DejaVu Sans,FontSize=12,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=1,Bold=1,Alignment=2,MarginV=95'`;
-            if (fs.existsSync(karaokeScript)) {
+            let haveAss = false;
+            if (fs.existsSync(karaokeScript) && fs.existsSync(dtwJsonPath)) {
               try {
-                await execFileAsync(findPython(), [karaokeScript, srtPath, assPath, String(Math.max(0, duration - 2))], { timeout: 30000 });
+                await execFileAsync(findPython(), [karaokeScript, dtwJsonPath, assPath, String(Math.max(0, duration - 2))], { timeout: 30000 });
                 if (fs.existsSync(assPath) && fs.readFileSync(assPath, "utf8").includes("Dialogue:")) {
                   subFilter = `subtitles=${assPath}:fontsdir=${FONTS_DIR}`;
+                  haveAss = true;
                 }
               } catch (kErr) {
                 logger.warn({ kErr }, "Karaoke caption generation failed — falling back to plain SRT");
               }
             }
 
-            await spawnProcess("ffmpeg", [
-              "-y", "-i", finalOutputPath,
-              "-vf", subFilter,
-              "-c:v", "libx264", "-preset", "veryfast", "-crf", "14", "-threads", "1",
-              "-c:a", "copy",
-              captionedPath,
-              // No hard timeout — caption burn is another full crf-14 re-encode that
-              // can also exceed 10 min on the phone; stall timer still guards hangs.
-            ], 0, () => {});
+            // A no-speech / non-English segment yields an empty SRT and no ASS
+            // Dialogue lines. Burning an empty subtitle file makes ffmpeg error,
+            // so skip the burn entirely and leave the clip uncaptioned.
+            const srtHasContent = (() => {
+              try { return fs.readFileSync(srtPath, "utf8").trim().length > 0; }
+              catch { return false; }
+            })();
 
-            if (fs.existsSync(captionedPath)) {
-              fs.renameSync(captionedPath, finalOutputPath);
-              logger.info({ finalOutputPath }, "Captions burned into clip");
+            if (haveAss || srtHasContent) {
+              await spawnProcess("ffmpeg", [
+                "-y", "-i", finalOutputPath,
+                "-vf", subFilter,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "14", "-threads", "1",
+                "-c:a", "copy",
+                captionedPath,
+                // No hard timeout — caption burn is another full crf-14 re-encode that
+                // can also exceed 10 min on the phone; stall timer still guards hangs.
+              ], 0, () => {});
+
+              if (fs.existsSync(captionedPath)) {
+                fs.renameSync(captionedPath, finalOutputPath);
+                logger.info({ finalOutputPath, mode: haveAss ? "dtw-karaoke" : "srt" }, "Captions burned into clip");
+              }
+            } else {
+              logger.info({ clipId }, "No speech detected in segment — skipping caption burn");
             }
             fs.existsSync(srtPath) && fs.unlinkSync(srtPath);
             fs.existsSync(assPath) && fs.unlinkSync(assPath);
+            fs.existsSync(dtwJsonPath) && fs.unlinkSync(dtwJsonPath);
           }
         }
       } catch (capErr) {

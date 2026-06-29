@@ -15,11 +15,21 @@ import {
   AlertTriangle,
   PlayCircle,
   Link,
+  Sparkles,
+  Copy,
 } from "lucide-react";
 import { AppHeader } from "@/components/app-header";
 import { useEffect, useRef, useState } from "react";
 
 import { API_BASE } from "@/lib/api";
+import { copyTextToClipboard } from "@/lib/utils";
+
+interface ClipMetadata {
+  title: string;
+  description: string;
+  hashtags: string;
+  tags: string;
+}
 
 export default function ClipDetail() {
   const params = useParams<{ id: string }>();
@@ -49,6 +59,23 @@ export default function ClipDetail() {
       queryClient.invalidateQueries({ queryKey: getGetClipStatsQueryKey() });
     }
   }, [clip?.status, queryClient]);
+
+  // SEO metadata — fetched once the clip is rendered (transcript is available then).
+  const [meta, setMeta] = useState<ClipMetadata | null>(null);
+  useEffect(() => {
+    if (clip?.status !== "done") { setMeta(null); return; }
+    let cancelled = false;
+    fetch(`${API_BASE}/api/clips/${clipId}/metadata`)
+      .then((r) => r.json() as Promise<ClipMetadata>)
+      .then((d) => { if (!cancelled) setMeta(d); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [clip?.status, clipId]);
+
+  async function copyMeta(text: string, label: string) {
+    const ok = await copyTextToClipboard(text);
+    toast(ok ? { title: `${label} copied` } : { title: "Copy failed", variant: "destructive" });
+  }
 
   async function handleRetry() {
     try {
@@ -228,6 +255,47 @@ export default function ClipDetail() {
                   <RefreshCw className="w-3.5 h-3.5 mr-2" />
                   Retry this clip
                 </Button>
+              </div>
+            )}
+
+            {/* YouTube SEO metadata — ready-to-paste title / description / tags */}
+            {clip.status === "done" && meta && (
+              <div className="rounded-lg border border-border bg-card p-5 space-y-4">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="flex items-center gap-2 font-mono text-[11px] uppercase tracking-[0.13em] text-muted-foreground">
+                    <Sparkles className="w-4 h-4 text-primary" /> YouTube metadata
+                  </p>
+                  <button
+                    onClick={() => copyMeta(`${meta.title}\n\n${meta.description}`, "All metadata")}
+                    className="flex items-center gap-1.5 text-[10.5px] font-mono uppercase tracking-[0.08em] text-primary hover:underline"
+                  >
+                    <Copy className="w-3 h-3" /> Copy all
+                  </button>
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground">Title</span>
+                    <button onClick={() => copyMeta(meta.title, "Title")} className="text-muted-foreground hover:text-foreground" aria-label="Copy title"><Copy className="w-3.5 h-3.5" /></button>
+                  </div>
+                  <p className="text-sm bg-background rounded-md border border-border px-3 py-2 break-words">{meta.title}</p>
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground">Description</span>
+                    <button onClick={() => copyMeta(meta.description, "Description")} className="text-muted-foreground hover:text-foreground" aria-label="Copy description"><Copy className="w-3.5 h-3.5" /></button>
+                  </div>
+                  <pre className="text-xs bg-background rounded-md border border-border px-3 py-2 whitespace-pre-wrap break-words font-sans">{meta.description}</pre>
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground">Tags</span>
+                    <button onClick={() => copyMeta(meta.tags, "Tags")} className="text-muted-foreground hover:text-foreground" aria-label="Copy tags"><Copy className="w-3.5 h-3.5" /></button>
+                  </div>
+                  <p className="text-xs font-mono bg-background rounded-md border border-border px-3 py-2 break-words text-muted-foreground">{meta.tags}</p>
+                </div>
               </div>
             )}
 

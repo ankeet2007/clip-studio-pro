@@ -60,7 +60,9 @@ function dispatchClipJob(
   captionsEnabled = true,
   outroEnabled = true,
   voiceoverEnabled = false,
-  voiceoverHook = ""
+  voiceoverHook = "",
+  punchInEnabled = false,
+  zoomMoments = ""
 ) {
   const { channelHandle } = readSettings();
 
@@ -76,7 +78,7 @@ function dispatchClipJob(
       logger.error({ err, clipId }, "Failed to mark clip as processing");
     }
 
-    await processClip(youtubeUrl, startTime, endTime, headline, outputFilename, mode, channelHandle, clipId, localFilePath, frameStyle, sourceChannel, captionsEnabled, outroEnabled, voiceoverEnabled, voiceoverHook)
+    await processClip(youtubeUrl, startTime, endTime, headline, outputFilename, mode, channelHandle, clipId, localFilePath, frameStyle, sourceChannel, captionsEnabled, outroEnabled, voiceoverEnabled, voiceoverHook, punchInEnabled, zoomMoments)
       .then(async () => {
         await db
           .update(clipsTable)
@@ -111,6 +113,8 @@ router.post("/clips", async (req, res): Promise<void> => {
   const outroEnabled = (req.body as { outroEnabled?: boolean }).outroEnabled ?? true;
   const voiceoverEnabled = (req.body as { voiceoverEnabled?: boolean }).voiceoverEnabled ?? false;
   const voiceoverHook = (req.body as { voiceoverHook?: string }).voiceoverHook ?? "";
+  const punchInEnabled = (req.body as { punchInEnabled?: boolean }).punchInEnabled ?? false;
+  const zoomMoments = (req.body as { zoomMoments?: string }).zoomMoments ?? "";
 
   const [clip] = await db
     .insert(clipsTable)
@@ -125,7 +129,7 @@ router.post("/clips", async (req, res): Promise<void> => {
   res.status(201).json(GetClipResponse.parse(clip));
 
   const outputFilename = `clip_${clip.id}_${Date.now()}.mp4`;
-  dispatchClipJob(clip.id, youtubeUrl, startTime, endTime, headline, outputFilename, mode, frameStyle, undefined, sourceChannel, captionsEnabled, outroEnabled, voiceoverEnabled, voiceoverHook);
+  dispatchClipJob(clip.id, youtubeUrl, startTime, endTime, headline, outputFilename, mode, frameStyle, undefined, sourceChannel, captionsEnabled, outroEnabled, voiceoverEnabled, voiceoverHook, punchInEnabled, zoomMoments);
 });
 
 /**
@@ -145,6 +149,8 @@ router.post("/clips/upload", (req, res): void => {
   let captionsEnabled = true;
   let voiceoverEnabled = false;
   let voiceoverHook = "";
+  let punchInEnabled = false;
+  let zoomMoments = "";
   let savedFilePath: string | null = null;
   let savedFileName: string | null = null;
   let fileWritePromise: Promise<void> | null = null;
@@ -170,6 +176,8 @@ router.post("/clips/upload", (req, res): void => {
     if (name === "captionsEnabled") captionsEnabled = value !== "false";
     if (name === "voiceoverEnabled") voiceoverEnabled = value === "true";
     if (name === "voiceoverHook") voiceoverHook = value;
+    if (name === "punchInEnabled") punchInEnabled = value === "true";
+    if (name === "zoomMoments") zoomMoments = value;
   });
 
   bb.on("file", (_name: string, stream: NodeJS.ReadableStream, info: { filename: string; encoding: string; mimeType: string }) => {
@@ -239,7 +247,7 @@ router.post("/clips/upload", (req, res): void => {
         res.status(201).json(GetClipResponse.parse(clip));
 
         const outputFilename = `clip_${clip.id}_${Date.now()}.mp4`;
-        dispatchClipJob(clip.id, null, startTime, endTime, headline, outputFilename, mode, frameStyle, savedFilePath, sourceChannel, captionsEnabled, true, voiceoverEnabled, voiceoverHook);
+        dispatchClipJob(clip.id, null, startTime, endTime, headline, outputFilename, mode, frameStyle, savedFilePath, sourceChannel, captionsEnabled, true, voiceoverEnabled, voiceoverHook, punchInEnabled, zoomMoments);
       } catch (err) {
         if (savedFilePath) {
           try { if (fs.existsSync(savedFilePath)) fs.unlinkSync(savedFilePath); } catch { /* ignore */ }
@@ -390,6 +398,69 @@ router.get("/clips/:id/thumbnail", async (req, res): Promise<void> => {
   const thumbPath = path.join(outputDir, "clip_" + clip.id + "_thumb.jpg");
   if (!fs.existsSync(thumbPath)) { res.status(404).json({ error: "Thumbnail not ready" }); return; }
   res.sendFile(thumbPath);
+});
+
+/**
+ * Builds YouTube SEO metadata (title / description / hashtags / tags) for a clip from
+ * data already on the row — headline, the whisper transcript, and the source creator.
+ * Purely algorithmic: the server makes NO AI calls (same principle as the voiceover hook).
+ */
+function buildSeoMetadata(clip: typeof clipsTable.$inferSelect): {
+  title: string; description: string; hashtags: string; tags: string;
+} {
+  const headline = (clip.headline || "").trim();
+  const channel = (clip.sourceChannel || "").trim();
+  const transcript = (clip.transcript || "").trim();
+
+  const STOP = new Set([
+    "the","and","for","that","this","with","you","your","are","was","were","have","has",
+    "had","what","when","where","which","their","they","them","from","into","just","like",
+    "about","over","then","than","but","not","its","get","got","out","one","all","can",
+    "will","would","could","should","yeah","gonna","wanna","really","very","there","here",
+    "whats","hes","shes","thats","theyre","dont","cant","wont","know","going","right",
+    "because","people","something","everything","okay","yes","said","says","were","still",
+  ]);
+  // Keep apostrophes while matching, then strip them so contractions like "what's"
+  // collapse to "whats" (caught by STOP) and never leak into a hashtag (apostrophes
+  // are invalid in YouTube hashtags).
+  const words = `${headline} ${transcript}`.toLowerCase().match(/[a-z0-9']+/g) || [];
+  const freq = new Map<string, number>();
+  for (const raw of words) {
+    const w = raw.replace(/'/g, "");
+    if (w.length < 4 || STOP.has(w)) continue;
+    freq.set(w, (freq.get(w) ?? 0) + 1);
+  }
+  const top = [...freq.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([w]) => w);
+  const channelTag = channel ? channel.replace(/[^a-z0-9]/gi, "").toLowerCase() : "";
+
+  const tagList = [...new Set(["shorts", "viral", "fyp", "trending", channelTag, ...top].filter(Boolean))];
+  const hashtags = tagList.map((t) => `#${t}`).join(" ");
+
+  // Title: headline-led, under YouTube's 100-char limit, with #Shorts appended.
+  let title = headline || (channel ? `${channel} — you won't believe this` : "Watch till the end 🔥");
+  const suffix = " #Shorts";
+  if (title.length + suffix.length <= 100) title += suffix;
+  if (title.length > 100) title = title.slice(0, 100).trimEnd();
+
+  const description = [
+    headline || "Watch till the end! 🔥",
+    "",
+    ...(channel ? [`🎬 Clip from ${channel}`] : []),
+    "👉 Subscribe for daily clips!",
+    "",
+    hashtags,
+  ].join("\n");
+
+  return { title, description, hashtags, tags: tagList.join(", ") };
+}
+
+router.get("/clips/:id/metadata", async (req, res): Promise<void> => {
+  const raw = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const params = GetClipParams.safeParse({ id: raw });
+  if (!params.success) { res.status(400).json({ error: "Invalid id" }); return; }
+  const [clip] = await db.select().from(clipsTable).where(eq(clipsTable.id, params.data.id));
+  if (!clip) { res.status(404).json({ error: "Clip not found" }); return; }
+  res.json(buildSeoMetadata(clip));
 });
 
 router.delete("/clips/:id", async (req, res): Promise<void> => {

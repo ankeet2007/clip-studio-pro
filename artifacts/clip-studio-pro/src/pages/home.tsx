@@ -30,6 +30,8 @@ import {
   Eye,
   Play,
   SendHorizonal,
+  ZoomIn,
+  Sparkles,
 } from "lucide-react";
 
 const MAX_CLIPS = 10;
@@ -42,6 +44,8 @@ const clipEntrySchema = z.object({
   headline: z.string().optional().default(""),
   captionsEnabled: z.boolean().default(true),
   outroEnabled: z.boolean().default(true),
+  punchInEnabled: z.boolean().default(false),
+  zoomMoments: z.string().optional().default(""),
   voiceoverEnabled: z.boolean().default(false),
   voiceoverHook: z.string().optional().default(""),
 }).superRefine((val, ctx) => {
@@ -73,6 +77,8 @@ const defaultClip = {
   headline: "",
   captionsEnabled: true,
   outroEnabled: true,
+  punchInEnabled: false,
+  zoomMoments: "",
   voiceoverEnabled: false,
   voiceoverHook: "",
 };
@@ -451,6 +457,30 @@ export default function Home() {
     }
   }
 
+  // Builds a Gemini prompt asking it to choose AUTO-ZOOM punch moments (timestamps).
+  // Same human-in-the-loop pattern as the hook: server makes no AI calls — the user
+  // pastes this into Gemini, then pastes the returned seconds into the zoom field.
+  async function copyZoomPrompt(index: number) {
+    const values = form.getValues();
+    const clip = values.clips[index];
+    if (!clip) return;
+    const dur = Math.max(0, toSecs(clip.endTime) - toSecs(clip.startTime));
+    const prompt =
+      `You are a short-form video editor choosing AUTO-ZOOM moments for a vertical YouTube Short.\n` +
+      `The clip is about ${dur} seconds long` +
+      `${clip.headline ? `, titled "${clip.headline}"` : ""}` +
+      `${values.sourceChannel ? `, from ${values.sourceChannel}` : ""}.\n` +
+      `Pick 3-6 timestamps (whole seconds, between 1 and ${Math.max(1, dur - 1)}) where a quick ` +
+      `punch-in zoom would add emphasis or energy — reactions, punchlines, key beats.\n` +
+      `Return ONLY a comma-separated list of seconds, e.g. 3, 9, 16, 24 — no other text.`;
+    const ok = await copyTextToClipboard(prompt);
+    if (ok) {
+      toast({ title: "Zoom prompt copied", description: "Paste it into Gemini, then paste the seconds back here." });
+    } else {
+      toast({ title: "Copy failed", description: "Couldn't access the clipboard.", variant: "destructive" });
+    }
+  }
+
   async function onSubmit(values: FormValues) {
     let successCount = 0;
     const failReasons: string[] = [];
@@ -470,6 +500,8 @@ export default function Home() {
             sourceChannel: values.sourceChannel ?? "",
             captionsEnabled: clip.captionsEnabled ?? true,
             outroEnabled: clip.outroEnabled ?? true,
+            punchInEnabled: clip.punchInEnabled ?? false,
+            zoomMoments: clip.zoomMoments ?? "",
             voiceoverEnabled: clip.voiceoverEnabled ?? false,
             voiceoverHook: clip.voiceoverHook ?? "",
           }),
@@ -726,6 +758,7 @@ export default function Home() {
                       const start = form.watch(`clips.${index}.startTime`);
                       const end = form.watch(`clips.${index}.endTime`);
                       const voOn = form.watch(`clips.${index}.voiceoverEnabled`) ?? false;
+                      const punchOn = form.watch(`clips.${index}.punchInEnabled`) ?? false;
 
                       return (
                         <div key={field.id} className="rounded-xl border border-border bg-background/40 overflow-hidden">
@@ -809,6 +842,45 @@ export default function Home() {
                                 onChange={(v) => form.setValue(`clips.${index}.outroEnabled`, v)}
                               />
                             </div>
+
+                            {/* AI Auto-Zoom panel (edited only) */}
+                            {!isRaw && (
+                              <div className="rounded-lg border border-primary/30 bg-primary/[0.05] p-3">
+                                <div className="flex items-center justify-between gap-2">
+                                  <label className="flex items-center gap-2.5 cursor-pointer">
+                                    <span
+                                      className={`w-3.5 h-3.5 rounded-[4px] border flex items-center justify-center ${punchOn ? "bg-primary border-primary" : "border-muted-foreground/50"}`}
+                                      onClick={(e) => { e.preventDefault(); form.setValue(`clips.${index}.punchInEnabled`, !punchOn); }}
+                                    >
+                                      {punchOn && <Check className="w-2.5 h-2.5 text-primary-foreground" strokeWidth={3.5} />}
+                                    </span>
+                                    <span
+                                      className="text-[10.5px] font-mono uppercase tracking-[0.1em] text-foreground flex items-center gap-1.5"
+                                      onClick={(e) => { e.preventDefault(); form.setValue(`clips.${index}.punchInEnabled`, !punchOn); }}
+                                    >
+                                      <ZoomIn className="w-3.5 h-3.5 text-primary" /> AI Auto-Zoom
+                                      <span className="text-[8.5px] font-semibold tracking-[0.14em] text-primary border border-primary/40 rounded px-1.5 py-0.5 inline-flex items-center gap-1"><Sparkles className="w-2.5 h-2.5" />AI</span>
+                                    </span>
+                                  </label>
+                                  {punchOn && (
+                                    <button
+                                      type="button"
+                                      onClick={() => copyZoomPrompt(index)}
+                                      className="text-[10px] font-mono uppercase tracking-[0.08em] text-primary hover:underline flex items-center gap-1.5 shrink-0"
+                                    >
+                                      <ClipboardCopy className="w-3 h-3" /> Copy Gemini prompt
+                                    </button>
+                                  )}
+                                </div>
+                                {punchOn && (
+                                  <Input
+                                    placeholder="Paste Gemini's seconds — e.g. 3, 9, 16, 24   (blank = auto every 5s)"
+                                    className="text-sm bg-background mt-2.5 font-mono"
+                                    {...form.register(`clips.${index}.zoomMoments`)}
+                                  />
+                                )}
+                              </div>
+                            )}
 
                             {/* voiceover PRO panel (edited only) */}
                             {!isRaw && (
