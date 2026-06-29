@@ -5,8 +5,7 @@ import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
   AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { Download, Trash2, PlayCircle, AlertTriangle, CheckCircle, Clock, Loader2, RefreshCw, ChevronRight } from "lucide-react";
-import { Badge } from "@/components/ui/badge";
+import { Download, Trash2, PlayCircle, AlertTriangle, CheckCircle, Clock, Loader2, RefreshCw, Play } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { useEffect, useRef, useState } from "react";
 import { useLocation } from "wouter";
@@ -36,8 +35,6 @@ export function ClipRow({ initialClip }: { initialClip: Clip }) {
     if (prevStatus.current !== clip.status) {
       const prev = prevStatus.current;
       prevStatus.current = clip.status;
-      // Invalidate shared queries whenever a clip reaches a terminal state
-      // (or transitions away from one, e.g. after a retry resets to pending).
       if (
         clip.status === "done" ||
         clip.status === "error" ||
@@ -86,27 +83,27 @@ export function ClipRow({ initialClip }: { initialClip: Clip }) {
     switch (clip.status) {
       case "pending":
         return (
-          <Badge variant="secondary" className="flex items-center gap-1 font-mono uppercase text-[10px] shrink-0">
-            <Clock className="w-3 h-3" /> QUEUED
-          </Badge>
+          <span className="inline-flex items-center gap-1.5 font-mono uppercase text-[9px] font-semibold tracking-[0.1em] px-2 py-1 rounded-md text-muted-foreground bg-card border border-border shrink-0">
+            <Clock className="w-3 h-3" /> Queued
+          </span>
         );
       case "processing":
         return (
-          <Badge className="bg-primary text-primary-foreground flex items-center gap-1 font-mono uppercase text-[10px] shrink-0">
-            <Loader2 className="w-3 h-3 animate-spin" /> PROCESSING
-          </Badge>
+          <span className="inline-flex items-center gap-1.5 font-mono uppercase text-[9px] font-semibold tracking-[0.1em] px-2 py-1 rounded-md bg-primary text-primary-foreground shrink-0">
+            <Loader2 className="w-3 h-3 animate-spin" /> Processing
+          </span>
         );
       case "done":
         return (
-          <Badge className="bg-green-500/10 text-green-500 border border-green-500/20 flex items-center gap-1 font-mono uppercase text-[10px] shrink-0">
-            <CheckCircle className="w-3 h-3" /> DONE
-          </Badge>
+          <span className="inline-flex items-center gap-1.5 font-mono uppercase text-[9px] font-semibold tracking-[0.1em] px-2 py-1 rounded-md text-green-500 bg-green-500/10 border border-green-500/25 shrink-0">
+            <CheckCircle className="w-3 h-3" /> Done
+          </span>
         );
       case "error":
         return (
-          <Badge variant="destructive" className="flex items-center gap-1 font-mono uppercase text-[10px] shrink-0">
-            <AlertTriangle className="w-3 h-3" /> ERROR
-          </Badge>
+          <span className="inline-flex items-center gap-1.5 font-mono uppercase text-[9px] font-semibold tracking-[0.1em] px-2 py-1 rounded-md text-destructive bg-destructive/10 border border-destructive/25 shrink-0">
+            <AlertTriangle className="w-3 h-3" /> Error
+          </span>
         );
       default:
         return null;
@@ -116,6 +113,7 @@ export function ClipRow({ initialClip }: { initialClip: Clip }) {
   const isActive = clip.status === "pending" || clip.status === "processing";
   const rawPct = Math.min(100, Math.max(0, clip.progress ?? 0));
   const pct = rawPct <= 3 ? 0 : rawPct <= 48 ? Math.round((rawPct / 48) * 45) : rawPct < 55 ? 45 : Math.round(45 + ((rawPct - 55) / 45) * 55);
+  const showThumb = clip.status === "done" && !thumbError;
 
   return (
     <>
@@ -138,26 +136,38 @@ export function ClipRow({ initialClip }: { initialClip: Clip }) {
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
+
     <div
-      className="flex flex-col md:flex-row md:items-center gap-3 p-4 bg-card/50 hover:bg-card transition-colors cursor-pointer group"
+      className={`flex gap-3.5 md:gap-4 items-center p-3.5 md:p-4 rounded-xl border bg-gradient-to-b from-card to-[hsl(240_10%_5%)] hover:-translate-y-px transition-all cursor-pointer group ${
+        clip.status === "error" ? "border-destructive/25" : "border-border hover:border-border/80"
+      }`}
       onClick={() => navigate(`/clips/${clip.id}`)}
     >
-      {clip.status === "done" && !thumbError && (
-        <div className="shrink-0 w-24 aspect-video rounded overflow-hidden bg-muted border border-border/50">
+      {/* thumbnail */}
+      <div className="shrink-0 w-[88px] md:w-[104px] aspect-video rounded-lg overflow-hidden border border-border bg-gradient-to-br from-[#241d38] to-[#0d1626] grid place-items-center">
+        {showThumb ? (
           <img
             src={`${API_BASE}/api/clips/${clip.id}/thumbnail`}
             alt="thumbnail"
             className="w-full h-full object-cover"
             onError={() => setThumbError(true)}
           />
-        </div>
-      )}
+        ) : (
+          <div className="w-6 h-6 rounded-full bg-black/40 grid place-items-center">
+            <Play className="w-2.5 h-2.5 text-white/70 fill-white/70 ml-0.5" />
+          </div>
+        )}
+      </div>
+
+      {/* main */}
       <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-3 mb-1">
+        <div className="flex items-center gap-2.5 mb-1.5">
           {getStatusBadge()}
-          <h3 className="font-semibold text-sm truncate">{clip.headline || <span className="text-muted-foreground italic font-normal">Raw clip</span>}</h3>
+          <h3 className="font-semibold text-sm truncate">
+            {clip.headline || <span className="text-muted-foreground italic font-normal">Raw clip</span>}
+          </h3>
         </div>
-        <div className="flex items-center gap-4 text-xs text-muted-foreground font-mono">
+        <div className="flex items-center gap-3.5 text-[11px] text-muted-foreground font-mono flex-wrap">
           {clip.sourceType === "local" ? (
             <span className="truncate max-w-[200px] flex items-center gap-1">
               <span className="text-primary/70 font-semibold shrink-0">LOCAL</span>
@@ -166,19 +176,16 @@ export function ClipRow({ initialClip }: { initialClip: Clip }) {
           ) : (
             <span className="truncate max-w-[200px]">{clip.youtubeUrl}</span>
           )}
-          <span className="flex items-center gap-1 shrink-0">
+          <span className="flex items-center gap-1 shrink-0 text-primary">
             <PlayCircle className="w-3 h-3" />
             {clip.startTime} &ndash; {clip.endTime}
           </span>
         </div>
 
-        {/* Progress bar — visible while pending or processing */}
+        {/* progress */}
         {isActive && (
           <div className="mt-2.5">
             {(() => {
-              // yt-dlp doesn't emit intermediate % during its internal keyframe re-encode,
-              // so pct stays at 2 the whole download phase. Show an indeterminate pulse
-              // instead of a frozen "2%" — switch to a real bar once encoding begins (≥50%).
               const isIndeterminate = clip.status === "pending" || rawPct <= 10;
               const label =
                 clip.status === "pending"
@@ -187,25 +194,23 @@ export function ClipRow({ initialClip }: { initialClip: Clip }) {
                     ? "Downloading…"
                     : pct < 55
                       ? "Compositing…"
-                      : `Encoding… ${pct}%`;
+                      : "Encoding…";
 
               return (
                 <>
-                  <div className="flex items-center justify-between mb-1">
-                    <span className="text-[10px] font-mono text-muted-foreground">{label}</span>
-                    {!isIndeterminate && (
-                      <span className="text-[10px] font-mono text-primary font-semibold">{pct}%</span>
-                    )}
-                  </div>
-                  <div className="h-1 bg-muted rounded-full overflow-hidden">
+                  <div className="h-1.5 rounded-full bg-background border border-border overflow-hidden">
                     {isIndeterminate ? (
                       <div className="h-full w-full bg-muted-foreground/25 rounded-full animate-pulse" />
                     ) : (
                       <div
-                        className="h-full bg-primary rounded-full transition-all duration-700 ease-out"
-                        style={{ width: `${Math.max(0, pct <= 3 ? 0 : pct)}%` }}
+                        className="h-full bg-gradient-to-r from-[#a9d600] to-primary rounded-full transition-all duration-700 ease-out"
+                        style={{ width: `${Math.max(0, pct)}%` }}
                       />
                     )}
+                  </div>
+                  <div className="flex items-center justify-between mt-1.5 font-mono text-[10px] text-muted-foreground">
+                    <span>{label}</span>
+                    {!isIndeterminate && <span className="text-primary font-semibold">{pct}%</span>}
                   </div>
                 </>
               );
@@ -214,47 +219,48 @@ export function ClipRow({ initialClip }: { initialClip: Clip }) {
         )}
 
         {clip.errorMessage && (
-          <div className="mt-2 text-xs text-destructive bg-destructive/10 p-2 rounded-sm border border-destructive/20 font-mono break-words">
+          <div className="mt-2 text-[11px] text-destructive bg-destructive/10 px-2.5 py-2 rounded-md border border-destructive/20 font-mono break-words">
             {clip.errorMessage}
           </div>
         )}
       </div>
 
+      {/* actions */}
       <div className="flex items-center gap-2 shrink-0">
         {clip.status === "error" && (
           <Button
-            size="sm"
+            size="icon"
             variant="outline"
-            className="font-mono text-xs h-8 border-destructive/50 text-destructive hover:bg-destructive hover:text-white"
+            className="h-9 w-9 border-border text-muted-foreground hover:text-amber-400 hover:border-amber-400/40"
             onClick={handleRetry}
+            title="Retry"
           >
-            <RefreshCw className="w-3.5 h-3.5 mr-1.5" />
-            RETRY
+            <RefreshCw className="w-4 h-4" />
           </Button>
         )}
         {clip.status === "done" && clip.outputFilename && (
           <Button
             size="sm"
-            className="font-mono text-xs h-8 bg-green-600 hover:bg-green-500 text-white"
+            className="font-mono text-[10.5px] uppercase tracking-[0.08em] h-9 bg-green-600 hover:bg-green-500 text-white"
             asChild
             onClick={(e) => e.stopPropagation()}
           >
             <a href={`${API_BASE}/api/clips/${clip.id}/download`} download>
-              <Download className="w-4 h-4 mr-2" />
-              DOWNLOAD
+              <Download className="w-4 h-4 mr-1.5" />
+              Download
             </a>
           </Button>
         )}
         <Button
           size="icon"
           variant="ghost"
-          className="h-8 w-8 text-muted-foreground hover:text-destructive"
+          className="h-9 w-9 text-muted-foreground hover:text-destructive"
           onClick={handleDelete}
           disabled={deleteClip.isPending}
+          title="Delete"
         >
           <Trash2 className="w-4 h-4" />
         </Button>
-        <ChevronRight className="w-4 h-4 text-muted-foreground/40 group-hover:text-muted-foreground transition-colors" />
       </div>
     </div>
     </>

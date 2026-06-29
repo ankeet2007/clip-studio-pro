@@ -2,47 +2,35 @@ import { useForm, useFieldArray } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import { useState, useRef, useCallback, useEffect, useMemo } from "react";
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@/components/ui/alert-dialog";
 import { API_BASE } from "@/lib/api";
 import {
   useListClips,
-  useGetClipStats,
   getListClipsQueryKey,
   getGetClipStatsQueryKey,
 } from "@workspace/api-client-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useLocation } from "wouter";
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
 import { AppHeader } from "@/components/app-header";
 import {
   Loader2,
-  Activity,
-  BarChart2,
+  Zap,
   Plus,
   X,
-  ChevronRight,
-  Settings,
   Youtube,
   Upload,
   FileVideo,
   MonitorPlay,
   Mic,
   ClipboardCopy,
+  Check,
+  Eye,
+  Play,
+  SendHorizonal,
 } from "lucide-react";
-import { Skeleton } from "@/components/ui/skeleton";
 
 const MAX_CLIPS = 10;
 const MAX_FILE_BYTES = 20 * 1024 * 1024 * 1024;
@@ -107,6 +95,18 @@ function secsToHMS(s: number): string {
   return [h, m, sec].map((v) => String(v).padStart(2, "0")).join(":");
 }
 
+function toSecs(t: string): number {
+  if (!/^\d{2}:\d{2}:\d{2}$/.test(t)) return 0;
+  return t.split(":").reduce((acc, v) => acc * 60 + Number(v), 0);
+}
+
+function fmtDuration(start: string, end: string): string {
+  const d = Math.max(0, toSecs(end) - toSecs(start));
+  const m = Math.floor(d / 60);
+  const s = d % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
 /**
  * Copies text to the clipboard, working over plain HTTP too. The modern
  * navigator.clipboard API only exists in a secure context (HTTPS or localhost);
@@ -140,11 +140,173 @@ async function copyTextToClipboard(text: string): Promise<boolean> {
   }
 }
 
+/* ---------- small reusable bits ---------- */
+
+function FieldLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <Label className="font-mono text-[10.5px] uppercase tracking-[0.13em] text-muted-foreground mb-1.5 block">
+      {children}
+    </Label>
+  );
+}
+
+function Segmented({
+  options,
+  value,
+  onChange,
+}: {
+  options: { value: string; label: string; icon?: React.ReactNode }[];
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  return (
+    <div className="inline-flex bg-background border border-border rounded-lg p-[3px] gap-[3px]">
+      {options.map((o) => (
+        <button
+          key={o.value}
+          type="button"
+          onClick={() => onChange(o.value)}
+          className={`flex items-center gap-1.5 rounded-md px-3.5 py-2 font-mono text-[11px] uppercase tracking-[0.1em] transition-colors ${
+            value === o.value ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          {o.icon}
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function ToggleChip({
+  checked,
+  onChange,
+  label,
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  label: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={() => onChange(!checked)}
+      className={`inline-flex items-center gap-2 rounded-md border px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.08em] transition-colors ${
+        checked
+          ? "text-primary border-primary/40 bg-primary/[0.07]"
+          : "text-muted-foreground border-border bg-card hover:text-foreground"
+      }`}
+    >
+      <span
+        className={`w-3.5 h-3.5 rounded-[4px] border flex items-center justify-center ${
+          checked ? "bg-primary border-primary" : "border-muted-foreground/50"
+        }`}
+      >
+        {checked && <Check className="w-2.5 h-2.5 text-primary-foreground" strokeWidth={3.5} />}
+      </span>
+      {label}
+    </button>
+  );
+}
+
+/* ---------- live 9:16 preview ---------- */
+
+function LivePreview({
+  headline,
+  mode,
+  frameStyle,
+  captions,
+  voiceover,
+  hook,
+  handle,
+}: {
+  headline: string;
+  mode: "edited" | "raw";
+  frameStyle: "standard" | "immersive";
+  captions: boolean;
+  voiceover: boolean;
+  hook: string;
+  handle: string;
+}) {
+  const showHeadline = mode === "edited" && headline.trim().length > 0;
+  const watermark = (handle || "@yourchannel").toUpperCase();
+  // crude "karaoke" split for the caption mock
+  const hookWords = (hook || "your spoken hook").trim().split(/\s+/).slice(0, 4);
+
+  return (
+    <div className="rounded-xl border border-border bg-gradient-to-b from-card to-[hsl(240_10%_5%)] p-4">
+      <div className="flex items-center justify-between mb-4">
+        <span className="font-mono text-[10.5px] uppercase tracking-[0.13em] text-muted-foreground flex items-center gap-2">
+          <Eye className="w-3.5 h-3.5 text-primary" /> Live preview
+        </span>
+        <span className="font-mono text-[9px] text-muted-foreground/50">9:16</span>
+      </div>
+
+      <div className="w-[200px] mx-auto aspect-[9/16] rounded-[22px] border border-border bg-black overflow-hidden relative shadow-[0_30px_60px_-30px_#000]">
+        {/* 40px top drop to clear YouTube UI */}
+        <div className="h-[7%] bg-black" />
+        {/* video area */}
+        <div className="absolute inset-x-0 top-[7%] bottom-0 grid place-items-center bg-gradient-to-br from-[#2a2140] via-[#101a2e] to-[#0a1420]">
+          <div className="w-11 h-11 rounded-full grid place-items-center bg-white/10 backdrop-blur-sm border border-white/20">
+            <Play className="w-4 h-4 text-white fill-white ml-0.5" />
+          </div>
+        </div>
+
+        {voiceover && (
+          <div className="absolute left-2 top-[calc(7%+8px)] flex items-center gap-1 rounded-md bg-[#9b7bff]/85 px-1.5 py-0.5 text-[7.5px] font-mono tracking-wide text-white">
+            <Mic className="w-2.5 h-2.5" /> HOOK
+          </div>
+        )}
+
+        {showHeadline && (
+          <div className="absolute inset-x-0 top-[11%] px-3 text-center">
+            <span className="font-extrabold text-[13px] leading-tight text-white drop-shadow-[0_2px_8px_rgba(0,0,0,0.8)]">
+              {headline}
+            </span>
+          </div>
+        )}
+
+        {mode === "edited" && (
+          <div className="absolute inset-x-0 top-1/2 -translate-y-1/2 text-center font-extrabold tracking-wide text-[15px] text-white/85 drop-shadow-[0_2px_10px_rgba(0,0,0,0.7)]">
+            {watermark}
+          </div>
+        )}
+
+        {captions && (
+          <div className="absolute inset-x-0 bottom-[13%] px-3 text-center leading-snug">
+            <span className="font-extrabold text-[13px] text-black bg-primary px-1.5 py-0.5 rounded-[5px] shadow">
+              {hookWords[0] ?? "your"}
+            </span>{" "}
+            <span className="font-extrabold text-[13px] text-white drop-shadow-[0_2px_6px_#000]">
+              {hookWords.slice(1).join(" ") || "captions"}
+            </span>
+          </div>
+        )}
+      </div>
+
+      <div className="mt-4 space-y-2">
+        {[
+          ["Frame", frameStyle === "immersive" ? "Immersive" : "Standard", "text-foreground"],
+          ["Captions", captions ? "Karaoke ON" : "Off", captions ? "text-primary" : "text-muted-foreground"],
+          ["Voiceover", voiceover ? "Hook ON" : "Off", voiceover ? "text-[#b69dff]" : "text-muted-foreground"],
+        ].map(([k, v, cls]) => (
+          <div key={k} className="flex items-center justify-between font-mono text-[10.5px]">
+            <span className="text-muted-foreground">{k}</span>
+            <span className={cls as string}>{v}</span>
+          </div>
+        ))}
+      </div>
+      <p className="mt-3 text-[11px] text-muted-foreground/60 leading-relaxed text-center">
+        Reflects your settings live — what you see is the Short that renders.
+      </p>
+    </div>
+  );
+}
+
 export default function Home() {
   const queryClient = useQueryClient();
   const { toast } = useToast();
   const [sourceTab, setSourceTab] = useState<SourceTab>("youtube");
-  const [navConfirmOpen, setNavConfirmOpen] = useState(false);
 
   // YouTube preview player
   const [showPlayer, setShowPlayer] = useState(false);
@@ -167,11 +329,17 @@ export default function Home() {
   });
   const [localErrors, setLocalErrors] = useState<Partial<Record<keyof LocalForm | "file", string>>>({});
 
-  useListClips({ query: { queryKey: getListClipsQueryKey() } });
+  // channel handle for the live preview watermark
+  const [channelHandle, setChannelHandle] = useState("");
+  useEffect(() => {
+    fetch(`${API_BASE}/api/settings`)
+      .then((r) => r.json() as Promise<{ channelHandle?: string }>)
+      .then((d) => setChannelHandle(d.channelHandle ?? ""))
+      .catch(() => {});
+  }, []);
 
-  const { data: stats, isLoading: isLoadingStats } = useGetClipStats({
-    query: { queryKey: getGetClipStatsQueryKey() },
-  });
+  // warm the clips list cache for the timeline
+  useListClips({ query: { queryKey: getListClipsQueryKey() } });
 
   const form = useForm<FormValues>({
     resolver: zodResolver(formSchema),
@@ -260,14 +428,11 @@ export default function Home() {
 
   // Builds a ready-made prompt for the user's own Gemini app and copies it to the
   // clipboard. The server never calls any AI — the user pastes this into Gemini,
-  // then pastes the returned hook line back into the voiceover text box. The prompt
-  // is built from context available at creation time (no transcript yet — that only
-  // exists after a render).
+  // then pastes the returned hook line back into the voiceover text box.
   async function copyHookPrompt(index: number) {
     const values = form.getValues();
     const clip = values.clips[index];
     if (!clip) return;
-    const toSecs = (t: string) => t.split(":").reduce((a, v) => a * 60 + Number(v), 0);
     const dur = Math.max(0, toSecs(clip.endTime) - toSecs(clip.startTime));
     const prompt =
       `You are a viral short-form video editor. Write ONE punchy spoken intro hook ` +
@@ -348,7 +513,6 @@ export default function Home() {
     if (!startValid) errors.startTime = "Must be HH:MM:SS";
     if (!endValid) errors.endTime = "Must be HH:MM:SS";
     if (startValid && endValid) {
-      const toSecs = (t: string) => t.split(":").reduce((acc, v) => acc * 60 + Number(v), 0);
       if (toSecs(localForm.endTime) <= toSecs(localForm.startTime))
         errors.endTime = "End time must be after start time";
     }
@@ -410,629 +574,482 @@ export default function Home() {
 
   const clipCount = fields.length;
 
+  // ----- values driving the live preview -----
+  const wFrame = form.watch("frameStyle");
+  const wClip0 = form.watch("clips.0");
+  const preview =
+    sourceTab === "youtube"
+      ? {
+          headline: wClip0?.headline ?? "",
+          mode: (wClip0?.mode ?? "edited") as "edited" | "raw",
+          captions: wClip0?.captionsEnabled ?? true,
+          voiceover: wClip0?.voiceoverEnabled ?? false,
+          hook: wClip0?.voiceoverHook ?? "",
+        }
+      : {
+          headline: localForm.headline,
+          mode: localForm.mode,
+          captions: localForm.captionsEnabled,
+          voiceover: false,
+          hook: "",
+        };
+
   return (
     <div className="h-full bg-background text-foreground flex flex-col font-sans overflow-hidden">
-      <AppHeader>
-        <button
-          onClick={() => navigate("/settings")}
-          className="ml-auto text-muted-foreground hover:text-foreground transition-colors"
-          title="Settings"
-          aria-label="Settings"
-        >
-          <Settings className="w-4 h-4" />
-        </button>
-      </AppHeader>
+      <AppHeader />
 
-      <main className="flex-1 flex flex-col min-h-0">
-        <section className="flex-1 min-h-0 overflow-y-auto border-b border-border bg-background p-4 md:p-8">
-          <div className="max-w-4xl mx-auto">
-            <h2 className="text-sm font-mono text-muted-foreground uppercase tracking-widest mb-5 flex items-center gap-2">
-              <Activity className="w-4 h-4" />
-              New Job Definition
-            </h2>
+      <main className="flex-1 min-h-0 overflow-y-auto">
+        <div className="max-w-6xl mx-auto px-4 md:px-8 py-6 md:py-8">
+          {/* Page heading */}
+          <p className="flex items-center gap-2 font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground mb-3">
+            <Zap className="w-4 h-4 text-primary" /> New job definition
+          </p>
+          <h2 className="text-2xl font-extrabold tracking-tight">Create a Short</h2>
+          <p className="text-sm text-muted-foreground mt-1 mb-6">
+            Pick a source, mark your in/out points, and dispatch render jobs to the phone.
+          </p>
 
-            {/* Source + Frame Style toggles */}
-            <div className="flex flex-wrap gap-3 mb-5">
-              <div className="flex rounded-md overflow-hidden border border-border bg-card w-fit">
-                <button
-                  type="button"
-                  onClick={() => { setSourceTab("youtube"); setLocalErrors({}); }}
-                  className={`flex items-center gap-2 px-4 py-2 text-xs font-mono uppercase tracking-wider transition-colors ${
-                    sourceTab === "youtube" ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"
-                  }`}
-                >
-                  <Youtube className="w-3.5 h-3.5" />
-                  YouTube
-                </button>
-                <button
-                  type="button"
-                  onClick={() => { setSourceTab("local"); setLocalErrors({}); }}
-                  className={`flex items-center gap-2 px-4 py-2 text-xs font-mono uppercase tracking-wider transition-colors ${
-                    sourceTab === "local" ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"
-                  }`}
-                >
-                  <Upload className="w-3.5 h-3.5" />
-                  Local File
-                </button>
+          <div className="grid lg:grid-cols-[1fr_320px] gap-6 items-start">
+            {/* LEFT — form */}
+            <div className="min-w-0">
+              {/* source + frame toolbar */}
+              <div className="flex flex-wrap gap-3 mb-5">
+                <Segmented
+                  value={sourceTab}
+                  onChange={(v) => { setSourceTab(v as SourceTab); setLocalErrors({}); }}
+                  options={[
+                    { value: "youtube", label: "YouTube", icon: <Youtube className="w-3.5 h-3.5" /> },
+                    { value: "local", label: "Local file", icon: <Upload className="w-3.5 h-3.5" /> },
+                  ]}
+                />
+                <Segmented
+                  value={wFrame}
+                  onChange={(v) => form.setValue("frameStyle", v as "standard" | "immersive")}
+                  options={[
+                    { value: "immersive", label: "Immersive" },
+                    { value: "standard", label: "Standard" },
+                  ]}
+                />
               </div>
 
-              <div className="flex rounded-md overflow-hidden border border-border bg-card w-fit">
-                <button
-                  type="button"
-                  onClick={() => form.setValue("frameStyle", "immersive")}
-                  className={`px-4 py-2 text-xs font-mono uppercase tracking-wider transition-colors ${
-                    form.watch("frameStyle") === "immersive" ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"
-                  }`}
-                >
-                  Immersive
-                </button>
-                <button
-                  type="button"
-                  onClick={() => form.setValue("frameStyle", "standard")}
-                  className={`px-4 py-2 text-xs font-mono uppercase tracking-wider transition-colors ${
-                    form.watch("frameStyle") === "standard" ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"
-                  }`}
-                >
-                  Standard
-                </button>
-              </div>
-            </div>
-
-            {sourceTab === "youtube" && (
-              <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-5">
-                {/* URL row */}
-                <div className="space-y-1.5">
-                  <Label className="font-mono text-xs uppercase tracking-wider text-muted-foreground">
-                    Source URL
-                  </Label>
-                  <div className="flex gap-2">
-                    <Input
-                      placeholder="https://youtube.com/watch?v=..."
-                      className="font-mono text-sm bg-card flex-1 min-w-0"
-                      {...form.register("youtubeUrl")}
-                    />
-                    {videoId && (
-                      <Button
-                        type="button"
-                        variant="secondary"
-                        onClick={() => setShowPlayer((p) => !p)}
-                        className={`font-mono text-xs tracking-wider border transition-colors shrink-0 ${
-                          showPlayer
-                            ? "border-primary/40 bg-primary/15 text-primary"
-                            : "border-border bg-card text-muted-foreground hover:text-foreground"
-                        }`}
-                      >
-                        <MonitorPlay className="w-4 h-4" />
-                        <span className="hidden sm:inline ml-2">{showPlayer ? "HIDE" : "PREVIEW"}</span>
-                      </Button>
-                    )}
-                  </div>
-                  {form.formState.errors.youtubeUrl && (
-                    <p className="text-xs text-destructive font-mono">{form.formState.errors.youtubeUrl.message}</p>
-                  )}
-                </div>
-
-                {/* YouTube preview player */}
-                {showPlayer && videoId && (
-                  <div className="rounded-md border border-border overflow-hidden bg-black">
-                    <div className="aspect-video w-full relative">
-                      <div ref={playerDivRef} className="w-full h-full" />
-                      {!playerReady && (
-                        <div className="absolute inset-0 flex items-center justify-center bg-black">
-                          <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
-                        </div>
+              {sourceTab === "youtube" && (
+                <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-5">
+                  {/* URL + source creator card */}
+                  <div className="rounded-xl border border-border bg-gradient-to-b from-card to-[hsl(240_10%_5%)] p-5 space-y-4">
+                    <div>
+                      <FieldLabel>Source URL</FieldLabel>
+                      <div className="flex gap-2">
+                        <Input
+                          placeholder="https://youtube.com/watch?v=..."
+                          className="font-mono text-sm bg-background flex-1 min-w-0"
+                          {...form.register("youtubeUrl")}
+                        />
+                        {videoId && (
+                          <Button
+                            type="button"
+                            variant="secondary"
+                            onClick={() => setShowPlayer((p) => !p)}
+                            className={`font-mono text-xs tracking-wider border transition-colors shrink-0 ${
+                              showPlayer
+                                ? "border-primary/40 bg-primary/15 text-primary"
+                                : "border-border bg-card text-muted-foreground hover:text-foreground"
+                            }`}
+                          >
+                            <MonitorPlay className="w-4 h-4" />
+                            <span className="hidden sm:inline ml-2">{showPlayer ? "HIDE" : "PREVIEW"}</span>
+                          </Button>
+                        )}
+                      </div>
+                      {form.formState.errors.youtubeUrl && (
+                        <p className="text-xs text-destructive font-mono mt-1.5">{form.formState.errors.youtubeUrl.message}</p>
                       )}
                     </div>
-                    {playerReady && (
-                      <div className="border-t border-border bg-card px-3 py-2 flex flex-wrap gap-2">
-                        {fields.map((_, i) => (
-                          <div key={i} className="flex items-center gap-1.5">
-                            {clipCount > 1 && (
-                              <span className="text-[10px] font-mono text-muted-foreground/50 uppercase tracking-wider">
-                                {String(i + 1).padStart(2, "0")}
-                              </span>
-                            )}
-                            <button
-                              type="button"
-                              onClick={() => handleSetIn(i)}
-                              className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider border border-border bg-background hover:bg-muted rounded transition-colors"
-                            >
-                              Set In
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleSetOut(i)}
-                              className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider border border-border bg-background hover:bg-muted rounded transition-colors"
-                            >
-                              Set Out
-                            </button>
-                          </div>
-                        ))}
-                        <span className="text-[10px] font-mono text-muted-foreground/40 self-center ml-auto">
-                          pause first, then set
-                        </span>
-                      </div>
-                    )}
-                  </div>
-                )}
 
-                {/* Source Creator */}
-                <div className="space-y-1.5">
-                  <Label className="font-mono text-xs uppercase tracking-wider text-muted-foreground">
-                    Source Creator <span className="text-muted-foreground/40">(optional)</span>
-                  </Label>
-                  <Input
-                    placeholder="e.g. KSI, MrBeast, IShowSpeed"
-                    className="font-mono text-sm bg-card"
-                    {...form.register("sourceChannel")}
-                  />
-                </div>
-
-                {/* Clip entries */}
-                <div className="space-y-2">
-                  {/* Desktop header row */}
-                  <div className="hidden md:grid grid-cols-12 gap-3 px-1">
-                    <div className="col-span-1">
-                      <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground/50">#</span>
-                    </div>
-                    <div className="col-span-2">
-                      <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">Mode</span>
-                    </div>
-                    <div className="col-span-2">
-                      <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">In</span>
-                    </div>
-                    <div className="col-span-2">
-                      <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">Out</span>
-                    </div>
-                    <div className="col-span-2">
-                      <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">Headline</span>
-                    </div>
-                    <div className="col-span-1 text-center">
-                      <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">CC</span>
-                    </div>
-                    <div className="col-span-1 text-center">
-                      <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">Outro</span>
-                    </div>
-                    <div className="col-span-1" />
-                  </div>
-
-                  {fields.map((field, index) => {
-                    const currentMode = form.watch(`clips.${index}.mode`);
-                    const isRaw = currentMode === "raw";
-
-                    return (
-                      <div key={field.id}>
-                        {/* Mobile card */}
-                        <div className="md:hidden rounded-md border border-border bg-card/40 p-3 space-y-2.5">
-                          <div className="flex items-center gap-2">
-                            <span className="font-mono text-[10px] text-muted-foreground/40 tabular-nums w-5 shrink-0">
-                              {String(index + 1).padStart(2, "0")}
-                            </span>
-                            <div className="flex rounded overflow-hidden border border-border text-[10px] font-mono uppercase tracking-wider flex-1">
-                              <button
-                                type="button"
-                                onClick={() => form.setValue(`clips.${index}.mode`, "edited")}
-                                className={`flex-1 py-1.5 flex items-center justify-center transition-colors ${!isRaw ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"}`}
-                              >
-                                Edited
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => form.setValue(`clips.${index}.mode`, "raw")}
-                                className={`flex-1 py-1.5 flex items-center justify-center transition-colors ${isRaw ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"}`}
-                              >
-                                Raw
-                              </button>
-                            </div>
-                            <div className="flex items-center gap-2.5 shrink-0">
-                              <label className="flex items-center gap-1 cursor-pointer">
-                                <Checkbox
-                                  checked={form.watch(`clips.${index}.captionsEnabled`) ?? true}
-                                  onCheckedChange={(v) => form.setValue(`clips.${index}.captionsEnabled`, v === true)}
-                                />
-                                <span className="text-[10px] font-mono text-muted-foreground">CC</span>
-                              </label>
-                              <label className="flex items-center gap-1 cursor-pointer">
-                                <Checkbox
-                                  checked={form.watch(`clips.${index}.outroEnabled`) ?? true}
-                                  onCheckedChange={(v) => form.setValue(`clips.${index}.outroEnabled`, v === true)}
-                                />
-                                <span className="text-[10px] font-mono text-muted-foreground">Outro</span>
-                              </label>
-                              {clipCount > 1 && (
-                                <button
-                                  type="button"
-                                  onClick={() => remove(index)}
-                                  className="w-6 h-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
-                                >
-                                  <X className="w-3.5 h-3.5" />
-                                </button>
-                              )}
-                            </div>
-                          </div>
-
-                          <div className="grid grid-cols-2 gap-2">
-                            <div>
-                              <p className="text-[10px] font-mono text-muted-foreground uppercase tracking-wider mb-1">In</p>
-                              <Input
-                                placeholder="00:00:00"
-                                className={`font-mono text-sm bg-background h-9 ${form.formState.errors.clips?.[index]?.startTime ? "border-destructive" : ""}`}
-                                {...form.register(`clips.${index}.startTime`)}
-                              />
-                              {form.formState.errors.clips?.[index]?.startTime && (
-                                <p className="text-[10px] text-destructive font-mono mt-0.5">{form.formState.errors.clips[index]!.startTime!.message}</p>
-                              )}
-                            </div>
-                            <div>
-                              <p className="text-[10px] font-mono text-muted-foreground uppercase tracking-wider mb-1">Out</p>
-                              <Input
-                                placeholder="00:00:15"
-                                className={`font-mono text-sm bg-background h-9 ${form.formState.errors.clips?.[index]?.endTime ? "border-destructive" : ""}`}
-                                {...form.register(`clips.${index}.endTime`)}
-                              />
-                              {form.formState.errors.clips?.[index]?.endTime && (
-                                <p className="text-[10px] text-destructive font-mono mt-0.5">{form.formState.errors.clips[index]!.endTime!.message}</p>
-                              )}
-                            </div>
-                          </div>
-
-                          {!isRaw && (
-                            <div>
-                              <Input
-                                placeholder="Overlay headline…"
-                                className={`text-sm bg-background h-9 ${form.formState.errors.clips?.[index]?.headline ? "border-destructive" : ""}`}
-                                {...form.register(`clips.${index}.headline`)}
-                              />
-                              {form.formState.errors.clips?.[index]?.headline && (
-                                <p className="text-[10px] text-destructive font-mono mt-0.5">{form.formState.errors.clips[index]!.headline!.message}</p>
-                              )}
+                    {showPlayer && videoId && (
+                      <div className="rounded-lg border border-border overflow-hidden bg-black">
+                        <div className="aspect-video w-full relative">
+                          <div ref={playerDivRef} className="w-full h-full" />
+                          {!playerReady && (
+                            <div className="absolute inset-0 flex items-center justify-center bg-black">
+                              <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
                             </div>
                           )}
                         </div>
-
-                        {/* Desktop row */}
-                        <div className="hidden md:grid grid-cols-12 gap-3 items-start">
-                          <div className="col-span-1 flex items-center h-10">
-                            <span className="font-mono text-xs text-muted-foreground/40 tabular-nums">
-                              {String(index + 1).padStart(2, "0")}
+                        {playerReady && (
+                          <div className="border-t border-border bg-card px-3 py-2 flex flex-wrap gap-2">
+                            {fields.map((_, i) => (
+                              <div key={i} className="flex items-center gap-1.5">
+                                {clipCount > 1 && (
+                                  <span className="text-[10px] font-mono text-muted-foreground/50 uppercase tracking-wider">
+                                    {String(i + 1).padStart(2, "0")}
+                                  </span>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => handleSetIn(i)}
+                                  className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider border border-border bg-background hover:bg-muted rounded transition-colors"
+                                >
+                                  Set In
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleSetOut(i)}
+                                  className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider border border-border bg-background hover:bg-muted rounded transition-colors"
+                                >
+                                  Set Out
+                                </button>
+                              </div>
+                            ))}
+                            <span className="text-[10px] font-mono text-muted-foreground/40 self-center ml-auto">
+                              pause first, then set
                             </span>
                           </div>
-                          <div className="col-span-2 flex h-10 rounded-md overflow-hidden border border-border bg-card text-[10px] font-mono uppercase tracking-wider">
-                            <button
-                              type="button"
-                              onClick={() => form.setValue(`clips.${index}.mode`, "edited")}
-                              className={`flex-1 flex items-center justify-center transition-colors ${!isRaw ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"}`}
-                            >
-                              Edited
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => form.setValue(`clips.${index}.mode`, "raw")}
-                              className={`flex-1 flex items-center justify-center transition-colors ${isRaw ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"}`}
-                            >
-                              Raw
-                            </button>
-                          </div>
-                          <div className="col-span-2">
-                            <Input placeholder="00:00:00" className="font-mono text-sm bg-card h-10" {...form.register(`clips.${index}.startTime`)} />
-                            {form.formState.errors.clips?.[index]?.startTime && (
-                              <p className="text-[10px] text-destructive font-mono mt-0.5">{form.formState.errors.clips[index]!.startTime!.message}</p>
-                            )}
-                          </div>
-                          <div className="col-span-2">
-                            <Input placeholder="00:00:15" className="font-mono text-sm bg-card h-10" {...form.register(`clips.${index}.endTime`)} />
-                            {form.formState.errors.clips?.[index]?.endTime && (
-                              <p className="text-[10px] text-destructive font-mono mt-0.5">{form.formState.errors.clips[index]!.endTime!.message}</p>
-                            )}
-                          </div>
-                          <div className="col-span-2">
-                            {isRaw ? (
-                              <div className="h-10 flex items-center px-3 rounded-md border border-dashed border-border/50 text-xs text-muted-foreground/40 font-mono italic select-none">
-                                no overlay
-                              </div>
-                            ) : (
-                              <>
-                                <Input placeholder="Overlay headline…" className="text-sm bg-card h-10" {...form.register(`clips.${index}.headline`)} />
-                                {form.formState.errors.clips?.[index]?.headline && (
-                                  <p className="text-[10px] text-destructive font-mono mt-0.5">{form.formState.errors.clips[index]!.headline!.message}</p>
-                                )}
-                              </>
-                            )}
-                          </div>
-                          <div className="col-span-1 flex items-center justify-center h-10">
-                            <Checkbox
-                              checked={form.watch(`clips.${index}.captionsEnabled`) ?? true}
-                              onCheckedChange={(v) => form.setValue(`clips.${index}.captionsEnabled`, v === true)}
-                              title="Enable captions"
+                        )}
+                      </div>
+                    )}
+
+                    <div>
+                      <FieldLabel>Source creator <span className="text-muted-foreground/40 normal-case">(optional)</span></FieldLabel>
+                      <Input
+                        placeholder="e.g. KSI, MrBeast, IShowSpeed"
+                        className="font-mono text-sm bg-background"
+                        {...form.register("sourceChannel")}
+                      />
+                    </div>
+                  </div>
+
+                  {/* clip entries */}
+                  <div className="space-y-3">
+                    {fields.map((field, index) => {
+                      const currentMode = form.watch(`clips.${index}.mode`);
+                      const isRaw = currentMode === "raw";
+                      const start = form.watch(`clips.${index}.startTime`);
+                      const end = form.watch(`clips.${index}.endTime`);
+                      const voOn = form.watch(`clips.${index}.voiceoverEnabled`) ?? false;
+
+                      return (
+                        <div key={field.id} className="rounded-xl border border-border bg-background/40 overflow-hidden">
+                          {/* clip header */}
+                          <div className="flex items-center gap-3 px-4 py-3 border-b border-border">
+                            <span className="font-mono text-[11px] text-primary bg-primary/[0.08] border border-primary/20 w-7 h-7 rounded-md grid place-items-center font-semibold tabular-nums">
+                              {String(index + 1).padStart(2, "0")}
+                            </span>
+                            <Segmented
+                              value={currentMode}
+                              onChange={(v) => form.setValue(`clips.${index}.mode`, v as "edited" | "raw")}
+                              options={[
+                                { value: "edited", label: "Edited" },
+                                { value: "raw", label: "Raw" },
+                              ]}
                             />
-                          </div>
-                          <div className="col-span-1 flex items-center justify-center h-10">
-                            <Checkbox
-                              checked={form.watch(`clips.${index}.outroEnabled`) ?? true}
-                              onCheckedChange={(v) => form.setValue(`clips.${index}.outroEnabled`, v === true)}
-                              title="Include outro card"
-                            />
-                          </div>
-                          <div className="col-span-1 flex items-center justify-center h-10">
                             {clipCount > 1 && (
                               <button
                                 type="button"
                                 onClick={() => remove(index)}
-                                className="w-7 h-7 flex items-center justify-center rounded text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
+                                className="ml-auto w-7 h-7 grid place-items-center rounded-md border border-border text-muted-foreground hover:text-destructive hover:border-destructive/40 hover:bg-destructive/10 transition-colors"
+                                aria-label="Remove clip"
                               >
-                                <X className="w-4 h-4" />
+                                <X className="w-3.5 h-3.5" />
                               </button>
                             )}
                           </div>
-                        </div>
 
-                        {/* Voiceover hook row — full width, both layouts (edited mode only) */}
-                        {!isRaw && (
-                          <div className="mt-2 rounded-md border border-border/60 bg-card/40 p-2.5 space-y-2">
-                            <div className="flex items-center justify-between gap-2">
-                              <label className="flex items-center gap-2 cursor-pointer">
-                                <Checkbox
-                                  checked={form.watch(`clips.${index}.voiceoverEnabled`) ?? false}
-                                  onCheckedChange={(v) => form.setValue(`clips.${index}.voiceoverEnabled`, v === true)}
+                          <div className="p-4 space-y-3.5">
+                            {/* in / out / duration */}
+                            <div className="grid grid-cols-[1fr_1fr_auto] gap-3 items-end">
+                              <div>
+                                <FieldLabel>In</FieldLabel>
+                                <Input
+                                  placeholder="00:00:00"
+                                  className={`font-mono text-sm bg-background ${form.formState.errors.clips?.[index]?.startTime ? "border-destructive" : ""}`}
+                                  {...form.register(`clips.${index}.startTime`)}
                                 />
-                                <span className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground flex items-center gap-1">
-                                  <Mic className="w-3 h-3" /> AI Voiceover Hook
-                                </span>
-                              </label>
-                              {form.watch(`clips.${index}.voiceoverEnabled`) && (
-                                <button
-                                  type="button"
-                                  onClick={() => copyHookPrompt(index)}
-                                  className="text-[10px] font-mono uppercase tracking-wider text-primary hover:underline flex items-center gap-1 shrink-0"
-                                >
-                                  <ClipboardCopy className="w-3 h-3" /> Copy Gemini prompt
-                                </button>
-                              )}
+                              </div>
+                              <div>
+                                <FieldLabel>Out</FieldLabel>
+                                <Input
+                                  placeholder="00:00:15"
+                                  className={`font-mono text-sm bg-background ${form.formState.errors.clips?.[index]?.endTime ? "border-destructive" : ""}`}
+                                  {...form.register(`clips.${index}.endTime`)}
+                                />
+                              </div>
+                              <div className="font-mono text-[11px] text-primary border border-dashed border-primary/30 rounded-lg px-3 py-2.5 text-center whitespace-nowrap">
+                                <span className="block text-[9px] text-muted-foreground/60 uppercase tracking-[0.12em]">Length</span>
+                                {fmtDuration(start, end)}
+                              </div>
                             </div>
-                            {form.watch(`clips.${index}.voiceoverEnabled`) && (
-                              <Input
-                                placeholder="Spoken intro hook — type it, or paste from your Gemini app…"
-                                className="text-sm bg-background h-9"
-                                {...form.register(`clips.${index}.voiceoverHook`)}
+                            {form.formState.errors.clips?.[index]?.endTime && (
+                              <p className="text-[10px] text-destructive font-mono -mt-1.5">{form.formState.errors.clips[index]!.endTime!.message}</p>
+                            )}
+
+                            {/* headline */}
+                            {!isRaw && (
+                              <div>
+                                <Input
+                                  placeholder="Overlay headline…"
+                                  className={`text-sm bg-background ${form.formState.errors.clips?.[index]?.headline ? "border-destructive" : ""}`}
+                                  {...form.register(`clips.${index}.headline`)}
+                                />
+                                {form.formState.errors.clips?.[index]?.headline && (
+                                  <p className="text-[10px] text-destructive font-mono mt-1">{form.formState.errors.clips[index]!.headline!.message}</p>
+                                )}
+                              </div>
+                            )}
+
+                            {/* toggles */}
+                            <div className="flex flex-wrap gap-2">
+                              <ToggleChip
+                                label="Captions"
+                                checked={form.watch(`clips.${index}.captionsEnabled`) ?? true}
+                                onChange={(v) => form.setValue(`clips.${index}.captionsEnabled`, v)}
                               />
+                              <ToggleChip
+                                label="Outro card"
+                                checked={form.watch(`clips.${index}.outroEnabled`) ?? true}
+                                onChange={(v) => form.setValue(`clips.${index}.outroEnabled`, v)}
+                              />
+                            </div>
+
+                            {/* voiceover PRO panel (edited only) */}
+                            {!isRaw && (
+                              <div className="rounded-lg border border-[#9b7bff]/30 bg-gradient-to-b from-[#9b7bff]/[0.08] to-[#9b7bff]/[0.02] p-3">
+                                <div className="flex items-center justify-between gap-2">
+                                  <label className="flex items-center gap-2.5 cursor-pointer">
+                                    <span
+                                      className={`w-3.5 h-3.5 rounded-[4px] border flex items-center justify-center ${
+                                        voOn ? "bg-[#9b7bff] border-[#9b7bff]" : "border-muted-foreground/50"
+                                      }`}
+                                      onClick={(e) => { e.preventDefault(); form.setValue(`clips.${index}.voiceoverEnabled`, !voOn); }}
+                                    >
+                                      {voOn && <Check className="w-2.5 h-2.5 text-white" strokeWidth={3.5} />}
+                                    </span>
+                                    <span
+                                      className="text-[10.5px] font-mono uppercase tracking-[0.1em] text-[#c9b8ff] flex items-center gap-1.5"
+                                      onClick={(e) => { e.preventDefault(); form.setValue(`clips.${index}.voiceoverEnabled`, !voOn); }}
+                                    >
+                                      <Mic className="w-3.5 h-3.5 text-[#9b7bff]" /> AI Voiceover Hook
+                                      <span className="text-[8.5px] font-semibold tracking-[0.14em] text-[#b69dff] border border-[#9b7bff]/40 rounded px-1.5 py-0.5">PRO</span>
+                                    </span>
+                                  </label>
+                                  {voOn && (
+                                    <button
+                                      type="button"
+                                      onClick={() => copyHookPrompt(index)}
+                                      className="text-[10px] font-mono uppercase tracking-[0.08em] text-[#b69dff] hover:underline flex items-center gap-1.5 shrink-0"
+                                    >
+                                      <ClipboardCopy className="w-3 h-3" /> Copy Gemini prompt
+                                    </button>
+                                  )}
+                                </div>
+                                {voOn && (
+                                  <Input
+                                    placeholder="Spoken intro hook — type it, or paste from your Gemini app…"
+                                    className="text-sm bg-background mt-2.5"
+                                    {...form.register(`clips.${index}.voiceoverHook`)}
+                                  />
+                                )}
+                              </div>
                             )}
                           </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* add clip */}
+                  <button
+                    type="button"
+                    onClick={() => clipCount < MAX_CLIPS && append({ ...defaultClip })}
+                    disabled={clipCount >= MAX_CLIPS}
+                    className={`w-full flex items-center justify-center gap-2 rounded-xl border border-dashed py-3 font-mono text-[11px] uppercase tracking-[0.1em] transition-colors ${
+                      clipCount >= MAX_CLIPS
+                        ? "text-muted-foreground/30 border-border cursor-not-allowed"
+                        : "text-muted-foreground border-border hover:text-primary hover:border-primary/40"
+                    }`}
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    {clipCount >= MAX_CLIPS ? `Max ${MAX_CLIPS} clips reached` : `Add clip (${clipCount}/${MAX_CLIPS})`}
+                  </button>
+
+                  {/* CTA */}
+                  <div className="flex items-center justify-between gap-4 flex-wrap pt-1">
+                    <span className="font-mono text-[11px] text-muted-foreground">
+                      {clipCount} job{clipCount > 1 ? "s" : ""} ready · ~25–30 min on phone
+                    </span>
+                    <Button type="submit" disabled={isSubmitting} className="font-mono uppercase tracking-[0.13em] text-xs h-12 px-7">
+                      {isSubmitting ? (
+                        <><Loader2 className="mr-2 h-4 w-4 animate-spin" />DISPATCHING…</>
+                      ) : (
+                        <><SendHorizonal className="mr-2 h-4 w-4" />ENQUEUE {clipCount} JOB{clipCount > 1 ? "S" : ""}</>
+                      )}
+                    </Button>
+                  </div>
+                </form>
+              )}
+
+              {sourceTab === "local" && (
+                <div className="rounded-xl border border-border bg-gradient-to-b from-card to-[hsl(240_10%_5%)] p-5 space-y-5">
+                  <div>
+                    <FieldLabel>Video file <span className="text-muted-foreground/50 normal-case">(max 20 GB)</span></FieldLabel>
+                    <div
+                      className={`relative flex items-center gap-3 rounded-lg border bg-background px-4 py-3 cursor-pointer hover:bg-background/70 transition-colors ${localErrors.file ? "border-destructive" : "border-border"}`}
+                      onClick={() => fileInputRef.current?.click()}
+                    >
+                      <FileVideo className={`w-5 h-5 shrink-0 ${selectedFile ? "text-primary" : "text-muted-foreground/50"}`} />
+                      <div className="flex-1 min-w-0">
+                        {selectedFile ? (
+                          <>
+                            <p className="text-sm font-medium truncate">{selectedFile.name}</p>
+                            <p className="text-[10px] font-mono text-muted-foreground">
+                              {(selectedFile.size / (1024 * 1024)).toFixed(1)} MB
+                            </p>
+                          </>
+                        ) : (
+                          <p className="text-sm text-muted-foreground">Click to browse or drag a video file here</p>
                         )}
                       </div>
-                    );
-                  })}
-                </div>
-
-                <button
-                  type="button"
-                  onClick={() => clipCount < MAX_CLIPS && append({ ...defaultClip })}
-                  disabled={clipCount >= MAX_CLIPS}
-                  className={`flex items-center gap-2 text-xs font-mono uppercase tracking-wider py-1 transition-colors ${
-                    clipCount >= MAX_CLIPS
-                      ? "text-muted-foreground/30 cursor-not-allowed"
-                      : "text-muted-foreground hover:text-primary"
-                  }`}
-                >
-                  <Plus className="w-3.5 h-3.5" />
-                  {clipCount >= MAX_CLIPS ? `Max ${MAX_CLIPS} clips reached` : `Add clip (${clipCount}/${MAX_CLIPS})`}
-                </button>
-
-                <div className="flex justify-end pt-1">
-                  <Button type="submit" disabled={isSubmitting} className="font-mono uppercase tracking-widest text-xs h-12 px-8">
-                    {isSubmitting ? (
-                      <><Loader2 className="mr-2 h-4 w-4 animate-spin" />DISPATCHING...</>
-                    ) : (
-                      `ENQUEUE ${clipCount} JOB${clipCount > 1 ? "S" : ""}`
-                    )}
-                  </Button>
-                </div>
-              </form>
-            )}
-
-            {sourceTab === "local" && (
-              <div className="space-y-5">
-                <div className="space-y-1.5">
-                  <Label className="font-mono text-xs uppercase tracking-wider text-muted-foreground">
-                    Video File <span className="text-muted-foreground/50">(max 20 GB)</span>
-                  </Label>
-                  <div
-                    className={`relative flex items-center gap-3 rounded-md border bg-card px-4 py-3 cursor-pointer hover:bg-card/80 transition-colors ${localErrors.file ? "border-destructive" : "border-border"}`}
-                    onClick={() => fileInputRef.current?.click()}
-                  >
-                    <FileVideo className={`w-5 h-5 shrink-0 ${selectedFile ? "text-primary" : "text-muted-foreground/50"}`} />
-                    <div className="flex-1 min-w-0">
-                      {selectedFile ? (
-                        <>
-                          <p className="text-sm font-medium truncate">{selectedFile.name}</p>
-                          <p className="text-[10px] font-mono text-muted-foreground">
-                            {(selectedFile.size / (1024 * 1024)).toFixed(1)} MB
-                          </p>
-                        </>
-                      ) : (
-                        <p className="text-sm text-muted-foreground">Click to browse or drag a video file here</p>
+                      {selectedFile && (
+                        <button
+                          type="button"
+                          onClick={(e) => { e.stopPropagation(); setSelectedFile(null); if (fileInputRef.current) fileInputRef.current.value = ""; }}
+                          className="shrink-0 w-6 h-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
                       )}
-                    </div>
-                    {selectedFile && (
-                      <button
-                        type="button"
-                        onClick={(e) => { e.stopPropagation(); setSelectedFile(null); if (fileInputRef.current) fileInputRef.current.value = ""; }}
-                        className="shrink-0 w-6 h-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
-                      >
-                        <X className="w-3.5 h-3.5" />
-                      </button>
-                    )}
-                    <input
-                      ref={fileInputRef}
-                      type="file"
-                      accept="video/*"
-                      className="sr-only"
-                      onChange={(e) => {
-                        const file = e.target.files?.[0] ?? null;
-                        if (file && file.size > MAX_FILE_BYTES) {
-                          toast({ title: "File too large", variant: "destructive" });
-                          return;
-                        }
-                        setSelectedFile(file);
-                        setLocalErrors((prev) => ({ ...prev, file: undefined }));
-                      }}
-                    />
-                  </div>
-                  {localErrors.file && <p className="text-xs text-destructive font-mono">{localErrors.file}</p>}
-                </div>
-
-                <div className="space-y-1.5">
-                  <Label className="font-mono text-xs uppercase tracking-wider text-muted-foreground">Mode</Label>
-                  <div className="flex rounded-md overflow-hidden border border-border bg-card w-fit">
-                    {(["edited", "raw"] as const).map((m) => (
-                      <button
-                        key={m}
-                        type="button"
-                        onClick={() => {
-                          setLocalForm((p) => ({ ...p, mode: m }));
-                          if (m === "raw") setLocalErrors((p) => ({ ...p, headline: undefined }));
+                      <input
+                        ref={fileInputRef}
+                        type="file"
+                        accept="video/*"
+                        className="sr-only"
+                        onChange={(e) => {
+                          const file = e.target.files?.[0] ?? null;
+                          if (file && file.size > MAX_FILE_BYTES) {
+                            toast({ title: "File too large", variant: "destructive" });
+                            return;
+                          }
+                          setSelectedFile(file);
+                          setLocalErrors((prev) => ({ ...prev, file: undefined }));
                         }}
-                        className={`px-4 py-2 text-xs font-mono uppercase tracking-wider transition-colors ${
-                          localForm.mode === m ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:text-foreground"
-                        }`}
-                      >
-                        {m}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-2 gap-3">
-                  <div className="space-y-1.5">
-                    <Label className="font-mono text-xs uppercase tracking-wider text-muted-foreground">In</Label>
-                    <Input
-                      placeholder="00:00:00"
-                      className={`font-mono text-sm bg-card ${localErrors.startTime ? "border-destructive" : ""}`}
-                      value={localForm.startTime}
-                      onChange={(e) => setLocalForm((p) => ({ ...p, startTime: e.target.value }))}
-                    />
-                    {localErrors.startTime && <p className="text-xs text-destructive font-mono">{localErrors.startTime}</p>}
-                  </div>
-                  <div className="space-y-1.5">
-                    <Label className="font-mono text-xs uppercase tracking-wider text-muted-foreground">Out</Label>
-                    <Input
-                      placeholder="00:01:00"
-                      className={`font-mono text-sm bg-card ${localErrors.endTime ? "border-destructive" : ""}`}
-                      value={localForm.endTime}
-                      onChange={(e) => setLocalForm((p) => ({ ...p, endTime: e.target.value }))}
-                    />
-                    {localErrors.endTime && <p className="text-xs text-destructive font-mono">{localErrors.endTime}</p>}
-                  </div>
-                </div>
-
-                {localForm.mode === "edited" && (
-                  <div className="space-y-1.5">
-                    <Label className="font-mono text-xs uppercase tracking-wider text-muted-foreground">Overlay Headline</Label>
-                    <Input
-                      placeholder="Overlay headline…"
-                      className={`text-sm bg-card ${localErrors.headline ? "border-destructive" : ""}`}
-                      value={localForm.headline}
-                      onChange={(e) => setLocalForm((p) => ({ ...p, headline: e.target.value }))}
-                    />
-                    {localErrors.headline && <p className="text-xs text-destructive font-mono">{localErrors.headline}</p>}
-                  </div>
-                )}
-
-                <div className="space-y-1.5">
-                  <Label className="font-mono text-xs uppercase tracking-wider text-muted-foreground">
-                    Source Creator <span className="text-muted-foreground/50">(optional)</span>
-                  </Label>
-                  <Input
-                    placeholder="e.g. KSI, MrBeast, IShowSpeed"
-                    className="font-mono text-sm bg-card"
-                    value={localForm.sourceChannel}
-                    onChange={(e) => setLocalForm((p) => ({ ...p, sourceChannel: e.target.value }))}
-                  />
-                </div>
-
-                <label className="flex items-center gap-2.5 cursor-pointer w-fit">
-                  <Checkbox
-                    checked={localForm.captionsEnabled}
-                    onCheckedChange={(v) => setLocalForm((p) => ({ ...p, captionsEnabled: v === true }))}
-                  />
-                  <span className="font-mono text-xs uppercase tracking-wider text-muted-foreground">Enable Captions</span>
-                </label>
-
-                {uploadProgress !== null && (
-                  <div className="space-y-1">
-                    <div className="flex justify-between text-[10px] font-mono text-muted-foreground">
-                      <span>Uploading…</span>
-                      <span>{uploadProgress}%</span>
-                    </div>
-                    <div className="h-1 bg-muted rounded-full overflow-hidden">
-                      <div
-                        className="h-full bg-primary rounded-full transition-all duration-300"
-                        style={{ width: `${uploadProgress}%` }}
                       />
                     </div>
+                    {localErrors.file && <p className="text-xs text-destructive font-mono mt-1.5">{localErrors.file}</p>}
                   </div>
-                )}
 
-                <div className="flex justify-end pt-1">
-                  <Button
-                    type="button"
-                    disabled={isUploading}
-                    onClick={handleLocalUpload}
-                    className="font-mono uppercase tracking-widest text-xs h-12 px-8"
-                  >
-                    {isUploading ? (
-                      <><Loader2 className="mr-2 h-4 w-4 animate-spin" />UPLOADING…</>
-                    ) : (
-                      <><Upload className="mr-2 h-4 w-4" />UPLOAD &amp; PROCESS</>
-                    )}
-                  </Button>
+                  <div>
+                    <FieldLabel>Mode</FieldLabel>
+                    <Segmented
+                      value={localForm.mode}
+                      onChange={(m) => {
+                        setLocalForm((p) => ({ ...p, mode: m as "edited" | "raw" }));
+                        if (m === "raw") setLocalErrors((p) => ({ ...p, headline: undefined }));
+                      }}
+                      options={[
+                        { value: "edited", label: "Edited" },
+                        { value: "raw", label: "Raw" },
+                      ]}
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <FieldLabel>In</FieldLabel>
+                      <Input
+                        placeholder="00:00:00"
+                        className={`font-mono text-sm bg-background ${localErrors.startTime ? "border-destructive" : ""}`}
+                        value={localForm.startTime}
+                        onChange={(e) => setLocalForm((p) => ({ ...p, startTime: e.target.value }))}
+                      />
+                      {localErrors.startTime && <p className="text-xs text-destructive font-mono mt-1">{localErrors.startTime}</p>}
+                    </div>
+                    <div>
+                      <FieldLabel>Out</FieldLabel>
+                      <Input
+                        placeholder="00:01:00"
+                        className={`font-mono text-sm bg-background ${localErrors.endTime ? "border-destructive" : ""}`}
+                        value={localForm.endTime}
+                        onChange={(e) => setLocalForm((p) => ({ ...p, endTime: e.target.value }))}
+                      />
+                      {localErrors.endTime && <p className="text-xs text-destructive font-mono mt-1">{localErrors.endTime}</p>}
+                    </div>
+                  </div>
+
+                  {localForm.mode === "edited" && (
+                    <div>
+                      <FieldLabel>Overlay headline</FieldLabel>
+                      <Input
+                        placeholder="Overlay headline…"
+                        className={`text-sm bg-background ${localErrors.headline ? "border-destructive" : ""}`}
+                        value={localForm.headline}
+                        onChange={(e) => setLocalForm((p) => ({ ...p, headline: e.target.value }))}
+                      />
+                      {localErrors.headline && <p className="text-xs text-destructive font-mono mt-1">{localErrors.headline}</p>}
+                    </div>
+                  )}
+
+                  <div>
+                    <FieldLabel>Source creator <span className="text-muted-foreground/50 normal-case">(optional)</span></FieldLabel>
+                    <Input
+                      placeholder="e.g. KSI, MrBeast, IShowSpeed"
+                      className="font-mono text-sm bg-background"
+                      value={localForm.sourceChannel}
+                      onChange={(e) => setLocalForm((p) => ({ ...p, sourceChannel: e.target.value }))}
+                    />
+                  </div>
+
+                  <ToggleChip
+                    label="Enable captions"
+                    checked={localForm.captionsEnabled}
+                    onChange={(v) => setLocalForm((p) => ({ ...p, captionsEnabled: v }))}
+                  />
+
+                  {uploadProgress !== null && (
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-[10px] font-mono text-muted-foreground">
+                        <span>Uploading…</span>
+                        <span>{uploadProgress}%</span>
+                      </div>
+                      <div className="h-1.5 bg-muted rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-primary rounded-full transition-all duration-300"
+                          style={{ width: `${uploadProgress}%` }}
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="flex justify-end pt-1">
+                    <Button
+                      type="button"
+                      disabled={isUploading}
+                      onClick={handleLocalUpload}
+                      className="font-mono uppercase tracking-[0.13em] text-xs h-12 px-7"
+                    >
+                      {isUploading ? (
+                        <><Loader2 className="mr-2 h-4 w-4 animate-spin" />UPLOADING…</>
+                      ) : (
+                        <><Upload className="mr-2 h-4 w-4" />UPLOAD &amp; PROCESS</>
+                      )}
+                    </Button>
+                  </div>
                 </div>
-              </div>
-            )}
-          </div>
-        </section>
+              )}
+            </div>
 
-        <AlertDialog open={navConfirmOpen} onOpenChange={setNavConfirmOpen}>
-          <AlertDialogContent>
-            <AlertDialogHeader>
-              <AlertDialogTitle>Leave without submitting?</AlertDialogTitle>
-              <AlertDialogDescription>
-                You have unsaved changes in the form. They will be lost if you navigate away.
-              </AlertDialogDescription>
-            </AlertDialogHeader>
-            <AlertDialogFooter>
-              <AlertDialogCancel>Stay</AlertDialogCancel>
-              <AlertDialogAction onClick={() => navigate("/timeline")}>Leave</AlertDialogAction>
-            </AlertDialogFooter>
-          </AlertDialogContent>
-        </AlertDialog>
-
-        <button
-          type="button"
-          onClick={() => {
-            if (form.formState.isDirty) {
-              setNavConfirmOpen(true);
-            } else {
-              navigate("/timeline");
-            }
-          }}
-          className="shrink-0 border-t border-border bg-card px-6 py-3 flex items-center justify-between w-full hover:bg-card/80 transition-colors"
-        >
-          <div className="flex items-center gap-2 text-sm font-mono text-muted-foreground uppercase tracking-widest">
-            <BarChart2 className="w-4 h-4" />
-            Timeline
+            {/* RIGHT — live preview (sticky on desktop) */}
+            <div className="lg:sticky lg:top-[84px]">
+              <LivePreview
+                headline={preview.headline}
+                mode={preview.mode}
+                frameStyle={wFrame}
+                captions={preview.captions}
+                voiceover={preview.voiceover}
+                hook={preview.hook}
+                handle={channelHandle}
+              />
+            </div>
           </div>
-          <div className="flex items-center gap-4 text-xs font-mono">
-            {isLoadingStats ? (
-              <Skeleton className="h-3 w-24 bg-muted" />
-            ) : stats ? (
-              <div className="flex items-center gap-1.5">
-                <span className="text-muted-foreground">TOTAL:</span>
-                <span className="text-foreground">{stats.total}</span>
-              </div>
-            ) : null}
-            <ChevronRight className="w-4 h-4 text-muted-foreground" />
-          </div>
-        </button>
+        </div>
       </main>
     </div>
   );
