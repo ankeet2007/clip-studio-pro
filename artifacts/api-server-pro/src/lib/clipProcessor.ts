@@ -973,7 +973,11 @@ export async function processClip(
             let haveAss = false;
             if (fs.existsSync(karaokeScript) && fs.existsSync(dtwJsonPath)) {
               try {
-                await execFileAsync(findPython(), [karaokeScript, dtwJsonPath, assPath, String(Math.max(0, duration - 2))], { timeout: 30000 });
+                // Caption cutoff = where the outro subscribe card starts (last 2s),
+                // so captions don't sit over it. With the outro OFF there is no card,
+                // so let captions run to the very end (was wrongly clipping the final 2s).
+                const captionEnd = outroEnabled ? Math.max(0, duration - 2) : duration;
+                await execFileAsync(findPython(), [karaokeScript, dtwJsonPath, assPath, String(captionEnd)], { timeout: 30000 });
                 if (fs.existsSync(assPath) && fs.readFileSync(assPath, "utf8").includes("Dialogue:")) {
                   subFilter = `subtitles=${assPath}:fontsdir=${FONTS_DIR}`;
                   haveAss = true;
