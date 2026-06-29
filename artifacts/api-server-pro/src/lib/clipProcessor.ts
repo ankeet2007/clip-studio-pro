@@ -423,16 +423,21 @@ function buildYtDlpArgs(
 /**
  * Downloads the exact time segment from YouTube using yt-dlp --download-sections.
  *
- * Strategy:
- *   1. DASH 1080p via native downloader + concurrent fragments.
+ * Strategy (all attempts are 720p+; we NEVER downgrade to 360p):
+ *   1. HLS 1080p (archived live streams).
+ *   2. DASH 1080p via native downloader + concurrent fragments.
  *      --downloader native makes yt-dlp download each DASH segment individually from the
  *      manifest, then ffmpeg muxes from local files. This avoids yt-dlp's internal ffmpeg
  *      seeking sequentially through the full CDN stream (which hangs on archived live recordings
  *      because it has to read through all content before the timestamp first).
  *      --concurrent-fragments 4 downloads up to 4 segments in parallel for faster throughput.
- *   2. 720p DASH via native downloader (same approach, smaller file).
- *   3. Format 18 = 360p H.264+AAC combined progressive mp4 — final reliable fallback.
- *      Not DASH; moov-atom index lets ffmpeg seek without reading the whole file.
+ *   3. 720p DASH via native downloader (same approach, smaller file).
+ *   4. Cookie-authed web client, 720p+ floor (last resort).
+ *
+ * Quality guarantee: a hard MIN_VIDEO_HEIGHT (720p) post-download check rejects any sub-720p
+ * result, and YouTube 429 throttling triggers a bounded backoff-retry of the SAME HD format
+ * rather than a silent drop to 360p. If no HD stream is obtainable, the job fails (retryable)
+ * instead of producing a low-quality clip.
  *
  * Returns the path to the downloaded temp file.
  */
@@ -454,7 +459,9 @@ async function downloadSegment(
 
   const attempts: Array<{ format: string; label: string; stallMs: number; hardMs: number; extraArgs?: string[] }> = [
     {
-      format: "95/93/94/best[protocol=m3u8_native]/best[protocol=m3u8]",
+      // 96=1080p, 95=720p, 301/300=1080p60/720p60. Dropped 93/94 (360p/480p HLS itags)
+      // so this attempt can never yield sub-720p; the height check below is the hard backstop.
+      format: "96/95/301/300/best[height>=720][protocol^=m3u8]",
       label: "HLS m3u8 (live stream)",
       stallMs: 300_000,
       hardMs: 900_000,
@@ -475,20 +482,33 @@ async function downloadSegment(
       extraArgs: ["--downloader", "native", "--concurrent-fragments", "4", "--remote-components", "ejs:github", "--extractor-args", "youtube:player_client=android_vr,web"],
     },
     {
-      format: "18/best[ext=mp4]/best",
-      label: "progressive mp4 fallback (360p)",
+      // HD-floored last resort: cookie-authed web client (different from the android_vr
+      // attempts above), 720p minimum. We deliberately DO NOT fall back to 360p (fmt 18)
+      // or bare "best" — a 360p clip is worse than failing and retrying once the throttle
+      // clears. The post-download height check below enforces this floor for real.
+      format: "bestvideo[height>=720][height<=1080]+bestaudio/22/best[height>=720]",
+      label: "HD fallback (720p+ floor, cookies)",
       stallMs: 300_000,
       hardMs: 300_000,
-      extraArgs: ["--extractor-args", "youtube:player_client=android_vr,web"],
-    },
-    {
-      format: "best",
-      label: "best available (any format)",
-      stallMs: 300_000,
-      hardMs: 300_000,
-      extraArgs: ["--extractor-args", "youtube:player_client=android_vr,web"],
+      extraArgs: ["--downloader", "native", "--concurrent-fragments", "4", "--remote-components", "ejs:github"],
     },
   ]
+
+  // Quality guarantee: never composite a source below this height. Under a YouTube 429
+  // throttle, only the tiny 360p progressive stream slips through, so a low-res result is
+  // itself a throttle symptom — we reject it (and retry HD) rather than ship a 360p clip.
+  const MIN_VIDEO_HEIGHT = 720;
+  // Bounded, shared backoff budget across all attempts so a persistent throttle errors out
+  // in a few minutes (retryable) instead of hanging — and never silently downgrades quality.
+  const RL_MAX_TOTAL = 3;
+  let rlRetriesTotal = 0;
+  const isRateLimited = (m: string) => /\b429\b/.test(m) || /too many requests/i.test(m);
+  const probeHeight = async (file: string): Promise<number> => {
+    try {
+      const { stdout } = await execFileAsync("ffprobe", ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=height", "-of", "csv=p=0", file], { timeout: 30_000 });
+      return parseInt(String(stdout).trim(), 10) || 0;
+    } catch { return 0; }
+  };
 
   let lastError: Error = new Error("no attempts made");
 
@@ -496,52 +516,78 @@ async function downloadSegment(
     const attemptId = i === 0 ? tmpId : `${tmpId}_fb${i}`;
     const outTemplate = path.join(tmpDir, `clip_raw_${attemptId}.%(ext)s`);
 
-    logger.info(
-      { youtubeUrl, startTime, endTime, section, format: attempt.format, attempt: i + 1 },
-      "Downloading segment via yt-dlp"
-    );
+    // Retry the SAME (HD) attempt on transient rate-limiting before stepping down.
+    for (;;) {
+      logger.info(
+        { youtubeUrl, startTime, endTime, section, format: attempt.format, attempt: i + 1 },
+        "Downloading segment via yt-dlp"
+      );
 
-    try {
-      await spawnProcess(
-        ytDlp,
-        buildYtDlpArgs(section, attempt.format, outTemplate, youtubeUrl, (attempt.extraArgs ?? []).join(" ").includes("android_vr") ? [] : cookiesArgs, attempt.extraArgs ?? []),
-        attempt.hardMs,
-        (line) => {
-          const m = line.match(/\[download\]\s+(\d+\.?\d*)%/);
-          if (m) {
-            const ytPct = parseFloat(m[1]!);
-            // Map yt-dlp's 0-100% → overall progress 2-48%
-            onProgress(ytPct * 0.45);
+      try {
+        await spawnProcess(
+          ytDlp,
+          buildYtDlpArgs(section, attempt.format, outTemplate, youtubeUrl, (attempt.extraArgs ?? []).join(" ").includes("android_vr") ? [] : cookiesArgs, attempt.extraArgs ?? []),
+          attempt.hardMs,
+          (line) => {
+            const m = line.match(/\[download\]\s+(\d+\.?\d*)%/);
+            if (m) {
+              const ytPct = parseFloat(m[1]!);
+              // Map yt-dlp's 0-100% → overall progress 2-48%
+              onProgress(ytPct * 0.45);
+            }
+          },
+          attempt.stallMs
+        );
+
+        // Locate the output file
+        const candidates = ["mp4", "mkv", "webm"].map((ext) => path.join(tmpDir, `clip_raw_${attemptId}.${ext}`));
+        let outFile = candidates.find((c) => fs.existsSync(c)) ?? null;
+        if (!outFile) {
+          const files = fs.readdirSync(tmpDir).filter((f) => f.startsWith(`clip_raw_${attemptId}`));
+          if (files.length > 0) outFile = path.join(tmpDir, files[0]!);
+        }
+        if (!outFile) throw new Error("yt-dlp finished but no output file found");
+
+        // Hard quality floor — reject and retry rather than composite sub-720p.
+        const h = await probeHeight(outFile);
+        if (h && h < MIN_VIDEO_HEIGHT) {
+          try { fs.unlinkSync(outFile); } catch { /* ignore */ }
+          throw new Error(`downloaded video is ${h}p, below the ${MIN_VIDEO_HEIGHT}p quality floor`);
+        }
+        return outFile;
+      } catch (err) {
+        lastError = err as Error;
+        const msg = lastError.message;
+        const belowFloor = msg.includes("quality floor");
+
+        // Transient 429 (or a throttle-induced low-res result): back off and retry the
+        // SAME HD format, preserving resolution. Bounded by a shared budget.
+        if ((isRateLimited(msg) || belowFloor) && rlRetriesTotal < RL_MAX_TOTAL) {
+          rlRetriesTotal++;
+          const backoffMs = 15_000 * rlRetriesTotal; // 15s, 30s, 45s
+          logger.warn(
+            { attempt: attempt.label, rlRetry: rlRetriesTotal, backoffMs, error: msg.slice(0, 150) },
+            "YouTube rate-limited (429) / low-res — backing off, then retrying the same HD format"
+          );
+          await new Promise((r) => setTimeout(r, backoffMs));
+          continue; // retry SAME attempt
+        }
+
+        const isStallOrTimeout = /killed\|/.test(msg) || msg.includes("stalled") || msg.includes("timed out") || /live event has ended/i.test(msg) || msg.includes("not available") || isRateLimited(msg) || belowFloor;
+        if (!isStallOrTimeout || i === attempts.length - 1) {
+          // Real error, or all HD attempts (incl. backoff) exhausted.
+          if (isRateLimited(msg) || belowFloor) {
+            throw new Error("YouTube is rate-limiting downloads (HTTP 429) and no HD (720p+) stream came through. Quality floor held (no 360p). Wait a few minutes and retry this clip.");
           }
-        },
-        attempt.stallMs
-      );
+          throw lastError;
+        }
 
-      // Locate the output file
-      const candidates = ["mp4", "mkv", "webm"].map((ext) =>
-        path.join(tmpDir, `clip_raw_${attemptId}.${ext}`)
-      );
-      for (const candidate of candidates) {
-        if (fs.existsSync(candidate)) return candidate;
+        logger.warn(
+          { attempt: attempt.label, error: msg.slice(0, 200) },
+          `Download failed on ${attempt.label}; retrying with ${attempts[i + 1]!.label}`
+        );
+        break; // step to the next (still HD) attempt
       }
-      const files = fs.readdirSync(tmpDir).filter((f) => f.startsWith(`clip_raw_${attemptId}`));
-      if (files.length > 0) return path.join(tmpDir, files[0]!);
-
-      throw new Error("yt-dlp finished but no output file found");
-    } catch (err) {
-      lastError = err as Error;
-      const msg = lastError.message;
-      const isStallOrTimeout = /killed\|/.test(msg) || msg.includes("stalled") || msg.includes("timed out") || /live event has ended/i.test(msg) || msg.includes("not available");
-
-      if (!isStallOrTimeout || i === attempts.length - 1) {
-        // Real error, or we've exhausted all fallbacks
-        throw lastError;
-      }
-
-      logger.warn(
-        { attempt: attempt.label, error: msg.slice(0, 200) },
-        `Download stalled on ${attempt.label}; retrying with ${attempts[i + 1]!.label}`
-      );
     }
   }
 
