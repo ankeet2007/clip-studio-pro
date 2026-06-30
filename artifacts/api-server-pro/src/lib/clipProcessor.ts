@@ -459,9 +459,13 @@ async function downloadSegment(
 
   const attempts: Array<{ format: string; label: string; stallMs: number; hardMs: number; extraArgs?: string[] }> = [
     {
-      // 96=1080p, 95=720p, 301/300=1080p60/720p60. Dropped 93/94 (360p/480p HLS itags)
-      // so this attempt can never yield sub-720p; the height check below is the hard backstop.
-      format: "96/95/301/300/best[height>=720][protocol^=m3u8]",
+      // Property-based HLS selector (NOT bare itags): YouTube now splits HLS streams by audio
+      // language (301-0/301-1, 300-0/300-1, …), so bare "301"/"300" no longer match a single
+      // format and yt-dlp errors "Requested format is not available". This selector matches
+      // whichever 720-1080p HLS variant exists regardless of itag/language split. HLS streams are
+      // muxed (single file, no ffmpeg merge), so they sidestep the merge failures DASH can hit.
+      // 720p floor is enforced in the selector and re-checked post-download.
+      format: "best[height>=720][height<=1080][protocol^=m3u8]/best[height>=720][protocol^=m3u8]",
       label: "HLS m3u8 (live stream)",
       stallMs: 300_000,
       hardMs: 900_000,
@@ -573,9 +577,14 @@ async function downloadSegment(
           continue; // retry SAME attempt
         }
 
-        const isStallOrTimeout = /killed\|/.test(msg) || msg.includes("stalled") || msg.includes("timed out") || /live event has ended/i.test(msg) || msg.includes("not available") || isRateLimited(msg) || belowFloor;
-        if (!isStallOrTimeout || i === attempts.length - 1) {
-          // Real error, or all HD attempts (incl. backoff) exhausted.
+        // Any other failure — a format-not-available, an ffmpeg/mux error (e.g. "ffmpeg exited
+        // with code 8" on a fragile 1080p60 DASH section), a network drop, a stall — is NOT fatal
+        // on its own. Step to the NEXT download strategy; we only give up once the LAST attempt has
+        // failed. This guarantees one flaky format can never sink the whole download. (Previously a
+        // non-whitelisted error such as the ffmpeg mux failure aborted the chain before ever trying
+        // the lower-bitrate 720p DASH / HD-fallback attempts, which usually succeed.)
+        if (i === attempts.length - 1) {
+          // All HD strategies exhausted.
           if (isRateLimited(msg) || belowFloor) {
             throw new Error("YouTube is rate-limiting downloads (HTTP 429) and no HD (720p+) stream came through. Quality floor held (no 360p). Wait a few minutes and retry this clip.");
           }
@@ -584,7 +593,7 @@ async function downloadSegment(
 
         logger.warn(
           { attempt: attempt.label, error: msg.slice(0, 200) },
-          `Download failed on ${attempt.label}; retrying with ${attempts[i + 1]!.label}`
+          `Download failed on ${attempt.label}; stepping to next strategy: ${attempts[i + 1]!.label}`
         );
         break; // step to the next (still HD) attempt
       }
@@ -594,36 +603,70 @@ async function downloadSegment(
   throw lastError;
 }
 
+// The six AI auto-zoom effects. Gemini picks one per moment; the ffmpeg expressions
+// for each are built in processClip (all sharp lanczos scale+crop — never zoompan).
+type ZoomType = "punch" | "whip" | "cut" | "pushin" | "pullout" | "kenburns";
+
+interface ZoomEvent { sec: number; type: ZoomType; }
+
+// Normalised (alnum-only, lowercase) keyword -> canonical type, so we tolerate the
+// variants Gemini may emit ("push-in", "ken burns", "zoom out", "snap", ...).
+const ZOOM_ALIASES: Record<string, ZoomType> = {
+  punch: "punch", punchin: "punch", punchzoom: "punch",
+  whip: "whip", snap: "whip", whipzoom: "whip", snapzoom: "whip",
+  cut: "cut", hardcut: "cut", jumpcut: "cut", cutzoom: "cut",
+  pushin: "pushin", push: "pushin", zoomin: "pushin", pushzoom: "pushin",
+  pullout: "pullout", pull: "pullout", zoomout: "pullout", reveal: "pullout", pullback: "pullout",
+  kenburns: "kenburns", ken: "kenburns", burns: "kenburns", pan: "kenburns",
+};
+
 /**
- * Parses AI auto-zoom moments (a string the user pastes from Gemini) into seconds.
- * Accepts plain seconds ("3, 9, 16") or timestamps ("0:03 0:09"), comma/space/semicolon
- * separated. Clamps inside the clip, dedupes, sorts, caps at 12.
+ * Parses AI auto-zoom events the user pastes from Gemini. Each event is a SECOND plus
+ * an optional zoom TYPE, e.g. "3 punch, 9 pushin, 16 kenburns". Tolerates bare seconds
+ * (defaults to punch, back-compatible), mm:ss timestamps, and comma/semicolon/newline
+ * separators. Clamps inside the clip, sorts, enforces a 1.2s min gap so zooms can't
+ * stack and over-crop, caps at 10.
  */
-function parseZoomMoments(raw: string, duration: number): number[] {
+function parseZoomEvents(raw: string, duration: number): ZoomEvent[] {
   if (!raw || !raw.trim()) return [];
-  const toks = raw.split(/[\s,;]+/).filter(Boolean);
-  const secs: number[] = [];
-  for (const tok of toks) {
-    let s: number;
-    if (tok.includes(":")) {
-      const parts = tok.split(":").map(Number);
-      if (parts.some((n) => Number.isNaN(n))) continue;
-      s = parts.reduce((a, n) => a * 60 + n, 0);
-    } else {
-      s = Number(tok);
+  const chunks = raw.split(/[,;\n]+/).map((c) => c.trim()).filter(Boolean);
+  const events: ZoomEvent[] = [];
+  for (const chunk of chunks) {
+    let sec: number | null = null;
+    let type: ZoomType = "punch";
+    for (const tok of chunk.split(/\s+/).filter(Boolean)) {
+      const low = tok.toLowerCase().replace(/[^a-z0-9:.]/g, "");
+      if (!low) continue;
+      if (ZOOM_ALIASES[low]) { type = ZOOM_ALIASES[low]; continue; }
+      if (sec !== null) continue;
+      let s: number;
+      if (low.includes(":")) {
+        const parts = low.split(":").map(Number);
+        if (parts.some((n) => Number.isNaN(n))) continue;
+        s = parts.reduce((a, n) => a * 60 + n, 0);
+      } else {
+        s = Number(low);
+      }
+      if (Number.isFinite(s)) sec = s;
     }
-    if (!Number.isFinite(s)) continue;
-    if (s < 0.5 || s > duration - 0.3) continue;
-    secs.push(Math.round(s * 10) / 10);
+    if (sec === null || !Number.isFinite(sec)) continue;
+    if (sec < 0.5 || sec > duration - 0.3) continue;
+    events.push({ sec: Math.round(sec * 10) / 10, type });
   }
-  return [...new Set(secs)].sort((a, b) => a - b).slice(0, 12);
+  events.sort((a, b) => a.sec - b.sec);
+  const out: ZoomEvent[] = [];
+  for (const e of events) {
+    if (out.length && e.sec - out[out.length - 1].sec < 1.2) continue;
+    out.push(e);
+  }
+  return out.slice(0, 10);
 }
 
-/** Evenly-spaced punches (~every 5s) when auto-zoom is on but no AI moments were given. */
-function defaultZoomMoments(duration: number): number[] {
-  const out: number[] = [];
-  for (let t = 5; t < duration - 0.5; t += 5) out.push(t);
-  return out.slice(0, 12);
+/** Evenly-spaced punches (~every 5s) when auto-zoom is on but no AI events were given. */
+function defaultZoomEvents(duration: number): ZoomEvent[] {
+  const out: ZoomEvent[] = [];
+  for (let t = 5; t < duration - 0.5; t += 5) out.push({ sec: t, type: "punch" });
+  return out.slice(0, 10);
 }
 
 export async function processClip(
@@ -786,23 +829,85 @@ export async function processClip(
       }
     }
 
-    // AI auto-zoom: punch the framing in at specific moments the user got from Gemini
-    // (or evenly-spaced defaults). Implemented as a lanczos animated scale + centre crop
-    // — NOT zoompan, which blurred badly and forced the output to 25/30fps. This keeps the
-    // source frame rate and stays sharp. Each moment is a smooth gaussian zoom "punch".
+    // AI auto-zoom: at each moment Gemini chose (or evenly-spaced defaults) apply the
+    // zoom TYPE it picked. ALL six types are a lanczos animated scale + crop driven by a
+    // per-frame zoom factor Z(t) — NEVER zoompan (which blurred badly and forced 25/30fps).
+    // This keeps the source frame rate and stays sharp. Each effect is a localised bump on
+    // Z(t) that is always >= 0, so Z >= 1 everywhere → the scale never goes below the output
+    // size → no upscale-from-smaller → no blur. Expressions stay comma-free (commas would
+    // split the filtergraph) — |u| via sqrt(u*u), squaring via self-multiply, no pow/^.
     let punchInChain = "";
     if (punchInEnabled) {
-      const parsed = parseZoomMoments(zoomMoments, duration);
-      const moments = parsed.length ? parsed : defaultZoomMoments(duration);
-      const H = 0.18;   // punch strength (peak ≈ 1.18x)
-      const W = 0.45;   // punch half-width in seconds (smooth in/out)
-      const terms = moments.map(
-        (t) => `${H}*exp(-((t-${t.toFixed(2)})/${W})*((t-${t.toFixed(2)})/${W}))`
-      );
-      const zExpr = `1+${terms.join("+")}`;
-      // No commas in zExpr (avoids filtergraph arg-splitting); eval=frame animates per frame.
-      punchInChain = `,scale=w=ceil(${videoW}*(${zExpr})/2)*2:h=ceil(${videoH}*(${zExpr})/2)*2:eval=frame:flags=lanczos,crop=${videoW}:${videoH}`;
-      logger.info({ moments, source: parsed.length ? "ai" : "default" }, "AI auto-zoom punches applied");
+      const parsed = parseZoomEvents(zoomMoments, duration);
+      const events = parsed.length ? parsed : defaultZoomEvents(duration);
+      const zTerms: string[] = [];   // added to the zoom factor Z(t)
+      const panXTerms: string[] = []; // crop-centre horizontal drift (Ken Burns only)
+      const panYTerms: string[] = []; // crop-centre vertical drift (Ken Burns only)
+      let kbIdx = 0;
+      for (const ev of events) {
+        const c = ev.sec.toFixed(2);
+        const u = `(t-${c})`;                       // time relative to the moment
+        const up = `((${u}+sqrt(${u}*${u}))/2)`;    // max(u,0): the "after" half
+        const un = `((${u}-sqrt(${u}*${u}))/2)`;    // min(u,0): the "before" half
+        switch (ev.type) {
+          case "whip": {            // fast, strong snap
+            const a = `(${u}/0.16)`;
+            zTerms.push(`0.34*exp(-${a}*${a})`);
+            break;
+          }
+          case "cut": {             // near-rectangular hold (super-gaussian, 4th power)
+            const q = `(${u}/0.55)`;
+            const q2 = `(${q}*${q})`;
+            zTerms.push(`0.24*exp(-${q2}*${q2})`);
+            break;
+          }
+          case "pushin": {          // slow build-in, quicker release
+            const ar = `(${un}/1.30)`;
+            const af = `(${up}/0.70)`;
+            zTerms.push(`0.20*exp(-${ar}*${ar}-${af}*${af})`);
+            break;
+          }
+          case "pullout": {         // snap in, slow reveal out
+            const ar = `(${un}/0.22)`;
+            const af = `(${up}/1.50)`;
+            zTerms.push(`0.22*exp(-${ar}*${ar}-${af}*${af})`);
+            break;
+          }
+          case "kenburns": {        // gentle wide zoom + slow diagonal pan
+            const a = `(${u}/1.40)`;
+            zTerms.push(`0.14*exp(-${a}*${a})`);
+            const dir = kbIdx % 2 === 0 ? 1 : -1;   // alternate drift so adjacent KBs differ
+            const pw = `(${u}/1.20)`;               // odd drift u*exp(-u^2): sweeps through centre
+            panXTerms.push(`${(dir * 1.20).toFixed(2)}*${pw}*exp(-${pw}*${pw})`);
+            panYTerms.push(`${(-dir * 1.40).toFixed(2)}*${pw}*exp(-${pw}*${pw})`);
+            kbIdx++;
+            break;
+          }
+          case "punch":
+          default: {                // quick symmetric zoom in/out (the original)
+            const a = `(${u}/0.45)`;
+            zTerms.push(`0.18*exp(-${a}*${a})`);
+            break;
+          }
+        }
+      }
+      if (zTerms.length) {
+        const zExpr = `1${zTerms.map((t) => `+${t}`).join("")}`;
+        const scalePart = `scale=w=ceil(${videoW}*(${zExpr})/2)*2:h=ceil(${videoH}*(${zExpr})/2)*2:eval=frame:flags=lanczos`;
+        let cropPart = `crop=${videoW}:${videoH}`;
+        if (panXTerms.length || panYTerms.length) {
+          // Offset the centre crop by a fraction of the available margin. The margin
+          // ((in_w-W)/2) shrinks to 0 as Z→1, and |pan|<1, so x/y stay in [0, in-out].
+          // ffmpeg 8.x evaluates crop x/y per-frame by default (no `eval` option — it
+          // was removed), so the t-driven pan animates without it.
+          const panX = panXTerms.length ? panXTerms.join("+") : "0";
+          const panY = panYTerms.length ? panYTerms.join("+") : "0";
+          cropPart = `crop=${videoW}:${videoH}:x=(in_w-${videoW})/2*(1+(${panX})):y=(in_h-${videoH})/2*(1+(${panY}))`;
+        }
+        punchInChain = `,${scalePart},${cropPart}`;
+        const typeCounts = events.reduce<Record<string, number>>((m, e) => { m[e.type] = (m[e.type] ?? 0) + 1; return m; }, {});
+        logger.info({ events, typeCounts, source: parsed.length ? "ai" : "default" }, "AI auto-zoom (multi-type) applied");
+      }
     }
 
     // Step 3: Build ffmpeg filter graph

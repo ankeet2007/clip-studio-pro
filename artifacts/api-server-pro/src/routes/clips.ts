@@ -118,7 +118,7 @@ router.post("/clips", async (req, res): Promise<void> => {
 
   const [clip] = await db
     .insert(clipsTable)
-    .values({ youtubeUrl, startTime, endTime, headline, mode, frameStyle, sourceChannel, captionsEnabled, voiceoverEnabled, voiceoverHook, sourceType: "youtube", status: "pending" })
+    .values({ youtubeUrl, startTime, endTime, headline, mode, frameStyle, sourceChannel, captionsEnabled, voiceoverEnabled, voiceoverHook, punchInEnabled, zoomMoments, outroEnabled, sourceType: "youtube", status: "pending" })
     .returning();
 
   if (!clip) {
@@ -151,6 +151,7 @@ router.post("/clips/upload", (req, res): void => {
   let voiceoverHook = "";
   let punchInEnabled = false;
   let zoomMoments = "";
+  let outroEnabled = true;
   let savedFilePath: string | null = null;
   let savedFileName: string | null = null;
   let fileWritePromise: Promise<void> | null = null;
@@ -178,6 +179,7 @@ router.post("/clips/upload", (req, res): void => {
     if (name === "voiceoverHook") voiceoverHook = value;
     if (name === "punchInEnabled") punchInEnabled = value === "true";
     if (name === "zoomMoments") zoomMoments = value;
+    if (name === "outroEnabled") outroEnabled = value !== "false";
   });
 
   bb.on("file", (_name: string, stream: NodeJS.ReadableStream, info: { filename: string; encoding: string; mimeType: string }) => {
@@ -232,6 +234,9 @@ router.post("/clips/upload", (req, res): void => {
             captionsEnabled,
             voiceoverEnabled,
             voiceoverHook,
+            punchInEnabled,
+            zoomMoments,
+            outroEnabled,
             localFilePath: savedFilePath,
             localFileName: savedFileName,
             status: "pending",
@@ -247,7 +252,7 @@ router.post("/clips/upload", (req, res): void => {
         res.status(201).json(GetClipResponse.parse(clip));
 
         const outputFilename = `clip_${clip.id}_${Date.now()}.mp4`;
-        dispatchClipJob(clip.id, null, startTime, endTime, headline, outputFilename, mode, frameStyle, savedFilePath, sourceChannel, captionsEnabled, true, voiceoverEnabled, voiceoverHook, punchInEnabled, zoomMoments);
+        dispatchClipJob(clip.id, null, startTime, endTime, headline, outputFilename, mode, frameStyle, savedFilePath, sourceChannel, captionsEnabled, outroEnabled, voiceoverEnabled, voiceoverHook, punchInEnabled, zoomMoments);
       } catch (err) {
         if (savedFilePath) {
           try { if (fs.existsSync(savedFilePath)) fs.unlinkSync(savedFilePath); } catch { /* ignore */ }
@@ -328,9 +333,14 @@ router.post("/clips/:id/retry", async (req, res): Promise<void> => {
     clip.localFilePath ?? undefined,
     clip.sourceChannel ?? "",
     clip.captionsEnabled ?? true,
-    true,
+    clip.outroEnabled ?? true,
     clip.voiceoverEnabled ?? false,
-    clip.voiceoverHook ?? ""
+    clip.voiceoverHook ?? "",
+    // Persisted settings — a retry re-renders with EXACTLY the same options the clip had
+    // before it failed (outro + voiceover + the AI Auto-Zoom Gemini chose). These used to
+    // be dropped because they weren't stored / were hardcoded on the retry path.
+    clip.punchInEnabled ?? false,
+    clip.zoomMoments ?? ""
   );
 });
 

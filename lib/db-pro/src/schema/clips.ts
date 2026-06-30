@@ -26,6 +26,14 @@ export const clipsTable = pgTable("clips_pro", {
   // pasted from their Gemini app); Piper TTS speaks it over the first few seconds.
   voiceoverEnabled: boolean("voiceover_enabled").notNull().default(false),
   voiceoverHook: text("voiceover_hook"),
+  // Pro-only: AI Auto-Zoom. punchInEnabled gates the effect; zoomMoments is the
+  // Gemini-chosen "second type" list. Persisted so Retry re-renders WITH the zoom
+  // (previously these rode only the create request and were lost on retry).
+  punchInEnabled: boolean("punch_in_enabled").notNull().default(false),
+  zoomMoments: text("zoom_moments").notNull().default(""),
+  // Whether the closing outro/CTA is appended (a real toggle, defaults on). Persisted so
+  // Retry restores it too, instead of forcing it back on.
+  outroEnabled: boolean("outro_enabled").notNull().default(true),
 });
 
 export const insertClipSchema = createInsertSchema(clipsTable).omit({

@@ -440,15 +440,22 @@ export default function Home() {
     const clip = values.clips[index];
     if (!clip) return;
     const dur = Math.max(0, toSecs(clip.endTime) - toSecs(clip.startTime));
+    const hasUrl = !!(values.youtubeUrl && values.youtubeUrl.trim());
     const prompt =
-      `You are a viral short-form video editor. Write ONE punchy spoken intro hook ` +
-      `(6-10 words) to be read aloud over the first few seconds of a YouTube Short, ` +
-      `to stop the scroll. Return ONLY the hook line — no quotes, no extra text.\n\n` +
+      `You are a viral short-form video editor. ` +
+      (hasUrl
+        ? `Open and WATCH the exact section of the source video below, then write a hook grounded in what ACTUALLY happens in it — do not guess.\n`
+        : `Write a hook for this clip (a local upload — if you cannot view the footage, base it on the title below).\n`) +
+      `Write ONE punchy spoken intro hook (6-10 words), read aloud over the first few seconds ` +
+      `of a YouTube Short, to stop the scroll and capture THIS clip's single most attention-grabbing moment. ` +
+      `Return ONLY the hook line — no quotes, no extra text.\n\n` +
       `Context:\n` +
+      (hasUrl
+        ? `- Video: ${values.youtubeUrl}\n- Watch ONLY this section: ${clip.startTime} to ${clip.endTime}\n`
+        : "") +
       `- Headline/title: ${clip.headline || "(none)"}\n` +
       `- Source channel: ${values.sourceChannel || "(unknown)"}\n` +
-      `- Clip length: ~${dur}s\n` +
-      `- Source video: ${values.youtubeUrl || "(n/a)"}`;
+      `- Clip length: ~${dur}s`;
     const ok = await copyTextToClipboard(prompt);
     if (ok) {
       toast({ title: "Prompt copied", description: "Paste it into your Gemini app, then paste the hook back here." });
@@ -457,25 +464,47 @@ export default function Home() {
     }
   }
 
-  // Builds a Gemini prompt asking it to choose AUTO-ZOOM punch moments (timestamps).
-  // Same human-in-the-loop pattern as the hook: server makes no AI calls — the user
-  // pastes this into Gemini, then pastes the returned seconds into the zoom field.
+  // Builds a Gemini prompt asking it to choose AUTO-ZOOM moments AND the best zoom TYPE
+  // for each. Same human-in-the-loop pattern as the hook: server makes no AI calls — the
+  // user pastes this into Gemini, then pastes the returned "second type" pairs back.
   async function copyZoomPrompt(index: number) {
     const values = form.getValues();
     const clip = values.clips[index];
     if (!clip) return;
     const dur = Math.max(0, toSecs(clip.endTime) - toSecs(clip.startTime));
+    const hasUrl = !!(values.youtubeUrl && values.youtubeUrl.trim());
+    // Give Gemini the actual video + the exact section to watch, so it picks INFORMED
+    // moments instead of guessing. Returned seconds must be clip-relative (0 = section start).
+    const sourceBlock = hasUrl
+      ? `Open and WATCH this exact part of the source video, then base every choice on what ACTUALLY happens in it — do not guess:\n` +
+        `Video: ${values.youtubeUrl}\n` +
+        `Watch ONLY the section from ${clip.startTime} to ${clip.endTime} (about ${dur} seconds long)` +
+        `${clip.headline ? `, titled "${clip.headline}"` : ""}` +
+        `${values.sourceChannel ? `, from ${values.sourceChannel}` : ""}.\n`
+      : `This is a ${dur}-second vertical clip` +
+        `${clip.headline ? `, titled "${clip.headline}"` : ""}` +
+        `${values.sourceChannel ? `, from ${values.sourceChannel}` : ""}. ` +
+        `(It is a local upload — if you cannot view the footage, choose sensible moments from the title and typical short-form pacing.)\n`;
     const prompt =
       `You are a short-form video editor choosing AUTO-ZOOM moments for a vertical YouTube Short.\n` +
-      `The clip is about ${dur} seconds long` +
-      `${clip.headline ? `, titled "${clip.headline}"` : ""}` +
-      `${values.sourceChannel ? `, from ${values.sourceChannel}` : ""}.\n` +
-      `Pick 3-6 timestamps (whole seconds, between 1 and ${Math.max(1, dur - 1)}) where a quick ` +
-      `punch-in zoom would add emphasis or energy — reactions, punchlines, key beats.\n` +
-      `Return ONLY a comma-separated list of seconds, e.g. 3, 9, 16, 24 — no other text.`;
+      sourceBlock +
+      `Pick 4-8 moments where a zoom would add emphasis or energy — reactions, punchlines, key beats. ` +
+      `For EACH moment pick the zoom TYPE that best fits that beat, from exactly these keywords:\n` +
+      `- punch — quick zoom-in and out; all-purpose emphasis on a punchline or reaction\n` +
+      `- whip — fast snappy zoom; a sudden shock or hype spike\n` +
+      `- cut — hard cut to a tighter shot and back; sharp, abrupt emphasis\n` +
+      `- pushin — slow gradual zoom-in; rising tension or an important line\n` +
+      `- pullout — snap in then slow zoom-out; a reveal or "stepping back" beat\n` +
+      `- kenburns — gentle zoom with a slow diagonal pan; calmer or B-roll stretches\n` +
+      `Space the moments at least 1.5 seconds apart.\n` +
+      `IMPORTANT — timing: give each moment as the number of seconds AFTER the start of that section ` +
+      `(0 = ${clip.startTime}), a whole number between 1 and ${Math.max(1, dur - 1)}. Do NOT use the video's ` +
+      `absolute timestamp.\n` +
+      `Return ONLY a comma-separated list of "second type" pairs and NOTHING else, e.g.:\n` +
+      `3 punch, 8 pushin, 14 kenburns, 20 whip, 27 cut`;
     const ok = await copyTextToClipboard(prompt);
     if (ok) {
-      toast({ title: "Zoom prompt copied", description: "Paste it into Gemini, then paste the seconds back here." });
+      toast({ title: "Zoom prompt copied", description: "Paste it into Gemini, then paste the second+type pairs back here." });
     } else {
       toast({ title: "Copy failed", description: "Couldn't access the clipboard.", variant: "destructive" });
     }
@@ -874,7 +903,7 @@ export default function Home() {
                                 </div>
                                 {punchOn && (
                                   <Input
-                                    placeholder="Paste Gemini's seconds — e.g. 3, 9, 16, 24   (blank = auto every 5s)"
+                                    placeholder="Paste Gemini's pairs — e.g. 3 punch, 9 pushin, 16 kenburns   (blank = auto punch every 5s)"
                                     className="text-sm bg-background mt-2.5 font-mono"
                                     {...form.register(`clips.${index}.zoomMoments`)}
                                   />
