@@ -43,6 +43,14 @@ const CAPTION_FONTS = [
 
 // --- Simple concurrency queue: max 2 simultaneous jobs ---
 const MAX_CONCURRENT = 1;
+
+// Stall window for CPU-bound ffmpeg re-encodes (composite + caption burn) on the phone.
+// These have no hard timeout, so the stall timer is the only hang guard — but on the weak,
+// memory-starved phone a healthy render can legitimately emit no progress for minutes
+// (filtergraph init, first-frame decode of a 1080p60 source, transient memory thrash). The
+// old 90s default was killing such renders prematurely. 15 min only trips on a truly dead
+// process. See spawnProcess / the composite render.
+const RENDER_STALL_MS = 900_000;
 let activeJobs = 0;
 const jobQueue: Array<() => void> = [];
 
@@ -210,9 +218,18 @@ function isNoiseLine(line: string): boolean {
 }
 
 export function parseProcessingError(raw: string): string {
-  // Detect process kill / timeout before parsing stderr content
-  if (/killed|timed out|SIGTERM|SIGKILL/i.test(raw) && !raw.includes("ERROR:")) {
-    return "Download timed out — the clip may be too long or the connection was slow. Try a shorter segment.";
+  // Detect process kill / stall / timeout before parsing stderr content. spawnProcess
+  // embeds a phase-accurate human message after a "killed|" marker — surface that verbatim
+  // so a killed RENDER is never mislabeled as a download timeout (the old bug: a composite
+  // render killed by the stall timer reported "Download timed out — try a shorter segment",
+  // even though the download had already succeeded).
+  if (/killed|timed out|stalled|SIGTERM|SIGKILL/i.test(raw) && !raw.includes("ERROR:")) {
+    const marked = raw.split("killed|")[1];
+    if (marked) {
+      const msg = marked.split("\n")[0]!.trim();
+      if (msg) return msg.slice(0, 300);
+    }
+    return "The process was stopped — it stalled or ran out of memory. Retry the clip (closing other apps frees RAM).";
   }
 
   const lines = raw.split("\n").map((l) => l.trim()).filter(Boolean);
@@ -307,7 +324,10 @@ function spawnProcess(
   args: string[],
   timeoutMs: number,
   onLine?: (line: string) => void,
-  stallTimeoutMs = 90_000
+  stallTimeoutMs = 90_000,
+  // phase drives the human-readable stall/timeout message. A killed RENDER must never be
+  // reported as a "download timed out" (the download already succeeded by then).
+  phase: "download" | "render" = "download"
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     // detached: true puts yt-dlp in its own process group so that killing the group
@@ -316,6 +336,17 @@ function spawnProcess(
     const proc = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], detached: true });
     let stderrBuf = "";
     let done = false;
+
+    // Phase-accurate messages (surfaced to the user by parseProcessingError). The marker
+    // text after "killed|" is what the user sees, so it must describe the real failure.
+    const stallMsg =
+      phase === "render"
+        ? `Rendering stalled — no progress for ${stallTimeoutMs / 1000}s. The phone likely ran low on memory. Retry the clip (closing other apps frees RAM).`
+        : `Download stalled — no data received for ${stallTimeoutMs / 1000}s. The video may be too long or the connection dropped. Retry the clip.`;
+    const timeoutMsg =
+      phase === "render"
+        ? `Rendering timed out after ${timeoutMs / 1000}s. Retry the clip.`
+        : `Download timed out after ${timeoutMs / 1000}s. Try a shorter segment or retry.`;
 
     function fail(msg: string) {
       if (done) return;
@@ -332,7 +363,7 @@ function spawnProcess(
     function resetStall() {
       clearTimeout(stallTimer);
       stallTimer = setTimeout(
-        () => fail(`killed|download stalled — no output for ${stallTimeoutMs / 1000}s\n${stderrBuf}`),
+        () => fail(`killed|${stallMsg}\n${stderrBuf}`),
         stallTimeoutMs
       );
     }
@@ -345,7 +376,7 @@ function spawnProcess(
     const hardTimer =
       timeoutMs > 0
         ? setTimeout(
-            () => fail(`killed|timed out after ${timeoutMs / 1000}s\n${stderrBuf}`),
+            () => fail(`killed|${timeoutMsg}\n${stderrBuf}`),
             timeoutMs
           )
         : undefined;
@@ -1050,8 +1081,12 @@ export async function processClip(
     logger.info({ pngHeight, channelHandle, fontFile }, "Starting ffmpeg");
 
     // No hard timeout: the immersive composite is CPU-bound and can run long on the
-    // phone. ffmpeg prints a progress line per ~second, so the 90s stall timer still
-    // kills a genuine hang. (Was 600000 — too short for 1080p renders on slow ARM.)
+    // phone. The stall timer is the only guard, so it must be GENEROUS: the AI-auto-zoom +
+    // immersive filtergraph on a 1080p60 source can go silent for well over the old 90s
+    // default during filtergraph init / first-frame decode, or when the memory-starved phone
+    // briefly thrashes — that silence is NOT a hang, but the 90s timer was killing these
+    // healthy renders mid-way (and then mislabeling it "Download timed out"). RENDER_STALL_MS
+    // (15 min) only fires on a genuinely dead process while letting slow renders finish.
     await spawnProcess("ffmpeg", ffmpegArgs, 0, (line) => {
       // ffmpeg progress: "... time=00:00:04.10 ..."
       const m = line.match(/time=(\d+):(\d+):(\d+\.?\d*)/);
@@ -1062,7 +1097,7 @@ export async function processClip(
         // Map ffmpeg 0-100% → overall 55-95%
         void updateProgress(45 + ratio * 50);
       }
-    });
+    }, RENDER_STALL_MS, "render");
 
     logger.info({ finalOutputPath }, "Clip processing complete");
 
@@ -1154,8 +1189,9 @@ export async function processClip(
                 "-c:a", "copy",
                 captionedPath,
                 // No hard timeout — caption burn is another full crf-14 re-encode that
-                // can also exceed 10 min on the phone; stall timer still guards hangs.
-              ], 0, () => {});
+                // can also exceed 10 min on the phone; the generous render stall timer
+                // (RENDER_STALL_MS) guards a genuine hang without killing a slow re-encode.
+              ], 0, () => {}, RENDER_STALL_MS, "render");
 
               if (fs.existsSync(captionedPath)) {
                 fs.renameSync(captionedPath, finalOutputPath);
