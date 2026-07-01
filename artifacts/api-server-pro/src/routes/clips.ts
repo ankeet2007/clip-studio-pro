@@ -12,7 +12,7 @@ import {
   GetClipResponse,
   GetClipStatsResponse,
 } from "@workspace/api-zod";
-import { processClip, enqueueClipJob, getOutputFilePath, getUploadsDir, normalizeYoutubeUrl, parseProcessingError } from "../lib/clipProcessor";
+import { processClip, enqueueClipJob, getOutputFilePath, getUploadsDir, normalizeYoutubeUrl, parseProcessingError, validateSegmentWithinVideo } from "../lib/clipProcessor";
 import { logger } from "../lib/logger";
 import { readSettings } from "../lib/settings";
 
@@ -115,6 +115,15 @@ router.post("/clips", async (req, res): Promise<void> => {
   const voiceoverHook = (req.body as { voiceoverHook?: string }).voiceoverHook ?? "";
   const punchInEnabled = (req.body as { punchInEnabled?: boolean }).punchInEnabled ?? false;
   const zoomMoments = (req.body as { zoomMoments?: string }).zoomMoments ?? "";
+
+  // Up-front guard: reject a start time that falls past the end of the source video so the user
+  // gets an immediate, clear "that timestamp doesn't exist" error instead of a frozen/failed
+  // render minutes later. Best-effort (never blocks on a transient metadata-fetch failure).
+  const rangeCheck = await validateSegmentWithinVideo(youtubeUrl, startTime, endTime);
+  if (!rangeCheck.ok) {
+    res.status(400).json({ error: rangeCheck.message });
+    return;
+  }
 
   const [clip] = await db
     .insert(clipsTable)

@@ -217,6 +217,64 @@ function isNoiseLine(line: string): boolean {
   return NOISE_PATTERNS.some((re) => re.test(line));
 }
 
+/** Human-readable H:MM:SS (or M:SS) from a seconds count. */
+export function formatHMS(total: number): string {
+  const s = Math.max(0, Math.floor(total));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const mm = h > 0 ? String(m).padStart(2, "0") : String(m);
+  return (h > 0 ? `${h}:` : "") + `${mm}:${String(sec).padStart(2, "0")}`;
+}
+
+/**
+ * Up-front validation that the requested [startTime, endTime] window actually exists in the
+ * source video. Fetches the video's real duration from yt-dlp (metadata only, no download) and
+ * rejects a start time at/past the end — the "timestamp doesn't exist for this video" case that
+ * otherwise only surfaces minutes later as a frozen/failed render. Best-effort: if the duration
+ * can't be fetched (transient yt-dlp/network error) it returns ok:true and lets the
+ * download-time short-download guard backstop it, rather than blocking clip creation.
+ */
+const durationCache = new Map<string, { dur: number; at: number }>();
+const DURATION_CACHE_TTL_MS = 10 * 60_000;
+
+export async function validateSegmentWithinVideo(
+  youtubeUrl: string,
+  startTime: string,
+  endTime: string
+): Promise<{ ok: boolean; message?: string; videoDuration?: number }> {
+  let videoDuration = 0;
+  const cached = durationCache.get(youtubeUrl);
+  if (cached && Date.now() - cached.at < DURATION_CACHE_TTL_MS) {
+    // Reuse a recent lookup so batching several clips from the same video is instant (the
+    // yt-dlp metadata fetch is slow on the phone — ~30s per call).
+    videoDuration = cached.dur;
+  } else {
+    try {
+      const { stdout } = await execFileAsync(
+        findYtDlp(),
+        ["--no-playlist", "--no-warnings", ...getCookiesArgs(), "--print", "%(duration)s", youtubeUrl],
+        { timeout: 45_000 }
+      );
+      videoDuration = parseFloat(String(stdout).trim().split("\n")[0] ?? "") || 0;
+      if (videoDuration > 0) durationCache.set(youtubeUrl, { dur: videoDuration, at: Date.now() });
+    } catch {
+      return { ok: true }; // Can't verify → don't block; the download-time guard backstops.
+    }
+  }
+  if (videoDuration <= 0) return { ok: true };
+
+  const startSeconds = timeToSeconds(startTime);
+  if (startSeconds >= videoDuration) {
+    return {
+      ok: false,
+      videoDuration,
+      message: `That timestamp doesn't exist in this video. The video is only ${formatHMS(videoDuration)} long, but the clip starts at ${startTime}. Pick a start time within ${formatHMS(videoDuration)}.`,
+    };
+  }
+  return { ok: true, videoDuration };
+}
+
 export function parseProcessingError(raw: string): string {
   // Detect process kill / stall / timeout before parsing stderr content. spawnProcess
   // embeds a phase-accurate human message after a "killed|" marker — surface that verbatim
