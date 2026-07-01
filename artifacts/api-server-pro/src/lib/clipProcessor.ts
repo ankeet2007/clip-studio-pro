@@ -445,8 +445,14 @@ function buildYtDlpArgs(
     "--progress",
     "--newline",
     "--socket-timeout", "30",
-    "--retries", "10",
-    "--fragment-retries", "inf",
+    // Finite retries: under a sustained YouTube 429 these MUST terminate. Previously
+    // "--fragment-retries inf" made yt-dlp retry the same fragment forever, keeping the
+    // process alive (and emitting output that reset the stall timer), so the job sat in
+    // "processing" for up to ~45 min and blocked the single-slot queue behind it.
+    "--retries", "3",
+    "--fragment-retries", "3",
+    // Pace requests to avoid tripping YouTube's per-IP rate limiter in the first place.
+    "--sleep-requests", "1.5",
     youtubeUrl,
   ];
 }
@@ -486,7 +492,7 @@ async function downloadSegment(
 
   // Native downloader args: download DASH segments individually (no full-stream seek),
   // with 4 concurrent connections for faster throughput.
-  const nativeArgs = ["--downloader", "native", "--concurrent-fragments", "4", "--remote-components", "ejs:github"];
+  const nativeArgs = ["--downloader", "native", "--concurrent-fragments", "2", "--remote-components", "ejs:github"];
 
   const attempts: Array<{ format: string; label: string; stallMs: number; hardMs: number; extraArgs?: string[] }> = [
     {
@@ -507,14 +513,14 @@ async function downloadSegment(
       label: "DASH 1080p (native)",
       stallMs: 300_000,
       hardMs: 900_000,
-      extraArgs: ["--downloader", "native", "--concurrent-fragments", "4", "--remote-components", "ejs:github", "--extractor-args", "youtube:player_client=android_vr,web"],
+      extraArgs: ["--downloader", "native", "--concurrent-fragments", "2", "--remote-components", "ejs:github", "--extractor-args", "youtube:player_client=android_vr,web"],
     },
     {
       format: "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720][ext=mp4]+bestaudio/bestvideo[height<=720]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio",
       label: "DASH 720p (native)",
       stallMs: 300_000,
       hardMs: 600_000,
-      extraArgs: ["--downloader", "native", "--concurrent-fragments", "4", "--remote-components", "ejs:github", "--extractor-args", "youtube:player_client=android_vr,web"],
+      extraArgs: ["--downloader", "native", "--concurrent-fragments", "2", "--remote-components", "ejs:github", "--extractor-args", "youtube:player_client=android_vr,web"],
     },
     {
       // HD-floored last resort: cookie-authed web client (different from the android_vr
@@ -525,7 +531,7 @@ async function downloadSegment(
       label: "HD fallback (720p+ floor, cookies)",
       stallMs: 300_000,
       hardMs: 300_000,
-      extraArgs: ["--downloader", "native", "--concurrent-fragments", "4", "--remote-components", "ejs:github"],
+      extraArgs: ["--downloader", "native", "--concurrent-fragments", "2", "--remote-components", "ejs:github"],
     },
   ]
 
@@ -537,6 +543,11 @@ async function downloadSegment(
   // in a few minutes (retryable) instead of hanging — and never silently downgrades quality.
   const RL_MAX_TOTAL = 3;
   let rlRetriesTotal = 0;
+  // Whole-job wall-clock cap: a single download must never occupy the single-slot queue
+  // (MAX_CONCURRENT = 1) for tens of minutes. Across ALL attempts combined, give up after
+  // this budget and fail (retryable) so clips queued behind it can proceed.
+  const DOWNLOAD_BUDGET_MS = 12 * 60_000;
+  const overallDeadline = Date.now() + DOWNLOAD_BUDGET_MS;
   const isRateLimited = (m: string) => /\b429\b/.test(m) || /too many requests/i.test(m);
   const probeHeight = async (file: string): Promise<number> => {
     try {
@@ -553,6 +564,11 @@ async function downloadSegment(
 
     // Retry the SAME (HD) attempt on transient rate-limiting before stepping down.
     for (;;) {
+      // Enforce the whole-job wall-clock cap on every (initial + backoff) iteration so a
+      // persistent 429 can never keep the job in "processing" indefinitely.
+      if (Date.now() > overallDeadline) {
+        throw new Error("YouTube download exceeded its time budget (likely 429 throttling) and no HD (720p+) stream came through. Quality floor held (no 360p). Wait a few minutes and retry this clip.");
+      }
       logger.info(
         { youtubeUrl, startTime, endTime, section, format: attempt.format, attempt: i + 1 },
         "Downloading segment via yt-dlp"
@@ -562,7 +578,10 @@ async function downloadSegment(
         await spawnProcess(
           ytDlp,
           buildYtDlpArgs(section, attempt.format, outTemplate, youtubeUrl, (attempt.extraArgs ?? []).join(" ").includes("android_vr") ? [] : cookiesArgs, attempt.extraArgs ?? []),
-          attempt.hardMs,
+          // Cap this attempt's hard timeout to whatever remains of the whole-job budget, so
+          // the four attempts can never sum to ~45 min. Floor at 30s so a near-exhausted
+          // budget still gives a real (if short) final try before the deadline check trips.
+          Math.max(30_000, Math.min(attempt.hardMs, overallDeadline - Date.now())),
           (line) => {
             const m = line.match(/\[download\]\s+(\d+\.?\d*)%/);
             if (m) {
