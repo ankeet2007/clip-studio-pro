@@ -727,6 +727,18 @@ function defaultZoomEvents(duration: number): ZoomEvent[] {
  * timer eventually kills). We detect that here (the first video frame has no pts) and
  * only then rebuild a clean file — normal clips are untouched.
  */
+/** Actual playable duration (seconds) of a media file, or 0 if it can't be probed. */
+async function probeContentDuration(file: string): Promise<number> {
+  try {
+    const { stdout } = await execFileAsync("ffprobe", [
+      "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", file,
+    ], { timeout: 30_000 });
+    return parseFloat(String(stdout).trim()) || 0;
+  } catch {
+    return 0;
+  }
+}
+
 async function segmentHasValidTimestamps(file: string): Promise<boolean> {
   try {
     const { stdout } = await execFileAsync("ffprobe", [
@@ -828,7 +840,10 @@ export async function processClip(
 
   const startSeconds = timeToSeconds(startTime);
   const endSeconds = timeToSeconds(endTime);
-  const duration = endSeconds - startSeconds;
+  // `let` (not const): if the source has less footage than requested (e.g. the cut runs past
+  // the end of the video), we clamp this to the real available footage so the composite never
+  // pads the shortfall with a frozen held frame. See the short-download guard after download.
+  let duration = endSeconds - startSeconds;
 
   if (duration <= 0) throw new Error("End time must be after start time");
 
@@ -863,6 +878,29 @@ export async function processClip(
       // those before compositing; normal clips (valid pts) skip this untouched.
       if (!(await segmentHasValidTimestamps(tmpInputPath))) {
         tmpInputPath = await normalizeSegmentTimestamps(tmpInputPath, tmpId);
+      }
+
+      // Short-download guard (the "frozen clip" fix). A cut that runs past the end of the
+      // source video — or any truncated download — comes back with far less footage than the
+      // requested window. The composite below uses `-t duration`, so the missing seconds get
+      // padded with a single held frame → a video that "freezes" for most of its length.
+      // Detect the shortfall from the actual content duration and handle it explicitly.
+      const contentDuration = await probeContentDuration(tmpInputPath);
+      if (contentDuration > 0 && contentDuration < duration - 1.5) {
+        // Grossly short (under ~5s, or less than 60% of the request): the window is largely
+        // past the end of the video. Retrying won't help — the timestamps are the problem —
+        // so fail with an actionable message instead of shipping a mostly-frozen clip.
+        if (contentDuration < Math.min(5, duration * 0.6)) {
+          throw new Error(
+            `Only ${contentDuration.toFixed(1)}s of footage is available for the requested ${Math.round(duration)}s segment (${startTime}–${endTime}). The clip time is likely past the end of the video — check the timestamps against the video's actual length.`
+          );
+        }
+        // Minor shortfall: clamp the render to the real footage so we never freeze-pad.
+        logger.warn(
+          { requestedDuration: duration, contentDuration },
+          "Downloaded segment shorter than requested — clamping render duration to available footage (avoids freeze-pad)"
+        );
+        duration = contentDuration;
       }
       await updateProgress(45, true);
     }
