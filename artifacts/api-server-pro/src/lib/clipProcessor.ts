@@ -700,6 +700,89 @@ function defaultZoomEvents(duration: number): ZoomEvent[] {
   return out.slice(0, 10);
 }
 
+/**
+ * yt-dlp `--download-sections` can emit a segment whose frames carry NO presentation
+ * timestamps — seen on sections cut from deep inside long livestream VODs (e.g. a clip
+ * 3 hours into a 3h+ stream, AV1 or H.264 alike). ffmpeg then decodes 0 frames through
+ * the composite filtergraph and the render "stalls" at frame 0 forever (which the stall
+ * timer eventually kills). We detect that here (the first video frame has no pts) and
+ * only then rebuild a clean file — normal clips are untouched.
+ */
+async function segmentHasValidTimestamps(file: string): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync("ffprobe", [
+      "-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#1",
+      "-show_entries", "frame=pts_time", "-of", "csv=p=0", file,
+    ], { timeout: 30_000 });
+    const first = String(stdout).trim().split("\n")[0]?.trim() ?? "";
+    return first !== "" && first.toUpperCase() !== "N/A";
+  } catch {
+    return true; // If we can't tell, don't force a needless re-encode.
+  }
+}
+
+async function probeFps(file: string): Promise<number> {
+  try {
+    const { stdout } = await execFileAsync("ffprobe", [
+      "-v", "error", "-select_streams", "v:0",
+      "-show_entries", "stream=avg_frame_rate", "-of", "csv=p=0", file,
+    ], { timeout: 30_000 });
+    const [num, den] = String(stdout).trim().split("/").map((n) => parseInt(n, 10));
+    if (num && den) return num / den;
+    if (num) return num;
+  } catch { /* fall through */ }
+  return 30;
+}
+
+async function segmentHasAudio(file: string): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync("ffprobe", [
+      "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
+      "-of", "csv=p=0", file,
+    ], { timeout: 15_000 });
+    return String(stdout).trim().length > 0;
+  } catch { return false; }
+}
+
+/**
+ * Rebuilds timestamps for a pts-less segment (see segmentHasValidTimestamps). Two passes:
+ * (1) a lossless `-c copy` remux with +genpts makes the pts-less packets decodable (a plain
+ * decode of the raw file yields 0 frames); (2) a re-encode that reassigns pts from the frame
+ * index (setpts=N/fps/TB) at the source frame rate yields a clean, correct-duration CFR file.
+ * Quality-preserving (crf 12 intermediate; the composite re-encodes at crf 14 anyway).
+ * Returns the normalized path and deletes the original + the intermediate remux.
+ */
+async function normalizeSegmentTimestamps(file: string, tmpId: string): Promise<string> {
+  const tmpDir = os.tmpdir();
+  const fps = await probeFps(file);
+  const hasAudio = await segmentHasAudio(file);
+  const remuxPath = path.join(tmpDir, `clip_remux_${tmpId}.mp4`);
+  const cleanPath = path.join(tmpDir, `clip_norm_${tmpId}.mp4`);
+
+  logger.info({ file, fps, hasAudio }, "Segment has no frame timestamps — normalizing before composite");
+
+  // Pass 1: genpts stream-copy remux (lossless) so the pts-less packets become decodable.
+  await spawnProcess("ffmpeg", [
+    "-y", "-fflags", "+genpts", "-i", file, "-c", "copy", remuxPath,
+  ], 300_000, undefined, RENDER_STALL_MS, "render");
+
+  // Pass 2: re-encode rebuilding pts from the frame/sample index → correct duration & pacing.
+  const args = [
+    "-y", "-i", remuxPath,
+    "-vf", `setpts=N/${fps}/TB`, "-r", String(fps), "-fps_mode", "cfr",
+    ...(hasAudio ? ["-af", "asetpts=N/SR/TB"] : ["-an"]),
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "12", "-pix_fmt", "yuv420p",
+    ...(hasAudio ? ["-c:a", "aac", "-b:a", "256k"] : []),
+    "-movflags", "+faststart", cleanPath,
+  ];
+  await spawnProcess("ffmpeg", args, 0, undefined, RENDER_STALL_MS, "render");
+
+  try { fs.unlinkSync(remuxPath); } catch { /* ignore */ }
+  try { fs.unlinkSync(file); } catch { /* ignore */ }
+  logger.info({ cleanPath }, "Segment normalized");
+  return cleanPath;
+}
+
 export async function processClip(
   youtubeUrl: string | null,
   startTime: string,
@@ -755,6 +838,13 @@ export async function processClip(
         (pct) => { void updateProgress(pct); }
       );
       logger.info({ tmpInputPath, mode }, "Segment downloaded");
+
+      // Deep-in-a-livestream section cuts can come back with NO frame timestamps, which
+      // makes the composite filtergraph emit 0 frames (a permanent frame-0 stall). Repair
+      // those before compositing; normal clips (valid pts) skip this untouched.
+      if (!(await segmentHasValidTimestamps(tmpInputPath))) {
+        tmpInputPath = await normalizeSegmentTimestamps(tmpInputPath, tmpId);
+      }
       await updateProgress(45, true);
     }
 
