@@ -1029,8 +1029,10 @@ export async function processClip(
 
     await updateProgress(45, true);
 
-    // Position: center the headline PNG vertically in the top white bar
-    const hlY = Math.max(30, Math.floor((videoY - pngHeight) / 2));
+    // Position: sit the headline PNG in the top bar, biased ~36px DOWNWARD from
+    // centered (keeps it clear of YouTube's very-top back/search icons), clamped so
+    // the bottom of the block never crosses the red line at videoY.
+    const hlY = Math.max(30, Math.min(videoY - pngHeight - 8, Math.floor((videoY - pngHeight) / 2) + 36));
 
     // Detect if the source video already has a logo/watermark in the bottom-center
     // area where our channel handle would go, and shift ours right if so.
@@ -1165,7 +1167,7 @@ export async function processClip(
       // ffmpeg drawtext: the colon must be backslash-escaped even inside single
       // quotes ('Credit\: KSI'), else the filtergraph fails to parse. \\ in the
       // template literal -> a single literal backslash in the filter string.
-      sourceChannel && sourceChannel.trim() ? `[composedac]drawtext=text='Credit\\: ${sourceChannel.trim().replace(/'/g,"")}':fontsize=24:fontcolor=white@0.85:x=w-text_w-16:y=${videoY + videoH - 36}:shadowx=1:shadowy=1:shadowcolor=black@0.9[composed]` : `[composedac]null[composed]`,
+      sourceChannel && sourceChannel.trim() ? `[composedac]drawtext=text='Credit\\: ${sourceChannel.trim().replace(/'/g,"")}':fontsize=24:fontcolor=white@0.85:x=16:y=${videoY + videoH - 36}:shadowx=1:shadowy=1:shadowcolor=black@0.9[composed]` : `[composedac]null[composed]`,
     ];
     let prevLabel = "composed";
 
@@ -1186,7 +1188,7 @@ export async function processClip(
       const safeHandle = escapeDrawtext(channelHandle.trim().toUpperCase());
       const handleFont = fs.existsSync(ANTON_FONT) ? ANTON_FONT : (fs.existsSync(WATERMARK_FONT) ? WATERMARK_FONT : fontFile);
       const handleFontSize = 48;
-      const handleY = videoY + videoH + Math.floor((canvasH - videoY - videoH - handleFontSize) / 2);  // vertically centered in bottom bar
+      const handleY = videoY + videoH + 20;  // bottom-center, just below the video frame with a small gap
       filters.push(
         `[${prevLabel}]drawtext=` +
         `text='${safeHandle}':` +
