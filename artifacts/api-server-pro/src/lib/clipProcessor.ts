@@ -1203,22 +1203,15 @@ export async function processClip(
     }
 
     if (outroEnabled) {
-      // Outro card: last 2 seconds = black overlay + styled end screen
+      // Outro card: last 2 seconds = full-black end screen with a single big, bold
+      // red SUBSCRIBE centered on both axes — matches the reference outro exactly.
       const outroStart = Math.max(0, duration - 2);
-      const safeHandleOutro = (channelHandle || '').replace(/'/g, '').trim();
+      const subFont = fs.existsSync(WATERMARK_FONT) ? WATERMARK_FONT : fontFile;
       filters.push(
-        // Black overlay
+        // Full-screen black card
         `[pre_outro]drawbox=x=0:y=0:w=${canvasW}:h=${canvasH}:color=black@1:t=fill:enable='gte(t,${outroStart})'[ob]`,
-        // Thin red accent line top
-        `[ob]drawbox=x=340:y=700:w=400:h=3:color=FF0000:t=fill:enable='gte(t,${outroStart})'[ol1]`,
-        // Channel handle
-        `[ol1]drawtext=text='${safeHandleOutro}':fontsize=44:fontcolor=white:x=(w-text_w)/2:y=750:enable='gte(t,${outroStart})'[ol2]`,
-        // Red subscribe button background
-        `[ol2]drawbox=x=${Math.floor((canvasW - 380) / 2)}:y=830:w=380:h=80:color=FF0000:t=fill:enable='gte(t,${outroStart})'[ol3]`,
-        // SUBSCRIBE text inside red button
-        `[ol3]drawtext=text='SUBSCRIBE':fontsize=42:fontcolor=white:x=(w-text_w)/2:y=848:enable='gte(t,${outroStart})'[ol4]`,
-        // Thin red accent line bottom
-        `[ol4]drawbox=x=340:y=940:w=400:h=3:color=FF0000:t=fill:enable='gte(t,${outroStart})'[out]`
+        // Bold red SUBSCRIBE, centered — same-color border thickens the strokes to a heavy weight
+        `[ob]drawtext=fontfile='${subFont}':text='SUBSCRIBE':fontsize=150:fontcolor=FF0000:borderw=4:bordercolor=FF0000:x=(w-text_w)/2:y=(h-text_h)/2:enable='gte(t,${outroStart})'[out]`
       );
     } else {
       filters.push(`[pre_outro]null[out]`);
