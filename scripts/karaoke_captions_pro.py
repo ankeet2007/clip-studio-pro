@@ -85,6 +85,9 @@ def extract_words(segs):
         # Skip whole non-speech segments, e.g. "(speaking in foreign language)".
         if not clean_text(s.get("text", "")):
             continue
+        # Collect this segment's real tokens with their raw (possibly VAD-compacted)
+        # onset in seconds.
+        seg_toks = []
         for t in s.get("tokens", []):
             tx = t.get("text", "")
             if tx.startswith("[_"):      # special tokens: [_BEG_], [_TT_94], ...
@@ -94,6 +97,33 @@ def extract_words(segs):
                 onset = dtw / 100.0          # centiseconds -> seconds
             else:
                 onset = t.get("offsets", {}).get("from", 0) / 1000.0
+            seg_toks.append([tx, onset])
+        if not seg_toks:
+            continue
+        # --- VAD timeline fix -------------------------------------------------
+        # With --vad, whisper.cpp remaps the SEGMENT offsets to the real timeline
+        # but leaves per-token t_dtw/offsets on the VAD-COMPACTED timeline (silence
+        # removed). Left as-is the karaoke drifts progressively early — words after
+        # a non-speech gap fire seconds ahead of the audio. Linearly remap each
+        # segment's token onsets from their compacted span onto the segment's true
+        # [offsets.from, offsets.to] span. Identity when nothing was compacted
+        # (e.g. VAD off), so it is always safe to apply.
+        off = s.get("offsets", {})
+        o0, o1 = off.get("from"), off.get("to")
+        if o0 is not None and o1 is not None:
+            o0 /= 1000.0; o1 /= 1000.0
+            cs = [c for _, c in seg_toks]
+            c0, c1 = min(cs), max(cs)
+            if c1 > c0 and o1 > o0:
+                scale = (o1 - o0) / (c1 - c0)
+                for tk in seg_toks:
+                    tk[1] = o0 + (tk[1] - c0) * scale
+            else:
+                for tk in seg_toks:
+                    tk[1] = o0
+        # ---------------------------------------------------------------------
+        # Merge sub-word tokens / punctuation back into whole words.
+        for tx, onset in seg_toks:
             if tx.startswith(" "):
                 words.append([tx[1:], onset])   # leading space => new word
             elif words:

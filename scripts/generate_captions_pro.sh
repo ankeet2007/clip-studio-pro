@@ -15,7 +15,15 @@ OUTPUT_SRT="$2"
 OUTPUT_TXT="$3"
 JSON_OUT="${OUTPUT_SRT%.srt}.json"
 WHISPER="$HOME/whisper.cpp/build/bin/whisper-cli"
-MODEL="$HOME/whisper.cpp/models/ggml-small.en.bin"
+# Model + matching DTW alignment-head preset MUST move together (a mismatched
+# -dtw preset silently corrupts word onsets). medium.en-q5_0 (~514MB quantized)
+# has ~small.en's memory footprint but far higher accuracy on noisy/shouty audio.
+MODEL="$HOME/whisper.cpp/models/ggml-medium.en-q5_0.bin"
+DTW_PRESET="medium.en"
+# Silero VAD (already on disk) gates whisper to real speech: kills hallucination
+# over crowd/music and stops loud non-narration windows being dropped as "no speech"
+# (the cause of captions vanishing after the clip's midpoint).
+VAD_MODEL="$HOME/whisper.cpp/models/ggml-silero-v5.1.2.bin"
 TMP_WAV="/data/data/com.termux/files/home/myapp/clips_output/tmp_audio_$$.wav"
 TMP_BASE="/data/data/com.termux/files/home/myapp/clips_output/tmp_srt_$$"
 # DTW gives accurate per-word onsets, so no global nudge is needed. This only shifts
@@ -27,9 +35,15 @@ DURATION=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "$INPUT" 2
 OUTRO_START=$(python3 -c "d=float('${DURATION}'); print(max(0, d-2))" 2>/dev/null || echo "9999")
 
 ffmpeg -y -i "$INPUT" -ar 16000 -ac 1 -c:a pcm_s16le "$TMP_WAV" 2>/dev/null
-# -nfa: disable flash attention (REQUIRED for DTW). -dtw small.en: DTW alignment-head
-# preset matching the model. -ojf: JSON-full (per-token t_dtw + offsets).
-"$WHISPER" -m "$MODEL" -f "$TMP_WAV" -nfa -dtw small.en -ojf -osrt -otxt -of "$TMP_BASE" -t 4 2>/dev/null
+# -nfa: disable flash attention (REQUIRED for DTW). -dtw $DTW_PRESET: DTW alignment-head
+# preset matching $MODEL. -ojf: JSON-full (per-token t_dtw + offsets).
+# --vad + Silero: only transcribe detected speech (accuracy + full-length coverage).
+# vad-speech-pad-ms 60: keep a little context around each speech chunk so word
+# starts/ends aren't clipped. Stderr -> debug log (not /dev/null) so failures are visible.
+"$WHISPER" -m "$MODEL" -f "$TMP_WAV" \
+  -nfa -dtw "$DTW_PRESET" -ojf -osrt -otxt -of "$TMP_BASE" -t 4 \
+  --vad --vad-model "$VAD_MODEL" --vad-threshold 0.5 --vad-speech-pad-ms 60 \
+  2>>"$HOME/myapp/caption_debug.log"
 rm -f "$TMP_WAV"
 
 if [ ! -f "${TMP_BASE}.srt" ]; then echo "FAIL"; exit 1; fi

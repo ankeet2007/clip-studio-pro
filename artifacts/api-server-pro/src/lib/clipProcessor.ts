@@ -1323,13 +1323,23 @@ export async function processClip(
         const captionedPath = path.join(outputDir, `clip_${clipId}_captioned.mp4`);
 
         if (fs.existsSync(captionScript)) {
-          await new Promise<void>((resolve) => {
-            // 30 min cap: whisper small.en is slow on the phone (~6 min for a ~45s clip);
-            // 5 min was too short and silently dropped captions on longer segments.
-            const cap = spawn("bash", [captionScript, finalOutputPath, srtPath, transcriptPath], { timeout: 1_800_000 });
-            cap.on("close", () => resolve());
-            cap.on("error", () => resolve());
+          // Capture exit code + the script's own OK/FAIL line so a failed whisper
+          // run is logged loudly instead of silently shipping an uncaptioned clip.
+          // 60 min cap: medium.en-q5 on the phone is ~16 min for a 60s clip (~16x
+          // realtime); a 30 min cap would time-out (and drop captions on) longer clips.
+          const capResult = await new Promise<{ code: number | null; out: string }>((resolve) => {
+            const cap = spawn("bash", [captionScript, finalOutputPath, srtPath, transcriptPath], { timeout: 3_600_000 });
+            let out = "";
+            cap.stdout?.on("data", (d) => { out += d.toString(); });
+            cap.on("close", (code) => resolve({ code, out }));
+            cap.on("error", (err) => resolve({ code: -1, out: String(err) }));
           });
+          if (capResult.code !== 0 || /\bFAIL\b/.test(capResult.out)) {
+            logger.warn(
+              { clipId, exitCode: capResult.code, tail: capResult.out.slice(-400) },
+              "Caption script failed (whisper/transcription) — clip may be uncaptioned or partial"
+            );
+          }
 
           if (fs.existsSync(transcriptPath)) {
             try {
