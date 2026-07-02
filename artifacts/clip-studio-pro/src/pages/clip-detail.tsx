@@ -77,6 +77,30 @@ export default function ClipDetail() {
     toast(ok ? { title: `${label} copied` } : { title: "Copy failed", variant: "destructive" });
   }
 
+  // AI-written YouTube metadata. Bridge pattern — the app writes a Gemini prompt for a
+  // scroll-stopping title, description and hashtags; the user runs it in their own Gemini and
+  // pastes the result straight into YouTube (no server AI call). The card above is the
+  // algorithmic fallback.
+  async function copyMetaPrompt() {
+    if (!clip) return;
+    const hasUrl = !!(clip.youtubeUrl && clip.youtubeUrl.trim());
+    const prompt =
+      `You are a YouTube Shorts growth expert. Write upload metadata for this vertical Short.\n` +
+      (hasUrl
+        ? `If you can, open and WATCH this exact section, then ground everything in what actually happens:\nVideo: ${clip.youtubeUrl}\nSection: ${clip.startTime} to ${clip.endTime}\n`
+        : "") +
+      `Context:\n- Headline: ${clip.headline || "(none)"}\n- Source channel: ${clip.sourceChannel || "(unknown)"}\n\n` +
+      `Produce, clearly labelled:\n` +
+      `1) TITLE — under 100 characters, scroll-stopping, ending with #Shorts\n` +
+      `2) DESCRIPTION — 2-3 short lines: a hook, then a subscribe nudge\n` +
+      `3) HASHTAGS — 5-8 relevant hashtags on one line (no apostrophes)\n` +
+      `Return just those three labelled sections, ready to paste into YouTube.`;
+    const ok = await copyTextToClipboard(prompt);
+    toast(ok
+      ? { title: "Metadata prompt copied", description: "Paste it into Gemini, then paste the result into YouTube." }
+      : { title: "Copy failed", variant: "destructive" });
+  }
+
   async function handleRetry() {
     try {
       const res = await fetch(`${API_BASE}/api/clips/${clipId}/retry`, { method: "POST" });
@@ -265,12 +289,20 @@ export default function ClipDetail() {
                   <p className="flex items-center gap-2 font-mono text-[11px] uppercase tracking-[0.13em] text-muted-foreground">
                     <Sparkles className="w-4 h-4 text-primary" /> YouTube metadata
                   </p>
-                  <button
-                    onClick={() => copyMeta(`${meta.title}\n\n${meta.description}`, "All metadata")}
-                    className="flex items-center gap-1.5 text-[10.5px] font-mono uppercase tracking-[0.08em] text-primary hover:underline"
-                  >
-                    <Copy className="w-3 h-3" /> Copy all
-                  </button>
+                  <div className="flex items-center gap-3 shrink-0">
+                    <button
+                      onClick={copyMetaPrompt}
+                      className="flex items-center gap-1.5 text-[10.5px] font-mono uppercase tracking-[0.08em] text-primary hover:underline"
+                    >
+                      <Sparkles className="w-3 h-3" /> Gemini prompt
+                    </button>
+                    <button
+                      onClick={() => copyMeta(`${meta.title}\n\n${meta.description}`, "All metadata")}
+                      className="flex items-center gap-1.5 text-[10.5px] font-mono uppercase tracking-[0.08em] text-muted-foreground hover:text-foreground"
+                    >
+                      <Copy className="w-3 h-3" /> Copy all
+                    </button>
+                  </div>
                 </div>
 
                 <div>

@@ -12,6 +12,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useLocation } from "wouter";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
 import { AppHeader } from "@/components/app-header";
@@ -111,6 +112,32 @@ function fmtDuration(start: string, end: string): string {
   const m = Math.floor(d / 60);
   const s = d % 60;
   return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+/**
+ * Parses clip suggestions the user pastes back from Gemini (the AI Clip Finder flow).
+ * Each line looks like "00:01:12 - 00:01:34 | Headline Here": we read the two timestamps
+ * and take everything after the second one as the headline. Times are normalised to
+ * HH:MM:SS. Backwards/garbage lines are skipped; the result is capped at MAX_CLIPS.
+ */
+function parseClipSuggestions(text: string): { startTime: string; endTime: string; headline: string }[] {
+  const padTime = (t: string): string => {
+    const parts = t.split(":");
+    while (parts.length < 3) parts.unshift("0");
+    return parts.slice(-3).map((p) => p.padStart(2, "0")).join(":");
+  };
+  const out: { startTime: string; endTime: string; headline: string }[] = [];
+  for (const line of text.split(/\r?\n/)) {
+    const m = line.match(/(\d{1,2}:\d{1,2}(?::\d{1,2})?)\s*(?:-|–|—|to|→)\s*(\d{1,2}:\d{1,2}(?::\d{1,2})?)(.*)/i);
+    if (!m) continue;
+    const startTime = padTime(m[1]);
+    const endTime = padTime(m[2]);
+    if (toSecs(endTime) <= toSecs(startTime)) continue;
+    const headline = m[3].replace(/^[\s|:\-–—]+/, "").replace(/^["']|["']$/g, "").trim().slice(0, 120);
+    out.push({ startTime, endTime, headline });
+    if (out.length >= MAX_CLIPS) break;
+  }
+  return out;
 }
 
 /**
@@ -356,10 +383,13 @@ export default function Home() {
     },
   });
 
-  const { fields, append, remove } = useFieldArray({
+  const { fields, append, remove, replace } = useFieldArray({
     control: form.control,
     name: "clips",
   });
+
+  // AI Clip Finder: raw text the user pastes back from Gemini, parsed into clip entries.
+  const [suggestText, setSuggestText] = useState("");
 
   const [, navigate] = useLocation();
   const isSubmitting = form.formState.isSubmitting;
@@ -508,6 +538,94 @@ export default function Home() {
     } else {
       toast({ title: "Copy failed", description: "Couldn't access the clipboard.", variant: "destructive" });
     }
+  }
+
+  // Per-clip AI headline. Same bridge pattern as the hook/zoom prompts — the app writes the
+  // Gemini prompt, the user runs it in their own Gemini and pastes the headline back.
+  async function copyHeadlinePrompt(index: number) {
+    const values = form.getValues();
+    const clip = values.clips[index];
+    if (!clip) return;
+    const dur = Math.max(0, toSecs(clip.endTime) - toSecs(clip.startTime));
+    const hasUrl = !!(values.youtubeUrl && values.youtubeUrl.trim());
+    const prompt =
+      `You are a viral short-form video editor. ` +
+      (hasUrl
+        ? `Open and WATCH the exact section of the source video below, then base the headline on what ACTUALLY happens in it — do not guess.\n`
+        : `Suggest a headline for this clip (a local upload — if you cannot view the footage, base it on the context below).\n`) +
+      `Write ONE punchy on-screen headline (4-7 words) for a vertical YouTube Short that stops the scroll and nails THIS clip's single most attention-grabbing moment. ` +
+      `Use Title Case, no ending period, no hashtags, no emoji, no quotes. Return ONLY the headline line — nothing else.\n\n` +
+      `Context:\n` +
+      (hasUrl
+        ? `- Video: ${values.youtubeUrl}\n- Watch ONLY this section: ${clip.startTime} to ${clip.endTime}\n`
+        : "") +
+      `- Source channel: ${values.sourceChannel || "(unknown)"}\n` +
+      `- Clip length: ~${dur}s`;
+    const ok = await copyTextToClipboard(prompt);
+    toast(ok
+      ? { title: "Headline prompt copied", description: "Paste it into Gemini, then paste the headline back here." }
+      : { title: "Copy failed", description: "Couldn't access the clipboard.", variant: "destructive" });
+  }
+
+  // AI Clip Finder: prompt asks Gemini to watch the whole video and return the best moments as
+  // "HH:MM:SS - HH:MM:SS | Headline" lines. The user pastes them back and applyClipSuggestions
+  // parses them into clip entries. Server makes no AI calls (same bridge pattern as hook/zoom).
+  async function copyClipFinderPrompt() {
+    const values = form.getValues();
+    const hasUrl = !!(values.youtubeUrl && values.youtubeUrl.trim());
+    const prompt =
+      `You are an expert short-form video editor hunting for viral moments to cut from a longer video.\n` +
+      (hasUrl
+        ? `Open and WATCH this video, then base every pick on what ACTUALLY happens — do not guess:\nVideo: ${values.youtubeUrl}\n`
+        : `(Add the source video URL first, or describe/paste the video to Gemini.)\n`) +
+      `Find the 3 to 5 most viral, hook-worthy moments to turn into vertical YouTube Shorts. ` +
+      `Each clip should be a self-contained 15-60 second beat — a reaction, punchline, reveal, or key moment.\n` +
+      (values.sourceChannel ? `Source channel: ${values.sourceChannel}.\n` : "") +
+      `For EACH clip give the START and END time as ABSOLUTE timestamps in the source video (HH:MM:SS), plus a punchy 4-7 word headline.\n` +
+      `Return ONLY one clip per line, in EXACTLY this format, and NOTHING else:\n` +
+      `HH:MM:SS - HH:MM:SS | Headline Here\n` +
+      `Example:\n` +
+      `00:01:12 - 00:01:34 | He Didn't See That Coming\n` +
+      `00:04:47 - 00:05:20 | The Bet That Changed Everything`;
+    const ok = await copyTextToClipboard(prompt);
+    toast(ok
+      ? { title: "Clip-finder prompt copied", description: "Paste it into Gemini, then paste its clip list into the box below." }
+      : { title: "Copy failed", description: "Couldn't access the clipboard.", variant: "destructive" });
+  }
+
+  // Turns whatever the user pasted from Gemini into clip entries. If the form still holds just
+  // the untouched default clip, replace it; otherwise append (respecting MAX_CLIPS).
+  function applyClipSuggestions() {
+    const parsed = parseClipSuggestions(suggestText);
+    if (parsed.length === 0) {
+      toast({ title: "No clips found", description: "Paste Gemini's lines like  00:01:12 - 00:01:34 | Headline", variant: "destructive" });
+      return;
+    }
+    const entries = parsed.map((p) => ({ ...defaultClip, startTime: p.startTime, endTime: p.endTime, headline: p.headline }));
+    const cur = form.getValues("clips");
+    const onlyDefault =
+      cur.length === 1 &&
+      !cur[0]?.headline?.trim() &&
+      cur[0]?.startTime === defaultClip.startTime &&
+      cur[0]?.endTime === defaultClip.endTime;
+    let added: number;
+    if (onlyDefault) {
+      const next = entries.slice(0, MAX_CLIPS);
+      replace(next);
+      added = next.length;
+    } else {
+      const room = Math.max(0, MAX_CLIPS - cur.length);
+      const toAdd = entries.slice(0, room);
+      toAdd.forEach((e) => append(e));
+      added = toAdd.length;
+    }
+    setSuggestText("");
+    toast({
+      title: `${added} clip${added === 1 ? "" : "s"} added`,
+      description: added < parsed.length
+        ? `Capped at ${MAX_CLIPS} clips. Review times & headlines, then Enqueue.`
+        : "Review the times & headlines, then Enqueue.",
+    });
   }
 
   async function onSubmit(values: FormValues) {
@@ -777,6 +895,37 @@ export default function Home() {
                         {...form.register("sourceChannel")}
                       />
                     </div>
+
+                    {/* AI Clip Finder — bridge pattern: copy prompt → run in Gemini → paste clips back */}
+                    <div className="rounded-lg border border-primary/30 bg-primary/[0.05] p-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[10.5px] font-mono uppercase tracking-[0.1em] text-foreground flex items-center gap-1.5">
+                          <Sparkles className="w-3.5 h-3.5 text-primary" /> AI Clip Finder
+                          <span className="text-[8.5px] font-semibold tracking-[0.14em] text-primary border border-primary/40 rounded px-1.5 py-0.5 inline-flex items-center gap-1"><Sparkles className="w-2.5 h-2.5" />AI</span>
+                        </span>
+                        <button
+                          type="button"
+                          onClick={copyClipFinderPrompt}
+                          className="text-[10px] font-mono uppercase tracking-[0.08em] text-primary hover:underline flex items-center gap-1.5 shrink-0"
+                        >
+                          <ClipboardCopy className="w-3 h-3" /> Copy Gemini prompt
+                        </button>
+                      </div>
+                      <Textarea
+                        value={suggestText}
+                        onChange={(e) => setSuggestText(e.target.value)}
+                        placeholder={"Paste Gemini's clips here — one per line:\n00:01:12 - 00:01:34 | Headline"}
+                        className="text-sm bg-background mt-2.5 font-mono min-h-[72px]"
+                      />
+                      <button
+                        type="button"
+                        onClick={applyClipSuggestions}
+                        disabled={!suggestText.trim()}
+                        className="mt-2 w-full flex items-center justify-center gap-2 rounded-md border border-dashed border-primary/40 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-primary hover:bg-primary/10 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        <Plus className="w-3.5 h-3.5" /> Add clips from paste
+                      </button>
+                    </div>
                   </div>
 
                   {/* clip entries */}
@@ -847,8 +996,18 @@ export default function Home() {
                             {/* headline */}
                             {!isRaw && (
                               <div>
+                                <div className="flex items-center justify-between gap-2 mb-1.5">
+                                  <FieldLabel>Headline</FieldLabel>
+                                  <button
+                                    type="button"
+                                    onClick={() => copyHeadlinePrompt(index)}
+                                    className="text-[10px] font-mono uppercase tracking-[0.08em] text-primary hover:underline flex items-center gap-1.5 shrink-0"
+                                  >
+                                    <ClipboardCopy className="w-3 h-3" /> Copy Gemini prompt
+                                  </button>
+                                </div>
                                 <Input
-                                  placeholder="Overlay headline…"
+                                  placeholder="Overlay headline…  (type it, or paste from Gemini)"
                                   className={`text-sm bg-background ${form.formState.errors.clips?.[index]?.headline ? "border-destructive" : ""}`}
                                   {...form.register(`clips.${index}.headline`)}
                                 />
