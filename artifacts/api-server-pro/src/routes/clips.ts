@@ -62,7 +62,8 @@ function dispatchClipJob(
   voiceoverEnabled = false,
   voiceoverHook = "",
   punchInEnabled = false,
-  zoomMoments = ""
+  zoomMoments = "",
+  captionColor = ""
 ) {
   const { channelHandle } = readSettings();
 
@@ -78,7 +79,7 @@ function dispatchClipJob(
       logger.error({ err, clipId }, "Failed to mark clip as processing");
     }
 
-    await processClip(youtubeUrl, startTime, endTime, headline, outputFilename, mode, channelHandle, clipId, localFilePath, frameStyle, sourceChannel, captionsEnabled, outroEnabled, voiceoverEnabled, voiceoverHook, punchInEnabled, zoomMoments)
+    await processClip(youtubeUrl, startTime, endTime, headline, outputFilename, mode, channelHandle, clipId, localFilePath, frameStyle, sourceChannel, captionsEnabled, outroEnabled, voiceoverEnabled, voiceoverHook, punchInEnabled, zoomMoments, captionColor)
       .then(async () => {
         await db
           .update(clipsTable)
@@ -115,6 +116,7 @@ router.post("/clips", async (req, res): Promise<void> => {
   const voiceoverHook = (req.body as { voiceoverHook?: string }).voiceoverHook ?? "";
   const punchInEnabled = (req.body as { punchInEnabled?: boolean }).punchInEnabled ?? false;
   const zoomMoments = (req.body as { zoomMoments?: string }).zoomMoments ?? "";
+  const captionColor = (req.body as { captionColor?: string }).captionColor ?? "";
 
   // Up-front guard: reject a start time that falls past the end of the source video so the user
   // gets an immediate, clear "that timestamp doesn't exist" error instead of a frozen/failed
@@ -127,7 +129,7 @@ router.post("/clips", async (req, res): Promise<void> => {
 
   const [clip] = await db
     .insert(clipsTable)
-    .values({ youtubeUrl, startTime, endTime, headline, mode, frameStyle, sourceChannel, captionsEnabled, voiceoverEnabled, voiceoverHook, punchInEnabled, zoomMoments, outroEnabled, sourceType: "youtube", status: "pending" })
+    .values({ youtubeUrl, startTime, endTime, headline, mode, frameStyle, sourceChannel, captionsEnabled, captionColor, voiceoverEnabled, voiceoverHook, punchInEnabled, zoomMoments, outroEnabled, sourceType: "youtube", status: "pending" })
     .returning();
 
   if (!clip) {
@@ -138,7 +140,7 @@ router.post("/clips", async (req, res): Promise<void> => {
   res.status(201).json(GetClipResponse.parse(clip));
 
   const outputFilename = `clip_${clip.id}_${Date.now()}.mp4`;
-  dispatchClipJob(clip.id, youtubeUrl, startTime, endTime, headline, outputFilename, mode, frameStyle, undefined, sourceChannel, captionsEnabled, outroEnabled, voiceoverEnabled, voiceoverHook, punchInEnabled, zoomMoments);
+  dispatchClipJob(clip.id, youtubeUrl, startTime, endTime, headline, outputFilename, mode, frameStyle, undefined, sourceChannel, captionsEnabled, outroEnabled, voiceoverEnabled, voiceoverHook, punchInEnabled, zoomMoments, captionColor);
 });
 
 /**
@@ -156,6 +158,7 @@ router.post("/clips/upload", (req, res): void => {
   let frameStyle: "standard" | "immersive" = "immersive";
   let sourceChannel = "";
   let captionsEnabled = true;
+  let captionColor = "";
   let voiceoverEnabled = false;
   let voiceoverHook = "";
   let punchInEnabled = false;
@@ -184,6 +187,7 @@ router.post("/clips/upload", (req, res): void => {
     if (name === "frameStyle" && (value === "standard" || value === "immersive")) frameStyle = value;
     if (name === "sourceChannel") sourceChannel = value;
     if (name === "captionsEnabled") captionsEnabled = value !== "false";
+    if (name === "captionColor") captionColor = value;
     if (name === "voiceoverEnabled") voiceoverEnabled = value === "true";
     if (name === "voiceoverHook") voiceoverHook = value;
     if (name === "punchInEnabled") punchInEnabled = value === "true";
@@ -241,6 +245,7 @@ router.post("/clips/upload", (req, res): void => {
             sourceType: "local",
             sourceChannel,
             captionsEnabled,
+            captionColor,
             voiceoverEnabled,
             voiceoverHook,
             punchInEnabled,
@@ -261,7 +266,7 @@ router.post("/clips/upload", (req, res): void => {
         res.status(201).json(GetClipResponse.parse(clip));
 
         const outputFilename = `clip_${clip.id}_${Date.now()}.mp4`;
-        dispatchClipJob(clip.id, null, startTime, endTime, headline, outputFilename, mode, frameStyle, savedFilePath, sourceChannel, captionsEnabled, outroEnabled, voiceoverEnabled, voiceoverHook, punchInEnabled, zoomMoments);
+        dispatchClipJob(clip.id, null, startTime, endTime, headline, outputFilename, mode, frameStyle, savedFilePath, sourceChannel, captionsEnabled, outroEnabled, voiceoverEnabled, voiceoverHook, punchInEnabled, zoomMoments, captionColor);
       } catch (err) {
         if (savedFilePath) {
           try { if (fs.existsSync(savedFilePath)) fs.unlinkSync(savedFilePath); } catch { /* ignore */ }
@@ -349,7 +354,8 @@ router.post("/clips/:id/retry", async (req, res): Promise<void> => {
     // before it failed (outro + voiceover + the AI Auto-Zoom Gemini chose). These used to
     // be dropped because they weren't stored / were hardcoded on the retry path.
     clip.punchInEnabled ?? false,
-    clip.zoomMoments ?? ""
+    clip.zoomMoments ?? "",
+    clip.captionColor ?? ""
   );
 });
 

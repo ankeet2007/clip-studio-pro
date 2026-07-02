@@ -1,5 +1,7 @@
-CLIP STUDIO PRO v1 — NEW FEATURES REMAINING
-(Brainstorm list. Copied exactly as told to the user on 2026-07-02.)
+CLIP STUDIO PRO v1 — NEW FEATURES CHECKLIST
+(Brainstorm list from 2026-07-02. Status ticks updated as features ship.)
+
+Legend:  [DONE] shipped & deployed   [PARTIAL] partly shipped   [TODO] not started
 
 ===================================================================
 
@@ -18,58 +20,66 @@ adds heavy compute.
 -------------------------------------------------------------------
 TOP PICKS (reuse Gemini/transcript you already have — low/medium effort)
 -------------------------------------------------------------------
-1. Auto-clip finder — paste a full video URL, Gemini reads the transcript and
+1. [DONE] Auto-clip finder — paste a full video URL, Gemini reads the transcript and
    suggests 3-5 viral-worthy segments with start/end + a headline each. This
    removes the most manual part of your workflow (hunting timestamps). Biggest
    payoff.
+   (Shipped as the bridge pattern: "Copy Gemini prompt" -> paste clip lines back.)
 
-2. Auto-headline — generate the headline from the clip's transcript instead of
+2. [DONE] Auto-headline — generate the headline from the clip's transcript instead of
    typing it. You already fetch the transcript and have Gemini.
+   (Shipped: per-clip "Copy Gemini prompt" button by the headline field.)
 
-3. Auto voiceover-hook — right now you type/paste the hook from the Gemini app
+3. [DONE] Auto voiceover-hook — right now you type/paste the hook from the Gemini app
    manually. Generate it in-app from the clip context. Closes that loop.
+   (Already present all along: the voiceover panel has a "Copy Gemini prompt" button.)
 
-4. Auto title + description + hashtags — Gemini writes the upload metadata,
+4. [DONE] Auto title + description + hashtags — Gemini writes the upload metadata,
    shown in the UI / saved as a sidecar .txt next to the clip.
+   (Shipped: "Gemini prompt" button in the YouTube-metadata card on clip detail.)
 
 -------------------------------------------------------------------
 FORMAT & REACH (medium effort, mostly ffmpeg)
 -------------------------------------------------------------------
-5. Platform presets — add 1:1 (Instagram feed) and 16:9 alongside the current
+5. [TODO] Platform presets — add 1:1 (Instagram feed) and 16:9 alongside the current
    9:16, so one clip serves Shorts + Reels + TikTok + feed.
 
-6. Batch queue from one video — accept several segments at once (pairs
+6. [TODO] Batch queue from one video — accept several segments at once (pairs
    perfectly with #1) and render them in sequence.
+   (Mostly already covered: the Clip Finder creates multiple clips and Enqueue
+   runs them one-by-one; only extra polish like per-clip status is left.)
 
-7. Caption style presets — a couple of switchable karaoke looks (e.g. a bold
+7. [PARTIAL] Caption style presets — a couple of switchable karaoke looks (e.g. a bold
    "Hormozi" style) rather than the single current style.
+   (DONE part: per-clip "Caption highlight" COLOUR picker — keeps the Classic style
+   but lets you recolour the spoken/active word, default yellow, persists on retry.
+   STILL OPEN: the multi-style system — Hormozi / Box highlight / Clean Minimal.)
 
 -------------------------------------------------------------------
 POLISH (ffmpeg, low/medium effort)
 -------------------------------------------------------------------
-8. Background music with auto-ducking — royalty-free bed under the speech,
+8. [TODO] Background music with auto-ducking — royalty-free bed under the speech,
    ducked when there's dialogue (you already do LUFS work, so the audio graph
    is familiar).
 
-9. Progress bar strip at the bottom of the frame (a very common Shorts
+9. [TODO] Progress bar strip at the bottom of the frame (a very common Shorts
    retention trick).
 
-10. Auto thumbnail — pull a strong frame + the headline into a thumbnail image.
+10. [TODO] Auto thumbnail — pull a strong frame + the headline into a thumbnail image.
 
 -------------------------------------------------------------------
 HEAVIER — flagging the cost given the phone
 -------------------------------------------------------------------
-11. Silence removal / auto jump-cuts — trims dead air in talking-head clips.
+11. [TODO] Silence removal / auto jump-cuts — trims dead air in talking-head clips.
     Big quality win but adds an analysis pass.
 
-12. Face-tracking reframe — keep the speaker centered in the vertical crop
+12. [TODO] Face-tracking reframe — keep the speaker centered in the vertical crop
     instead of blurred bars. Most "pro" upgrade, but it's the most
     compute-hungry and risky on the phone (OOM territory) — I'd only attempt
     this after moving renders off the phone.
 
 -------------------------------------------------------------------
-RECOMMENDATION
+WHAT'S LEFT
 -------------------------------------------------------------------
-Start with #1 Auto-clip finder (or the #1-#4 "AI assist" bundle) — it's the
-highest workflow impact and reuses infra you already have, so it's low-risk on
-the phone.
+Fresh work remaining: #5, #7 (full multi-style), #8, #9, #10 (safe, mostly
+ffmpeg/frontend) and the two heavy ones #11, #12.

@@ -17,7 +17,10 @@ fallback). A word stays highlighted until the next word's onset.
 Falls back to writing nothing (header only, no Dialogue lines) if the JSON is
 missing/empty, so the caller burns the plain SRT instead.
 
-Usage: python3 karaoke_captions_pro.py <whisper.json> <out.ass> [outro_start_sec]
+Usage: python3 karaoke_captions_pro.py <whisper.json> <out.ass> [outro_start_sec] [highlight_hex]
+
+`highlight_hex` (optional) is the spoken/active-word colour as "#RRGGBB" (or bare
+"RRGGBB"); blank/invalid falls back to the classic bright yellow.
 """
 import json, re, sys
 
@@ -28,8 +31,24 @@ OUTLINE       = 6
 SHADOW        = 3
 MARGIN_V      = 540          # px above bottom (PlayResY=1920 space)
 WHITE         = r"&H00FFFFFF&"
-HIGHLIGHT     = r"&H0000F4FF&"   # ASS &HBBGGRR -> bright yellow
+HIGHLIGHT     = r"&H0000F4FF&"   # ASS &HAABBGGRR -> bright yellow (the classic default)
 PLAY_W, PLAY_H = 1080, 1920
+
+
+def hex_to_ass(hexstr, default=HIGHLIGHT):
+    """Convert a "#RRGGBB" / "RRGGBB" UI colour into an opaque ASS &H00BBGGRR& string.
+    Blank or malformed input returns the classic-yellow default."""
+    if not hexstr:
+        return default
+    h = str(hexstr).strip().lstrip('#')
+    if len(h) != 6:
+        return default
+    try:
+        int(h, 16)
+    except ValueError:
+        return default
+    rr, gg, bb = h[0:2], h[2:4], h[4:6]
+    return f"&H00{bb}{gg}{rr}&".upper()
 
 MAX_WORDS     = 5
 MAX_CHARS     = 24
@@ -122,6 +141,7 @@ def group_lines(words):
 def main():
     src, dst = sys.argv[1], sys.argv[2]
     outro_start = float(sys.argv[3]) if len(sys.argv) > 3 else 1e9
+    highlight = hex_to_ass(sys.argv[4] if len(sys.argv) > 4 else None)
 
     words = []
     try:
@@ -157,7 +177,7 @@ def main():
             parts = []
             for j, tok in enumerate(toks):
                 if j == pos:
-                    parts.append("{\\c" + HIGHLIGHT + "}" + tok + "{\\c" + WHITE + "}")
+                    parts.append("{\\c" + highlight + "}" + tok + "{\\c" + WHITE + "}")
                 else:
                     parts.append(tok)
             events.append((ws, we, "{\\c" + WHITE + "}" + " ".join(parts)))

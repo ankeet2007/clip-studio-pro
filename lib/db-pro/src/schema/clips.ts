@@ -21,6 +21,9 @@ export const clipsTable = pgTable("clips_pro", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow().$onUpdate(() => new Date()),
   sourceChannel: text("source_channel").notNull().default(""),
   captionsEnabled: boolean("captions_enabled").notNull().default(true),
+  // Pro-only: highlight (spoken/active word) colour for the karaoke captions, as "#RRGGBB".
+  // Blank = the classic bright-yellow default. Persisted so Retry restores the chosen colour.
+  captionColor: text("caption_color").notNull().default(""),
   transcript: text("transcript"),
   // Pro-only: AI intro-hook voiceover. The hook line is user-supplied (typed or
   // pasted from their Gemini app); Piper TTS speaks it over the first few seconds.

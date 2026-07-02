@@ -44,6 +44,7 @@ const clipEntrySchema = z.object({
   endTime: z.string().regex(/^\d{2}:\d{2}:\d{2}$/, "Must be HH:MM:SS"),
   headline: z.string().optional().default(""),
   captionsEnabled: z.boolean().default(true),
+  captionColor: z.string().optional().default("#FFF400"),
   outroEnabled: z.boolean().default(true),
   punchInEnabled: z.boolean().default(false),
   zoomMoments: z.string().optional().default(""),
@@ -77,6 +78,7 @@ const defaultClip = {
   endTime: "00:00:15",
   headline: "",
   captionsEnabled: true,
+  captionColor: "#FFF400",
   outroEnabled: true,
   punchInEnabled: false,
   zoomMoments: "",
@@ -646,6 +648,7 @@ export default function Home() {
             mode: clip.mode,
             sourceChannel: values.sourceChannel ?? "",
             captionsEnabled: clip.captionsEnabled ?? true,
+            captionColor: clip.captionColor ?? "#FFF400",
             outroEnabled: clip.outroEnabled ?? true,
             punchInEnabled: clip.punchInEnabled ?? false,
             zoomMoments: clip.zoomMoments ?? "",
@@ -1030,6 +1033,28 @@ export default function Home() {
                                 onChange={(v) => form.setValue(`clips.${index}.outroEnabled`, v)}
                               />
                             </div>
+
+                            {/* caption highlight colour — the spoken/active word colour (edited + captions on) */}
+                            {!isRaw && (form.watch(`clips.${index}.captionsEnabled`) ?? true) && (
+                              <div className="flex items-center gap-2.5 rounded-lg border border-border bg-background/40 px-3 py-2">
+                                <span className="text-[10.5px] font-mono uppercase tracking-[0.1em] text-muted-foreground">Caption highlight</span>
+                                <input
+                                  type="color"
+                                  value={form.watch(`clips.${index}.captionColor`) || "#FFF400"}
+                                  onChange={(e) => form.setValue(`clips.${index}.captionColor`, e.target.value.toUpperCase())}
+                                  className="w-8 h-8 rounded cursor-pointer bg-transparent border border-border p-0.5 shrink-0"
+                                  aria-label="Caption highlight colour"
+                                />
+                                <span className="font-mono text-[11px] text-foreground">{(form.watch(`clips.${index}.captionColor`) || "#FFF400").toUpperCase()}</span>
+                                <button
+                                  type="button"
+                                  onClick={() => form.setValue(`clips.${index}.captionColor`, "#FFF400")}
+                                  className="ml-auto text-[10px] font-mono uppercase tracking-[0.08em] text-muted-foreground hover:text-foreground"
+                                >
+                                  Reset
+                                </button>
+                              </div>
+                            )}
 
                             {/* AI Auto-Zoom panel (edited only) */}
                             {!isRaw && (

@@ -889,7 +889,8 @@ export async function processClip(
   voiceoverEnabled = false,
   voiceoverHook = "",
   punchInEnabled = false,
-  zoomMoments = ""
+  zoomMoments = "",
+  captionColor = ""
 ): Promise<void> {
   const isLocalFile = !!localFilePath;
   const ytDlp = findYtDlp();
@@ -1361,7 +1362,8 @@ export async function processClip(
                 // so captions don't sit over it. With the outro OFF there is no card,
                 // so let captions run to the very end (was wrongly clipping the final 2s).
                 const captionEnd = outroEnabled ? Math.max(0, duration - 2) : duration;
-                await execFileAsync(findPython(), [karaokeScript, dtwJsonPath, assPath, String(captionEnd)], { timeout: 30000 });
+                // Pass the user-chosen highlight colour (blank => the script's classic yellow).
+                await execFileAsync(findPython(), [karaokeScript, dtwJsonPath, assPath, String(captionEnd), captionColor || ""], { timeout: 30000 });
                 if (fs.existsSync(assPath) && fs.readFileSync(assPath, "utf8").includes("Dialogue:")) {
                   subFilter = `subtitles=${assPath}:fontsdir=${FONTS_DIR}`;
                   haveAss = true;
