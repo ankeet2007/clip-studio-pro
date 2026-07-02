@@ -1,0 +1,75 @@
+CLIP STUDIO PRO v1 — NEW FEATURES REMAINING
+(Brainstorm list. Copied exactly as told to the user on 2026-07-02.)
+
+===================================================================
+
+Here's what Pro v1 does today, so we're building on reality: YouTube-segment
+or local-file -> vertical 1080x1920 Short, with headline (emoji-capable),
+karaoke captions (whisper), channel watermark, source credit, subscribe outro,
+AI intro-hook voiceover (Piper), AI auto-zoom (Gemini-picked moments), and
+-14 LUFS loudness normalization. Gemini and youtube-transcript are already
+wired in, and it stores the transcript per clip.
+
+Given that, here are the highest-leverage additions, grouped by theme. I've
+flagged effort and whether it reuses infra you already have — important because
+the phone OOMs at the whisper stage, so I'm steering away from anything that
+adds heavy compute.
+
+-------------------------------------------------------------------
+TOP PICKS (reuse Gemini/transcript you already have — low/medium effort)
+-------------------------------------------------------------------
+1. Auto-clip finder — paste a full video URL, Gemini reads the transcript and
+   suggests 3-5 viral-worthy segments with start/end + a headline each. This
+   removes the most manual part of your workflow (hunting timestamps). Biggest
+   payoff.
+
+2. Auto-headline — generate the headline from the clip's transcript instead of
+   typing it. You already fetch the transcript and have Gemini.
+
+3. Auto voiceover-hook — right now you type/paste the hook from the Gemini app
+   manually. Generate it in-app from the clip context. Closes that loop.
+
+4. Auto title + description + hashtags — Gemini writes the upload metadata,
+   shown in the UI / saved as a sidecar .txt next to the clip.
+
+-------------------------------------------------------------------
+FORMAT & REACH (medium effort, mostly ffmpeg)
+-------------------------------------------------------------------
+5. Platform presets — add 1:1 (Instagram feed) and 16:9 alongside the current
+   9:16, so one clip serves Shorts + Reels + TikTok + feed.
+
+6. Batch queue from one video — accept several segments at once (pairs
+   perfectly with #1) and render them in sequence.
+
+7. Caption style presets — a couple of switchable karaoke looks (e.g. a bold
+   "Hormozi" style) rather than the single current style.
+
+-------------------------------------------------------------------
+POLISH (ffmpeg, low/medium effort)
+-------------------------------------------------------------------
+8. Background music with auto-ducking — royalty-free bed under the speech,
+   ducked when there's dialogue (you already do LUFS work, so the audio graph
+   is familiar).
+
+9. Progress bar strip at the bottom of the frame (a very common Shorts
+   retention trick).
+
+10. Auto thumbnail — pull a strong frame + the headline into a thumbnail image.
+
+-------------------------------------------------------------------
+HEAVIER — flagging the cost given the phone
+-------------------------------------------------------------------
+11. Silence removal / auto jump-cuts — trims dead air in talking-head clips.
+    Big quality win but adds an analysis pass.
+
+12. Face-tracking reframe — keep the speaker centered in the vertical crop
+    instead of blurred bars. Most "pro" upgrade, but it's the most
+    compute-hungry and risky on the phone (OOM territory) — I'd only attempt
+    this after moving renders off the phone.
+
+-------------------------------------------------------------------
+RECOMMENDATION
+-------------------------------------------------------------------
+Start with #1 Auto-clip finder (or the #1-#4 "AI assist" bundle) — it's the
+highest workflow impact and reuses infra you already have, so it's low-risk on
+the phone.
