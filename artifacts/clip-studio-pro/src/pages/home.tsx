@@ -737,14 +737,18 @@ export default function Home() {
   async function copyStoryPrompt() {
     const hasUrl = !!storyUrl.trim();
     const prompt =
-      `You are a short-form editor building ONE 60-120 second STORY from a longer video.\n` +
+      `ROLE: You are a world-class short-form editor building ONE tight 60-120 second STORY from a longer video — a single narrative with a clear arc (hook → escalation → payoff) that holds viewers to the very end.\n` +
       (hasUrl
-        ? `Open and WATCH this video, then base every pick on what ACTUALLY happens — do not guess:\nVideo: ${storyUrl}\n`
-        : `(Add the source video URL first, or describe the video to Gemini.)\n`) +
-      `Pick 9 to 10 moments that, IN ORDER, tell a single escalating story. Each moment should be a self-contained 6-12 second beat.\n` +
+        ? `WATCH this video and base every pick on what ACTUALLY happens — never guess a timestamp:\nVideo: ${storyUrl}\n`
+        : `(Add the source video URL first, or describe the video to Gemini so it picks real moments.)\n`) +
       (storyCreator ? `Source channel: ${storyCreator}.\n` : "") +
-      `For EACH moment give the START and END time as ABSOLUTE timestamps in the source video (HH:MM:SS) plus a punchy 4-7 word headline.\n` +
-      `THEN write short bridging narration placed on the FINAL stitched timeline (0 = start of the stitched video, NOT the source), timed so a line bridges between the moments (e.g. "But that wasn't the craziest part..."). Give each narration time as whole seconds after the start of the stitched video, at least 3s apart.\n` +
+      `SELECT 9-10 moments that, IN ORDER, tell ONE escalating story:\n` +
+      `- Moment 1 is the HOOK — the single most curiosity-grabbing beat, even if it happens later in the source.\n` +
+      `- Each following moment RAISES the stakes; save the biggest payoff for last.\n` +
+      `- Every moment is a self-contained 6-12s beat with clear visual action (no dead air, no slow lead-ins).\n` +
+      `- Drop anything that repeats a beat you already have — each moment must add something NEW.\n` +
+      `For EACH moment give START and END as ABSOLUTE source timestamps (HH:MM:SS) + a punchy 4-7 word headline.\n` +
+      `THEN write bridging NARRATION on the FINAL stitched timeline (0 = start of the stitched video, NOT the source). Each line should open a curiosity gap that pulls the viewer into the next moment (e.g. "But that wasn't even the crazy part...") — short, spoken aloud naturally, and NOT just describing what's already on screen. Put one line near 0s as the hook; time the rest as whole seconds from the stitched start, at least 3s apart.\n` +
       `Return EXACTLY this format and NOTHING else:\n` +
       `SEGMENTS:\n` +
       `HH:MM:SS - HH:MM:SS | Headline\n` +
@@ -757,7 +761,7 @@ export default function Home() {
       `00:01:12 - 00:01:26 | He Didn't See It Coming\n` +
       `00:04:47 - 00:05:03 | The Bet That Changed Everything\n` +
       `NARRATION:\n` +
-      `1 | It started as an ordinary bet.\n` +
+      `0 | It started as an ordinary bet.\n` +
       `16 | But that was only the beginning.`;
     const ok = await copyTextToClipboard(prompt);
     toast(ok
