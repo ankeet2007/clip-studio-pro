@@ -1667,7 +1667,7 @@ export async function processClip(
 
 // ============================================================================
 // FEATURE 2 — MULTI-CLIP STORY MODE
-// A story stitches 3-5 moments from ONE source into a single 45-60s video with
+// A story stitches 9-10 moments from ONE source into a single 60-120s video with
 // bridging narration. Implemented WITHOUT touching processClip: each segment is
 // composited by reusing processClip itself (clipId=0 → composite only, no per-
 // segment captions/thumbnail/voiceover), then the segments are concatenated and
@@ -1859,7 +1859,7 @@ export async function processStory(
   const updateProgress = makeProgressUpdater(clipId);
   const tmpId = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
 
-  const segs = (segments ?? []).slice(0, 5);
+  const segs = (segments ?? []).slice(0, 10);
   if (segs.length < 2) throw new Error("A story needs at least 2 segments.");
 
   const segFiles: string[] = [];

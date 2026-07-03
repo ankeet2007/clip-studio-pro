@@ -54,7 +54,7 @@ export const clipsTable = pgTable("clips_pro", {
   // Retry restores it too, instead of forcing it back on.
   outroEnabled: boolean("outro_enabled").notNull().default(true),
   // Pro-only: Multi-clip Story mode (Feature 2). jobType "clip" = normal single clip;
-  // "story" = stitch `segments` (3-5 moments from one source) into one video with
+  // "story" = stitch `segments` (9-10 moments from one source) into one video with
   // bridging narration (reuses narrationScript, timestamped on the STITCHED timeline).
   // Persisted so Retry re-renders the whole story from the same row.
   jobType: text("job_type").notNull().default("clip"),

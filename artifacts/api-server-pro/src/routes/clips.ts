@@ -153,7 +153,7 @@ function sanitizeSegments(raw: unknown): StorySegment[] {
       zoomMoments: typeof seg.zoomMoments === "string" ? seg.zoomMoments : "",
       punchInEnabled: seg.punchInEnabled === true,
     });
-    if (out.length >= 5) break;
+    if (out.length >= 10) break;
   }
   return out;
 }

@@ -693,16 +693,16 @@ export default function Home() {
 
   /* ---------- Story mode (Feature 2) ---------- */
 
-  // Bridge prompt: asks Gemini for 3-5 ordered moments + bridging narration on the
+  // Bridge prompt: asks Gemini for 9-10 ordered moments + bridging narration on the
   // stitched timeline. Same human-in-the-loop pattern — no server AI call.
   async function copyStoryPrompt() {
     const hasUrl = !!storyUrl.trim();
     const prompt =
-      `You are a short-form editor building ONE 45-60 second STORY from a longer video.\n` +
+      `You are a short-form editor building ONE 60-120 second STORY from a longer video.\n` +
       (hasUrl
         ? `Open and WATCH this video, then base every pick on what ACTUALLY happens — do not guess:\nVideo: ${storyUrl}\n`
         : `(Add the source video URL first, or describe the video to Gemini.)\n`) +
-      `Pick 3 to 5 moments that, IN ORDER, tell a single escalating story. Each moment should be a self-contained 8-20 second beat.\n` +
+      `Pick 9 to 10 moments that, IN ORDER, tell a single escalating story. Each moment should be a self-contained 6-12 second beat.\n` +
       (storyCreator ? `Source channel: ${storyCreator}.\n` : "") +
       `For EACH moment give the START and END time as ABSOLUTE timestamps in the source video (HH:MM:SS) plus a punchy 4-7 word headline.\n` +
       `THEN write short bridging narration placed on the FINAL stitched timeline (0 = start of the stitched video, NOT the source), timed so a line bridges between the moments (e.g. "But that wasn't the craziest part..."). Give each narration time as whole seconds after the start of the stitched video, at least 3s apart.\n` +
@@ -737,7 +737,7 @@ export default function Home() {
       narrBlock = text.slice(nIdx).replace(/^[^\n]*\n?/, ""); // drop the "NARRATION:" label line
     }
     segBlock = segBlock.replace(/segments\s*:/i, "");
-    const parsedSegs = parseClipSuggestions(segBlock).slice(0, 5);
+    const parsedSegs = parseClipSuggestions(segBlock).slice(0, 10);
     if (parsedSegs.length < 2) {
       toast({ title: "No story found", description: "Paste Gemini's SEGMENTS lines like  00:01:12 - 00:01:26 | Headline", variant: "destructive" });
       return;
@@ -782,7 +782,7 @@ export default function Home() {
           outroEnabled: storyOutro,
           captionColor: "#FFF400",
           narrationScript: storyNarration,
-          segments: valid.slice(0, 5),
+          segments: valid.slice(0, 10),
         }),
       });
       if (!r.ok) {
@@ -1576,7 +1576,7 @@ export default function Home() {
                   {/* Segments (moments) */}
                   <div className="space-y-3">
                     <p className="font-mono text-[11px] uppercase tracking-[0.13em] text-muted-foreground">
-                      Moments <span className="text-muted-foreground/50">({storySegments.length}/5 · min 2)</span>
+                      Moments <span className="text-muted-foreground/50">({storySegments.length}/10 · min 2)</span>
                     </p>
                     {storySegments.map((seg, index) => {
                       const bad = !/^\d{2}:\d{2}:\d{2}$/.test(seg.startTime) || !/^\d{2}:\d{2}:\d{2}$/.test(seg.endTime) || toSecs(seg.endTime) <= toSecs(seg.startTime);
@@ -1634,16 +1634,16 @@ export default function Home() {
                     })}
                     <button
                       type="button"
-                      onClick={() => storySegments.length < 5 && setStorySegments((p) => [...p, { startTime: "00:00:00", endTime: "00:00:15", headline: "" }])}
-                      disabled={storySegments.length >= 5}
+                      onClick={() => storySegments.length < 10 && setStorySegments((p) => [...p, { startTime: "00:00:00", endTime: "00:00:15", headline: "" }])}
+                      disabled={storySegments.length >= 10}
                       className={`w-full flex items-center justify-center gap-2 rounded-xl border border-dashed py-3 font-mono text-[11px] uppercase tracking-[0.1em] transition-colors ${
-                        storySegments.length >= 5
+                        storySegments.length >= 10
                           ? "text-muted-foreground/30 border-border cursor-not-allowed"
                           : "text-muted-foreground border-border hover:text-primary hover:border-primary/40"
                       }`}
                     >
                       <Plus className="w-3.5 h-3.5" />
-                      {storySegments.length >= 5 ? "Max 5 moments" : `Add moment (${storySegments.length}/5)`}
+                      {storySegments.length >= 10 ? "Max 10 moments" : `Add moment (${storySegments.length}/10)`}
                     </button>
                   </div>
 
