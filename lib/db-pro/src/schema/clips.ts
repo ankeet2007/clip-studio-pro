@@ -1,6 +1,16 @@
-import { pgTable, text, serial, timestamp, integer, boolean } from "drizzle-orm/pg-core";
+import { pgTable, text, serial, timestamp, integer, boolean, jsonb } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod/v4";
+
+// Pro-only: one moment of a multi-clip STORY (Feature 2). A story row carries an
+// array of these in the `segments` jsonb column; timestamps are absolute in the source.
+export interface StorySegment {
+  startTime: string;
+  endTime: string;
+  headline?: string;
+  zoomMoments?: string;
+  punchInEnabled?: boolean;
+}
 
 export const clipsTable = pgTable("clips_pro", {
   id: serial("id").primaryKey(),
@@ -29,6 +39,12 @@ export const clipsTable = pgTable("clips_pro", {
   // pasted from their Gemini app); Piper TTS speaks it over the first few seconds.
   voiceoverEnabled: boolean("voiceover_enabled").notNull().default(false),
   voiceoverHook: text("voiceover_hook"),
+  // Pro-only: full narration mode. voiceoverMode gates "hook" (one intro line over
+  // the first few seconds) vs "script" (multiple timed lines spoken across the whole
+  // clip). narrationScript holds those lines as "SS | text" (one per line), parsed
+  // server-side like zoomMoments. Persisted so Retry re-renders the same narration.
+  voiceoverMode: text("voiceover_mode").notNull().default("hook"),
+  narrationScript: text("narration_script").notNull().default(""),
   // Pro-only: AI Auto-Zoom. punchInEnabled gates the effect; zoomMoments is the
   // Gemini-chosen "second type" list. Persisted so Retry re-renders WITH the zoom
   // (previously these rode only the create request and were lost on retry).
@@ -37,6 +53,12 @@ export const clipsTable = pgTable("clips_pro", {
   // Whether the closing outro/CTA is appended (a real toggle, defaults on). Persisted so
   // Retry restores it too, instead of forcing it back on.
   outroEnabled: boolean("outro_enabled").notNull().default(true),
+  // Pro-only: Multi-clip Story mode (Feature 2). jobType "clip" = normal single clip;
+  // "story" = stitch `segments` (3-5 moments from one source) into one video with
+  // bridging narration (reuses narrationScript, timestamped on the STITCHED timeline).
+  // Persisted so Retry re-renders the whole story from the same row.
+  jobType: text("job_type").notNull().default("clip"),
+  segments: jsonb("segments").$type<StorySegment[]>().notNull().default([]),
 });
 
 export const insertClipSchema = createInsertSchema(clipsTable).omit({

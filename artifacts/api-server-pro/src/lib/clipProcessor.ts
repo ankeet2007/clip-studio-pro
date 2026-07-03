@@ -777,6 +777,67 @@ function defaultZoomEvents(duration: number): ZoomEvent[] {
   return out.slice(0, 10);
 }
 
+interface NarrationLine { sec: number; text: string; }
+
+/**
+ * Parses the full-narration script the user pastes back from Gemini (the Pro
+ * "narration mode" bridge). Each line is a START time plus "|" plus the sentence
+ * to speak, e.g.  "2 | Nobody saw this coming."  Mirrors parseZoomEvents: tolerates
+ * bare seconds or mm:ss, clamps the start inside the clip (and before the 2s outro
+ * card so narration never lands on the SUBSCRIBE screen), sorts, enforces a small
+ * min start-gap so two lines can't begin on top of each other, and caps the count
+ * (a length / OOM guard — each line is a separate Piper synth + amix input).
+ */
+function parseNarrationLines(raw: string, duration: number, outroEnabled: boolean): NarrationLine[] {
+  if (!raw || !raw.trim()) return [];
+  // Latest a line may START. With the outro card on, keep it clear of the last 2s.
+  const latestStart = (outroEnabled ? duration - 2.2 : duration - 0.5);
+  const parsed: NarrationLine[] = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const bar = line.indexOf("|");
+    if (bar === -1) continue;
+    const text = line.slice(bar + 1).trim().replace(/\s+/g, " ").slice(0, 180);
+    if (!text) continue;
+    const tok = line.slice(0, bar).toLowerCase().replace(/[^0-9:.]/g, "");
+    if (!tok) continue;
+    let sec: number;
+    if (tok.includes(":")) {
+      const parts = tok.split(":").map(Number);
+      if (parts.some((n) => Number.isNaN(n))) continue;
+      sec = parts.reduce((a, n) => a * 60 + n, 0);
+    } else {
+      sec = Number(tok);
+    }
+    if (!Number.isFinite(sec)) continue;
+    if (sec < 0.3) sec = 0.3;
+    if (sec > latestStart) continue; // a line that can't start before the clip/outro ends is dropped
+    parsed.push({ sec: Math.round(sec * 10) / 10, text });
+  }
+  parsed.sort((a, b) => a.sec - b.sec);
+  const spaced: NarrationLine[] = [];
+  for (const e of parsed) {
+    if (spaced.length && e.sec - spaced[spaced.length - 1]!.sec < 0.8) continue;
+    spaced.push(e);
+  }
+  return spaced.slice(0, 8);
+}
+
+/**
+ * Speaks `text` to `outWav` via the local Piper TTS script (same script the intro
+ * hook uses). Resolves true only if the WAV was actually produced. Non-throwing —
+ * a missing script / failed synth resolves false so the caller can skip that line.
+ */
+async function generateNarrationWav(text: string, outWav: string): Promise<boolean> {
+  const voiceScript = path.join(os.homedir(), "myapp/scripts/generate_voiceover.sh");
+  if (!fs.existsSync(voiceScript)) return false;
+  await new Promise<void>((resolve) => {
+    const v = spawn("bash", [voiceScript, text, outWav], { timeout: 120_000 });
+    v.on("close", () => resolve());
+    v.on("error", () => resolve());
+  });
+  return fs.existsSync(outWav);
+}
+
 /**
  * yt-dlp `--download-sections` can emit a segment whose frames carry NO presentation
  * timestamps — seen on sections cut from deep inside long livestream VODs (e.g. a clip
@@ -890,7 +951,9 @@ export async function processClip(
   voiceoverHook = "",
   punchInEnabled = false,
   zoomMoments = "",
-  captionColor = ""
+  captionColor = "",
+  voiceoverMode: "hook" | "script" = "hook",
+  narrationScript = ""
 ): Promise<void> {
   const isLocalFile = !!localFilePath;
   const ytDlp = findYtDlp();
@@ -1029,10 +1092,12 @@ export async function processClip(
 
     await updateProgress(45, true);
 
-    // Position: sit the headline PNG in the top bar, biased ~36px DOWNWARD from
-    // centered (keeps it clear of YouTube's very-top back/search icons), clamped so
-    // the bottom of the block never crosses the red line at videoY.
-    const hlY = Math.max(30, Math.min(videoY - pngHeight - 8, Math.floor((videoY - pngHeight) / 2) + 36));
+    // Position: BOTTOM-anchor the headline just above the red line (bottom of the top
+    // bar), leaving the top of the bar empty for YouTube's top UI (back/search/menu).
+    // 1-line titles then sit low near the frame; 2-line titles fill the bar and stay
+    // clear of the red drawbox at y=videoY-3. Guarded so an oversized PNG never goes
+    // off the top.
+    const hlY = Math.max(12, videoY - pngHeight - 12);
 
     // Detect if the source video already has a logo/watermark in the bottom-center
     // area where our channel handle would go, and shift ours right if so.
@@ -1164,10 +1229,11 @@ export async function processClip(
       `[composedv]drawbox=x=0:y=0:w=${canvasW}:h=${videoY}:color=black@0.30:t=fill[scrimtop]`,
       `[scrimtop]drawbox=x=0:y=${videoY + videoH}:w=${canvasW}:h=${canvasH - videoY - videoH}:color=black@0.30:t=fill[composedsc]`,
       `[composedsc]drawbox=x=0:y=${videoY - 3}:w=${canvasW}:h=3:color=FF0000:t=fill[composedac]`,
-      // ffmpeg drawtext: the colon must be backslash-escaped even inside single
-      // quotes ('Credit\: KSI'), else the filtergraph fails to parse. \\ in the
-      // template literal -> a single literal backslash in the filter string.
-      sourceChannel && sourceChannel.trim() ? `[composedac]drawtext=text='Credit\\: ${sourceChannel.trim().replace(/'/g,"")}':fontsize=24:fontcolor=white@0.85:x=16:y=${videoY + videoH - 36}:shadowx=1:shadowy=1:shadowcolor=black@0.9[composed]` : `[composedac]null[composed]`,
+      // Credit line, bottom-LEFT of the video frame. Left (not right) so it never clashes
+      // with the source creator's own logo/handle, which almost always sits bottom-centre/
+      // right. Uppercase "CREDIT <name>" (no colon) matches the reference layout and avoids
+      // the drawtext colon-escaping entirely.
+      sourceChannel && sourceChannel.trim() ? `[composedac]drawtext=text='CREDIT ${sourceChannel.trim().replace(/'/g,"").toUpperCase()}':fontsize=24:fontcolor=white@0.85:x=16:y=${videoY + videoH - 36}:shadowx=1:shadowy=1:shadowcolor=black@0.9[composed]` : `[composedac]null[composed]`,
     ];
     let prevLabel = "composed";
 
@@ -1188,7 +1254,12 @@ export async function processClip(
       const safeHandle = escapeDrawtext(channelHandle.trim().toUpperCase());
       const handleFont = fs.existsSync(ANTON_FONT) ? ANTON_FONT : (fs.existsSync(WATERMARK_FONT) ? WATERMARK_FONT : fontFile);
       const handleFontSize = 48;
-      const handleY = videoY + videoH + 20;  // bottom-center, just below the video frame with a small gap
+      // Immersive: hug the TOP of the bottom bar (just under the video) so YouTube's bottom
+      // Shorts overlay can't cover the handle. Standard's bottom bar is huge (videoH=608 →
+      // ~1072px bar), so keep it centered there to avoid a big empty gap below the handle.
+      const handleY = frameStyle === "standard"
+        ? videoY + videoH + Math.floor((canvasH - videoY - videoH - handleFontSize) / 2)
+        : videoY + videoH + 20;
       filters.push(
         `[${prevLabel}]drawtext=` +
         `text='${safeHandle}':` +
@@ -1421,11 +1492,95 @@ export async function processClip(
         logger.warn({ capErr }, "Caption generation failed (non-fatal)");
       }
 
+      // Pro: FULL NARRATION MODE. Speak N timed lines across the clip (Piper TTS,
+      // local), ducking the original audio to ~22% only WHILE a line plays and back
+      // to full between lines. One cheap audio-only pass (video stream copied). A line
+      // whose WAV fails to synth is skipped; if none survive, the clip ships un-narrated.
+      if (voiceoverEnabled && voiceoverMode === "script" && narrationScript && narrationScript.trim()) try {
+        const lines = parseNarrationLines(narrationScript, duration, outroEnabled);
+        const wavPaths: string[] = [];
+        const spoken: { start: number; end: number }[] = [];
+        for (const [i, ln] of lines.entries()) {
+          const wav = path.join(outputDir, `clip_${clipId}_narr_${i}.wav`);
+          if (!(await generateNarrationWav(ln.text, wav))) {
+            logger.warn({ clipId, line: i }, "Narration WAV not produced — skipping this line");
+            continue;
+          }
+          const wdur = (await probeContentDuration(wav)) || 3;
+          wavPaths.push(wav);
+          // Duck window = while the line plays + a short tail so dialogue returns cleanly.
+          spoken.push({ start: ln.sec, end: ln.sec + wdur + 0.4 });
+        }
+
+        if (spoken.length > 0) {
+          // Does the current file still have an audio stream to duck under narration?
+          let narrHasAudio = false;
+          try {
+            const p = await execFileAsync("ffprobe", [
+              "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
+              "-of", "csv=p=0", finalOutputPath,
+            ], { timeout: 10000 });
+            narrHasAudio = p.stdout.trim().length > 0;
+          } catch { /* assume none */ }
+
+          // Inputs: [0]=video, [1..N]=narration WAVs, and (only when the source has no
+          // audio) a fixed-length silent bed so amix still has a full-length base to key
+          // duration=first off (an anullsrc SOURCE would otherwise run forever).
+          const ffInputs: string[] = ["-y", "-i", finalOutputPath];
+          for (const w of wavPaths) ffInputs.push("-i", w);
+          const anullIdx = 1 + wavPaths.length;
+          if (!narrHasAudio) ffInputs.push("-f", "lavfi", "-t", String(duration), "-i", "anullsrc=r=48000:cl=stereo");
+
+          const parts: string[] = [];
+          if (narrHasAudio) {
+            // Duck the original only across the UNION of narration intervals. between()
+            // is 0/1 and volume's `enable` treats any non-zero as true → overlapping
+            // intervals are handled for free, no interval-merging needed.
+            const enableExpr = spoken.map((s) => `between(t,${s.start.toFixed(2)},${s.end.toFixed(2)})`).join("+");
+            parts.push(`[0:a]volume=enable='${enableExpr}':volume=0.22,aresample=48000,aformat=channel_layouts=stereo[base]`);
+          } else {
+            parts.push(`[${anullIdx}:a]aresample=48000,aformat=channel_layouts=stereo[base]`);
+          }
+          const mixLabels: string[] = ["[base]"];
+          wavPaths.forEach((_w, i) => {
+            const inIdx = i + 1;
+            const delayMs = Math.round(spoken[i]!.start * 1000);
+            parts.push(`[${inIdx}:a]adelay=${delayMs}:all=1,aresample=48000,aformat=channel_layouts=stereo[n${inIdx}]`);
+            mixLabels.push(`[n${inIdx}]`);
+          });
+          // duration=first ties the output length to [base] (source audio ≈ clip, or the
+          // silent bed = clip duration), so any narration tail past clip end is trimmed.
+          parts.push(`${mixLabels.join("")}amix=inputs=${mixLabels.length}:duration=first:normalize=0,loudnorm=I=-14:TP=-1.5:LRA=11[aout]`);
+
+          const narratedPath = path.join(outputDir, `clip_${clipId}_narrated.mp4`);
+          await spawnProcess("ffmpeg", [
+            ...ffInputs,
+            "-filter_complex", parts.join(";"),
+            "-map", "0:v", "-map", "[aout]",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "256k",
+            "-movflags", "+faststart",
+            narratedPath,
+          ], 300_000, () => {});
+
+          if (fs.existsSync(narratedPath)) {
+            fs.renameSync(narratedPath, finalOutputPath);
+            logger.info({ finalOutputPath, lines: spoken.length }, "Full narration mixed in");
+          }
+        } else {
+          logger.warn({ clipId }, "No narration lines produced — skipping narration mix");
+        }
+
+        for (const w of wavPaths) { try { fs.existsSync(w) && fs.unlinkSync(w); } catch { /* ignore */ } }
+      } catch (naErr) {
+        logger.warn({ naErr }, "Narration generation failed (non-fatal)");
+      }
+
       // Pro: AI intro-hook voiceover. Speak the user-supplied hook line (Piper TTS,
       // local) over the first few seconds with the original audio ducked underneath.
       // Runs as a cheap audio-only pass — the video stream is copied, only the audio
       // is re-encoded — so it adds negligible time even on the phone. Non-fatal.
-      if (voiceoverEnabled && voiceoverHook && voiceoverHook.trim()) try {
+      // Skipped in "script" mode (the narration block above owns the audio then).
+      if (voiceoverEnabled && voiceoverMode !== "script" && voiceoverHook && voiceoverHook.trim()) try {
         const hookWav = path.join(outputDir, `clip_${clipId}_hook.wav`);
         const voiceScript = path.join(os.homedir(), "myapp/scripts/generate_voiceover.sh");
 
@@ -1506,6 +1661,279 @@ export async function processClip(
       }
     } catch (cleanupErr) {
       logger.warn({ cleanupErr, tmpId }, "Failed to clean up temp files");
+    }
+  }
+}
+
+// ============================================================================
+// FEATURE 2 — MULTI-CLIP STORY MODE
+// A story stitches 3-5 moments from ONE source into a single 45-60s video with
+// bridging narration. Implemented WITHOUT touching processClip: each segment is
+// composited by reusing processClip itself (clipId=0 → composite only, no per-
+// segment captions/thumbnail/voiceover), then the segments are concatenated and
+// the WHOLE stitched video is captioned + narrated by the two helpers below.
+// The helpers are faithful copies of processClip's caption / narration steps so
+// that the deployed single-clip path stays byte-for-byte unchanged.
+// ============================================================================
+
+export interface StorySegment {
+  startTime: string;
+  endTime: string;
+  headline?: string;
+  zoomMoments?: string;
+  punchInEnabled?: boolean;
+}
+
+/**
+ * Transcribes `filePath` with whisper.cpp and burns animated karaoke captions
+ * into it in place. Faithful copy of processClip's caption step, run once over the
+ * fully-stitched story. Non-fatal.
+ */
+async function burnCaptionsOnFile(
+  clipId: number,
+  filePath: string,
+  duration: number,
+  outroEnabled: boolean,
+  captionColor: string
+): Promise<void> {
+  const outputDir = getOutputDir();
+  try {
+    const srtPath = path.join(outputDir, `clip_${clipId}_captions.srt`);
+    const transcriptPath = path.join(outputDir, `clip_${clipId}_transcript.txt`);
+    const captionScript = path.join(os.homedir(), "myapp/scripts/generate_captions_pro.sh");
+    const captionedPath = path.join(outputDir, `clip_${clipId}_captioned.mp4`);
+    if (!fs.existsSync(captionScript)) return;
+
+    const capResult = await new Promise<{ code: number | null; out: string }>((resolve) => {
+      const cap = spawn("bash", [captionScript, filePath, srtPath, transcriptPath], { timeout: 3_600_000 });
+      let out = "";
+      cap.stdout?.on("data", (d) => { out += d.toString(); });
+      cap.on("close", (code) => resolve({ code, out }));
+      cap.on("error", (err) => resolve({ code: -1, out: String(err) }));
+    });
+    if (capResult.code !== 0 || /\bFAIL\b/.test(capResult.out)) {
+      logger.warn({ clipId, exitCode: capResult.code, tail: capResult.out.slice(-400) }, "Story caption script failed — may be uncaptioned");
+    }
+
+    if (fs.existsSync(transcriptPath)) {
+      try {
+        const transcript = fs.readFileSync(transcriptPath, "utf8").trim();
+        if (transcript) await db.update(clipsTable).set({ transcript }).where(eq(clipsTable.id, clipId));
+      } catch { /* non-fatal */ }
+      fs.unlinkSync(transcriptPath);
+    }
+
+    if (fs.existsSync(srtPath)) {
+      const assPath = path.join(outputDir, `clip_${clipId}_captions.ass`);
+      const dtwJsonPath = srtPath.replace(/\.srt$/, ".json");
+      const karaokeScript = path.join(os.homedir(), "myapp/scripts/karaoke_captions_pro.py");
+      let subFilter = `subtitles=${srtPath}:fontsdir=${FONTS_DIR}:force_style='FontName=DejaVu Sans,FontSize=12,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=1,Bold=1,Alignment=2,MarginV=95'`;
+      let haveAss = false;
+      if (fs.existsSync(karaokeScript) && fs.existsSync(dtwJsonPath)) {
+        try {
+          const captionEnd = outroEnabled ? Math.max(0, duration - 2) : duration;
+          await execFileAsync(findPython(), [karaokeScript, dtwJsonPath, assPath, String(captionEnd), captionColor || ""], { timeout: 30000 });
+          if (fs.existsSync(assPath) && fs.readFileSync(assPath, "utf8").includes("Dialogue:")) {
+            subFilter = `subtitles=${assPath}:fontsdir=${FONTS_DIR}`;
+            haveAss = true;
+          }
+        } catch (kErr) {
+          logger.warn({ kErr }, "Story karaoke caption generation failed — falling back to plain SRT");
+        }
+      }
+      const srtHasContent = (() => { try { return fs.readFileSync(srtPath, "utf8").trim().length > 0; } catch { return false; } })();
+      if (haveAss || srtHasContent) {
+        await spawnProcess("ffmpeg", [
+          "-y", "-i", filePath, "-vf", subFilter,
+          "-c:v", "libx264", "-preset", "veryfast", "-crf", "14", "-threads", "1",
+          "-c:a", "copy", captionedPath,
+        ], 0, () => {}, RENDER_STALL_MS, "render");
+        if (fs.existsSync(captionedPath)) {
+          fs.renameSync(captionedPath, filePath);
+          logger.info({ filePath, mode: haveAss ? "dtw-karaoke" : "srt" }, "Story captions burned in");
+        }
+      } else {
+        logger.info({ clipId }, "No speech detected — skipping story caption burn");
+      }
+      fs.existsSync(srtPath) && fs.unlinkSync(srtPath);
+      fs.existsSync(assPath) && fs.unlinkSync(assPath);
+      fs.existsSync(dtwJsonPath) && fs.unlinkSync(dtwJsonPath);
+    }
+  } catch (capErr) {
+    logger.warn({ capErr }, "Story caption generation failed (non-fatal)");
+  }
+}
+
+/**
+ * Mixes the bridging narration across the fully-stitched story timeline in place.
+ * Faithful copy of processClip's narration step; timestamps are on the STITCHED
+ * timeline (0 = start of the whole story). Non-fatal.
+ */
+async function mixNarrationOnFile(
+  clipId: number,
+  filePath: string,
+  duration: number,
+  outroEnabled: boolean,
+  narrationScript: string
+): Promise<void> {
+  const outputDir = getOutputDir();
+  try {
+    const lines = parseNarrationLines(narrationScript, duration, outroEnabled);
+    const wavPaths: string[] = [];
+    const spoken: { start: number; end: number }[] = [];
+    for (const [i, ln] of lines.entries()) {
+      const wav = path.join(outputDir, `clip_${clipId}_snarr_${i}.wav`);
+      if (!(await generateNarrationWav(ln.text, wav))) {
+        logger.warn({ clipId, line: i }, "Story narration WAV not produced — skipping line");
+        continue;
+      }
+      const wdur = (await probeContentDuration(wav)) || 3;
+      wavPaths.push(wav);
+      spoken.push({ start: ln.sec, end: ln.sec + wdur + 0.4 });
+    }
+    if (spoken.length > 0) {
+      let narrHasAudio = false;
+      try {
+        const p = await execFileAsync("ffprobe", ["-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", filePath], { timeout: 10000 });
+        narrHasAudio = p.stdout.trim().length > 0;
+      } catch { /* assume none */ }
+      const ffInputs: string[] = ["-y", "-i", filePath];
+      for (const w of wavPaths) ffInputs.push("-i", w);
+      const anullIdx = 1 + wavPaths.length;
+      if (!narrHasAudio) ffInputs.push("-f", "lavfi", "-t", String(duration), "-i", "anullsrc=r=48000:cl=stereo");
+      const parts: string[] = [];
+      if (narrHasAudio) {
+        const enableExpr = spoken.map((s) => `between(t,${s.start.toFixed(2)},${s.end.toFixed(2)})`).join("+");
+        parts.push(`[0:a]volume=enable='${enableExpr}':volume=0.22,aresample=48000,aformat=channel_layouts=stereo[base]`);
+      } else {
+        parts.push(`[${anullIdx}:a]aresample=48000,aformat=channel_layouts=stereo[base]`);
+      }
+      const mixLabels: string[] = ["[base]"];
+      wavPaths.forEach((_w, i) => {
+        const inIdx = i + 1;
+        const delayMs = Math.round(spoken[i]!.start * 1000);
+        parts.push(`[${inIdx}:a]adelay=${delayMs}:all=1,aresample=48000,aformat=channel_layouts=stereo[n${inIdx}]`);
+        mixLabels.push(`[n${inIdx}]`);
+      });
+      parts.push(`${mixLabels.join("")}amix=inputs=${mixLabels.length}:duration=first:normalize=0,loudnorm=I=-14:TP=-1.5:LRA=11[aout]`);
+      const narratedPath = path.join(outputDir, `clip_${clipId}_snarrated.mp4`);
+      await spawnProcess("ffmpeg", [
+        ...ffInputs, "-filter_complex", parts.join(";"),
+        "-map", "0:v", "-map", "[aout]",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart",
+        narratedPath,
+      ], 300_000, () => {});
+      if (fs.existsSync(narratedPath)) {
+        fs.renameSync(narratedPath, filePath);
+        logger.info({ filePath, lines: spoken.length }, "Story bridging narration mixed in");
+      }
+    } else {
+      logger.warn({ clipId }, "No story narration lines produced — skipping");
+    }
+    for (const w of wavPaths) { try { fs.existsSync(w) && fs.unlinkSync(w); } catch { /* ignore */ } }
+  } catch (naErr) {
+    logger.warn({ naErr }, "Story narration generation failed (non-fatal)");
+  }
+}
+
+/**
+ * Renders a multi-clip STORY: composites each segment (via processClip, composite-
+ * only), concatenates them, then captions + narrates the whole. One queue job, one
+ * output file. Sequential segment rendering keeps the phone's memory flat.
+ */
+export async function processStory(
+  youtubeUrl: string,
+  outputFilename: string,
+  channelHandle: string,
+  clipId: number,
+  frameStyle: "standard" | "immersive",
+  sourceChannel: string,
+  captionsEnabled: boolean,
+  outroEnabled: boolean,
+  captionColor: string,
+  narrationScript: string,
+  segments: StorySegment[]
+): Promise<void> {
+  const outputDir = getOutputDir();
+  const finalOutputPath = path.join(outputDir, outputFilename);
+  const updateProgress = makeProgressUpdater(clipId);
+  const tmpId = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+
+  const segs = (segments ?? []).slice(0, 5);
+  if (segs.length < 2) throw new Error("A story needs at least 2 segments.");
+
+  const segFiles: string[] = [];
+  try {
+    await updateProgress(2, true);
+
+    // 1) Composite each segment sequentially (memory-safe). Reuse processClip with
+    //    clipId=0 so it produces ONLY the composite (no per-segment captions/thumb/
+    //    voiceover). The outro card is rendered on the LAST segment so it lands at the
+    //    very end of the stitched story.
+    for (let i = 0; i < segs.length; i++) {
+      const seg = segs[i]!;
+      const isLast = i === segs.length - 1;
+      const segFilename = `story_${clipId}_seg_${i}_${tmpId}.mp4`;
+      logger.info({ clipId, segment: i + 1, of: segs.length }, "Rendering story segment");
+      await processClip(
+        youtubeUrl, seg.startTime, seg.endTime, seg.headline ?? "",
+        segFilename, "edited", channelHandle, 0, undefined, frameStyle, sourceChannel,
+        false, isLast && outroEnabled, false, "",
+        seg.punchInEnabled ?? false, seg.zoomMoments ?? "", "", "hook", ""
+      );
+      segFiles.push(path.join(outputDir, segFilename));
+      await updateProgress(5 + ((i + 1) / segs.length) * 60, true);
+    }
+
+    // 2) Concat via the demuxer with -c copy. Every segment came from the same source
+    //    and was composited with identical encode settings, so the streams are
+    //    concatenatable without a re-encode. (The later caption pass re-encodes video
+    //    and the narration pass re-encodes audio, cleaning up any seam timestamps.)
+    const listPath = path.join(outputDir, `story_${clipId}_list_${tmpId}.txt`);
+    fs.writeFileSync(listPath, segFiles.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join("\n") + "\n");
+    const stitchedPath = path.join(outputDir, `story_${clipId}_stitched_${tmpId}.mp4`);
+    await spawnProcess("ffmpeg", [
+      "-y", "-f", "concat", "-safe", "0", "-i", listPath,
+      "-c", "copy", "-movflags", "+faststart", stitchedPath,
+    ], 300_000, () => {}, RENDER_STALL_MS, "render");
+    if (!fs.existsSync(stitchedPath)) throw new Error("Story concat produced no output");
+    fs.renameSync(stitchedPath, finalOutputPath);
+    await updateProgress(72, true);
+
+    const storyDuration = (await probeContentDuration(finalOutputPath)) || 0;
+    logger.info({ clipId, storyDuration, segments: segs.length }, "Story stitched");
+
+    // 3) Thumbnail (non-fatal)
+    try {
+      const thumbPath = path.join(outputDir, `clip_${clipId}_thumb.jpg`);
+      await spawnProcess("ffmpeg", ["-y", "-i", finalOutputPath, "-vf", "thumbnail=300", "-frames:v", "1", thumbPath], 60000, () => {});
+    } catch (thumbErr) {
+      logger.warn({ thumbErr }, "Story thumbnail failed (non-fatal)");
+    }
+
+    // 4) Captions over the whole stitched story
+    if (captionsEnabled && storyDuration > 0) {
+      await burnCaptionsOnFile(clipId, finalOutputPath, storyDuration, outroEnabled, captionColor);
+    }
+    await updateProgress(90, true);
+
+    // 5) Bridging narration across the stitched timeline
+    if (narrationScript && narrationScript.trim() && storyDuration > 0) {
+      await mixNarrationOnFile(clipId, finalOutputPath, storyDuration, outroEnabled, narrationScript);
+    }
+    await updateProgress(99, true);
+    logger.info({ finalOutputPath }, "Story processing complete");
+  } finally {
+    // Clean up the per-segment files + list + any leftover story temp files.
+    try {
+      for (const f of segFiles) { try { fs.existsSync(f) && fs.unlinkSync(f); } catch { /* ignore */ } }
+      const leftovers = fs.readdirSync(outputDir).filter((f) => f.includes(tmpId));
+      for (const f of leftovers) {
+        const p = path.join(outputDir, f);
+        try { fs.existsSync(p) && fs.unlinkSync(p); } catch { /* ignore */ }
+      }
+    } catch (cleanupErr) {
+      logger.warn({ cleanupErr, tmpId }, "Failed to clean up story temp files");
     }
   }
 }

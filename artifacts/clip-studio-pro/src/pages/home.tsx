@@ -33,6 +33,8 @@ import {
   SendHorizonal,
   ZoomIn,
   Sparkles,
+  Film,
+  Trash2,
 } from "lucide-react";
 
 const MAX_CLIPS = 10;
@@ -50,6 +52,8 @@ const clipEntrySchema = z.object({
   zoomMoments: z.string().optional().default(""),
   voiceoverEnabled: z.boolean().default(false),
   voiceoverHook: z.string().optional().default(""),
+  voiceoverMode: z.enum(["hook", "script"]).default("hook"),
+  narrationScript: z.string().optional().default(""),
 }).superRefine((val, ctx) => {
   if (val.mode === "edited" && (!val.headline || val.headline.trim().length === 0)) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Headline required for Edited mode", path: ["headline"] });
@@ -84,9 +88,17 @@ const defaultClip = {
   zoomMoments: "",
   voiceoverEnabled: false,
   voiceoverHook: "",
+  voiceoverMode: "hook" as const,
+  narrationScript: "",
 };
 
-type SourceTab = "youtube" | "local";
+type SourceTab = "youtube" | "local" | "story";
+
+interface StorySeg {
+  startTime: string;
+  endTime: string;
+  headline: string;
+}
 
 interface LocalForm {
   startTime: string;
@@ -393,6 +405,19 @@ export default function Home() {
   // AI Clip Finder: raw text the user pastes back from Gemini, parsed into clip entries.
   const [suggestText, setSuggestText] = useState("");
 
+  // ----- Story mode (Feature 2) state -----
+  const [storyUrl, setStoryUrl] = useState("");
+  const [storyCreator, setStoryCreator] = useState("");
+  const [storySegments, setStorySegments] = useState<StorySeg[]>([
+    { startTime: "00:00:00", endTime: "00:00:15", headline: "" },
+    { startTime: "00:00:00", endTime: "00:00:15", headline: "" },
+  ]);
+  const [storyNarration, setStoryNarration] = useState("");
+  const [storyPaste, setStoryPaste] = useState("");
+  const [storyCaptions, setStoryCaptions] = useState(true);
+  const [storyOutro, setStoryOutro] = useState(true);
+  const [storySubmitting, setStorySubmitting] = useState(false);
+
   const [, navigate] = useLocation();
   const isSubmitting = form.formState.isSubmitting;
 
@@ -494,6 +519,42 @@ export default function Home() {
     } else {
       toast({ title: "Copy failed", description: "Couldn't access the clipboard. Long-press the box to copy manually.", variant: "destructive" });
     }
+  }
+
+  // Builds a Gemini prompt for FULL NARRATION mode: a multi-line documentary script
+  // with clip-relative timestamps. Same bridge pattern as the hook — the user runs it in
+  // their own Gemini and pastes the "SS | sentence" lines back into the narration box.
+  async function copyNarrationPrompt(index: number) {
+    const values = form.getValues();
+    const clip = values.clips[index];
+    if (!clip) return;
+    const dur = Math.max(0, toSecs(clip.endTime) - toSecs(clip.startTime));
+    const hasUrl = !!(values.youtubeUrl && values.youtubeUrl.trim());
+    const prompt =
+      `You are a documentary editor writing spoken narration for a vertical YouTube Short. ` +
+      (hasUrl
+        ? `Open and WATCH the exact section of the source video below, then narrate what ACTUALLY happens in it — do not guess.\n`
+        : `Write narration for this clip (a local upload — if you cannot view the footage, base it on the title below).\n`) +
+      `Write a 4-6 line spoken narration that tells the story of the clip, ONE sentence per beat, timed to the action, ` +
+      `to keep viewers watching to the end. Give each line's time as the number of seconds AFTER the start of the section ` +
+      `(0 = ${clip.startTime}), a whole number between 1 and ${Math.max(1, dur - 1)}, and space the lines at least 3 seconds apart.\n` +
+      `Return ONLY the lines in EXACTLY this format and NOTHING else:\n` +
+      `SS | narration sentence\n` +
+      `Example:\n` +
+      `2 | Nobody saw this coming.\n` +
+      `9 | He'd been planning it for months.\n` +
+      `17 | And that's when everything fell apart.\n\n` +
+      `Context:\n` +
+      (hasUrl
+        ? `- Video: ${values.youtubeUrl}\n- Watch ONLY this section: ${clip.startTime} to ${clip.endTime}\n`
+        : "") +
+      `- Headline/title: ${clip.headline || "(none)"}\n` +
+      `- Source channel: ${values.sourceChannel || "(unknown)"}\n` +
+      `- Clip length: ~${dur}s`;
+    const ok = await copyTextToClipboard(prompt);
+    toast(ok
+      ? { title: "Narration prompt copied", description: "Paste it into your Gemini app, then paste the timed lines back here." }
+      : { title: "Copy failed", description: "Couldn't access the clipboard.", variant: "destructive" });
   }
 
   // Builds a Gemini prompt asking it to choose AUTO-ZOOM moments AND the best zoom TYPE
@@ -630,6 +691,120 @@ export default function Home() {
     });
   }
 
+  /* ---------- Story mode (Feature 2) ---------- */
+
+  // Bridge prompt: asks Gemini for 3-5 ordered moments + bridging narration on the
+  // stitched timeline. Same human-in-the-loop pattern — no server AI call.
+  async function copyStoryPrompt() {
+    const hasUrl = !!storyUrl.trim();
+    const prompt =
+      `You are a short-form editor building ONE 45-60 second STORY from a longer video.\n` +
+      (hasUrl
+        ? `Open and WATCH this video, then base every pick on what ACTUALLY happens — do not guess:\nVideo: ${storyUrl}\n`
+        : `(Add the source video URL first, or describe the video to Gemini.)\n`) +
+      `Pick 3 to 5 moments that, IN ORDER, tell a single escalating story. Each moment should be a self-contained 8-20 second beat.\n` +
+      (storyCreator ? `Source channel: ${storyCreator}.\n` : "") +
+      `For EACH moment give the START and END time as ABSOLUTE timestamps in the source video (HH:MM:SS) plus a punchy 4-7 word headline.\n` +
+      `THEN write short bridging narration placed on the FINAL stitched timeline (0 = start of the stitched video, NOT the source), timed so a line bridges between the moments (e.g. "But that wasn't the craziest part..."). Give each narration time as whole seconds after the start of the stitched video, at least 3s apart.\n` +
+      `Return EXACTLY this format and NOTHING else:\n` +
+      `SEGMENTS:\n` +
+      `HH:MM:SS - HH:MM:SS | Headline\n` +
+      `...\n` +
+      `NARRATION:\n` +
+      `SS | bridging line\n` +
+      `...\n\n` +
+      `Example:\n` +
+      `SEGMENTS:\n` +
+      `00:01:12 - 00:01:26 | He Didn't See It Coming\n` +
+      `00:04:47 - 00:05:03 | The Bet That Changed Everything\n` +
+      `NARRATION:\n` +
+      `1 | It started as an ordinary bet.\n` +
+      `16 | But that was only the beginning.`;
+    const ok = await copyTextToClipboard(prompt);
+    toast(ok
+      ? { title: "Story prompt copied", description: "Paste it into Gemini, then paste its reply into the box below." }
+      : { title: "Copy failed", description: "Couldn't access the clipboard.", variant: "destructive" });
+  }
+
+  // Parses Gemini's reply into SEGMENTS (reusing parseClipSuggestions) + a NARRATION block.
+  function applyStoryPaste() {
+    const text = storyPaste;
+    const nIdx = text.search(/narration\s*:/i);
+    let segBlock = text;
+    let narrBlock = "";
+    if (nIdx >= 0) {
+      segBlock = text.slice(0, nIdx);
+      narrBlock = text.slice(nIdx).replace(/^[^\n]*\n?/, ""); // drop the "NARRATION:" label line
+    }
+    segBlock = segBlock.replace(/segments\s*:/i, "");
+    const parsedSegs = parseClipSuggestions(segBlock).slice(0, 5);
+    if (parsedSegs.length < 2) {
+      toast({ title: "No story found", description: "Paste Gemini's SEGMENTS lines like  00:01:12 - 00:01:26 | Headline", variant: "destructive" });
+      return;
+    }
+    const narration = narrBlock
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => /^\d{1,2}(:\d{2})?\s*\|/.test(l))
+      .join("\n");
+    setStorySegments(parsedSegs.map((p) => ({ startTime: p.startTime, endTime: p.endTime, headline: p.headline })));
+    if (narration) setStoryNarration(narration);
+    setStoryPaste("");
+    toast({ title: `${parsedSegs.length} moments added`, description: narration ? "Segments + narration filled. Review, then Enqueue." : "Segments filled. Add narration, then Enqueue." });
+  }
+
+  function updateStorySeg(i: number, patch: Partial<StorySeg>) {
+    setStorySegments((prev) => prev.map((s, idx) => (idx === i ? { ...s, ...patch } : s)));
+  }
+
+  async function submitStory() {
+    if (!storyUrl.trim() || !/(youtube\.com|youtu\.be)/.test(storyUrl)) {
+      toast({ title: "Add a valid YouTube URL", variant: "destructive" });
+      return;
+    }
+    const valid = storySegments.filter(
+      (s) => /^\d{2}:\d{2}:\d{2}$/.test(s.startTime) && /^\d{2}:\d{2}:\d{2}$/.test(s.endTime) && toSecs(s.endTime) > toSecs(s.startTime),
+    );
+    if (valid.length < 2) {
+      toast({ title: "Need at least 2 valid segments", description: "Each moment needs a start and end (end after start).", variant: "destructive" });
+      return;
+    }
+    setStorySubmitting(true);
+    try {
+      const r = await fetch(`${API_BASE}/api/clips/story`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          youtubeUrl: storyUrl,
+          frameStyle: wFrame,
+          sourceChannel: storyCreator,
+          captionsEnabled: storyCaptions,
+          outroEnabled: storyOutro,
+          captionColor: "#FFF400",
+          narrationScript: storyNarration,
+          segments: valid.slice(0, 5),
+        }),
+      });
+      if (!r.ok) {
+        let msg = "Failed to create story";
+        try { msg = ((await r.json()) as { error?: string }).error ?? msg; } catch { /* ignore */ }
+        throw new Error(msg);
+      }
+      queryClient.invalidateQueries({ queryKey: getListClipsQueryKey() });
+      queryClient.invalidateQueries({ queryKey: getGetClipStatsQueryKey() });
+      toast({ title: "Story job enqueued", description: "It renders each moment, stitches them, then narrates — watch the Timeline." });
+      setStorySegments([
+        { startTime: "00:00:00", endTime: "00:00:15", headline: "" },
+        { startTime: "00:00:00", endTime: "00:00:15", headline: "" },
+      ]);
+      setStoryNarration("");
+    } catch (e) {
+      toast({ title: e instanceof Error ? e.message : "Failed", variant: "destructive" });
+    } finally {
+      setStorySubmitting(false);
+    }
+  }
+
   async function onSubmit(values: FormValues) {
     let successCount = 0;
     const failReasons: string[] = [];
@@ -654,6 +829,8 @@ export default function Home() {
             zoomMoments: clip.zoomMoments ?? "",
             voiceoverEnabled: clip.voiceoverEnabled ?? false,
             voiceoverHook: clip.voiceoverHook ?? "",
+            voiceoverMode: clip.voiceoverMode ?? "hook",
+            narrationScript: clip.narrationScript ?? "",
           }),
         });
         if (!r.ok) {
@@ -802,6 +979,7 @@ export default function Home() {
                   options={[
                     { value: "youtube", label: "YouTube", icon: <Youtube className="w-3.5 h-3.5" /> },
                     { value: "local", label: "Local file", icon: <Upload className="w-3.5 h-3.5" /> },
+                    { value: "story", label: "Story", icon: <Film className="w-3.5 h-3.5" /> },
                   ]}
                 />
                 <Segmented
@@ -939,6 +1117,7 @@ export default function Home() {
                       const start = form.watch(`clips.${index}.startTime`);
                       const end = form.watch(`clips.${index}.endTime`);
                       const voOn = form.watch(`clips.${index}.voiceoverEnabled`) ?? false;
+                      const voMode = form.watch(`clips.${index}.voiceoverMode`) ?? "hook";
                       const punchOn = form.watch(`clips.${index}.punchInEnabled`) ?? false;
 
                       return (
@@ -1112,14 +1291,14 @@ export default function Home() {
                                       className="text-[10.5px] font-mono uppercase tracking-[0.1em] text-[#c9b8ff] flex items-center gap-1.5"
                                       onClick={(e) => { e.preventDefault(); form.setValue(`clips.${index}.voiceoverEnabled`, !voOn); }}
                                     >
-                                      <Mic className="w-3.5 h-3.5 text-[#9b7bff]" /> AI Voiceover Hook
+                                      <Mic className="w-3.5 h-3.5 text-[#9b7bff]" /> AI Voiceover
                                       <span className="text-[8.5px] font-semibold tracking-[0.14em] text-[#b69dff] border border-[#9b7bff]/40 rounded px-1.5 py-0.5">PRO</span>
                                     </span>
                                   </label>
                                   {voOn && (
                                     <button
                                       type="button"
-                                      onClick={() => copyHookPrompt(index)}
+                                      onClick={() => (voMode === "script" ? copyNarrationPrompt(index) : copyHookPrompt(index))}
                                       className="text-[10px] font-mono uppercase tracking-[0.08em] text-[#b69dff] hover:underline flex items-center gap-1.5 shrink-0"
                                     >
                                       <ClipboardCopy className="w-3 h-3" /> Copy Gemini prompt
@@ -1127,11 +1306,31 @@ export default function Home() {
                                   )}
                                 </div>
                                 {voOn && (
-                                  <Input
-                                    placeholder="Spoken intro hook — type it, or paste from your Gemini app…"
-                                    className="text-sm bg-background mt-2.5"
-                                    {...form.register(`clips.${index}.voiceoverHook`)}
-                                  />
+                                  <>
+                                    <div className="mt-2.5">
+                                      <Segmented
+                                        value={voMode}
+                                        onChange={(v) => form.setValue(`clips.${index}.voiceoverMode`, v as "hook" | "script")}
+                                        options={[
+                                          { value: "hook", label: "Hook" },
+                                          { value: "script", label: "Narration" },
+                                        ]}
+                                      />
+                                    </div>
+                                    {voMode === "script" ? (
+                                      <Textarea
+                                        placeholder={"Timed narration — one line per beat (or paste from Gemini):\n2 | Nobody saw this coming.\n9 | He'd been planning it for months."}
+                                        className="text-sm bg-background mt-2.5 font-mono min-h-[84px]"
+                                        {...form.register(`clips.${index}.narrationScript`)}
+                                      />
+                                    ) : (
+                                      <Input
+                                        placeholder="Spoken intro hook — type it, or paste from your Gemini app…"
+                                        className="text-sm bg-background mt-2.5"
+                                        {...form.register(`clips.${index}.voiceoverHook`)}
+                                      />
+                                    )}
+                                  </>
                                 )}
                               </div>
                             )}
@@ -1314,6 +1513,178 @@ export default function Home() {
                         <><Loader2 className="mr-2 h-4 w-4 animate-spin" />UPLOADING…</>
                       ) : (
                         <><Upload className="mr-2 h-4 w-4" />UPLOAD &amp; PROCESS</>
+                      )}
+                    </Button>
+                  </div>
+                </div>
+              )}
+
+              {sourceTab === "story" && (
+                <div className="space-y-5">
+                  <div className="rounded-xl border border-border bg-gradient-to-b from-card to-[hsl(240_10%_5%)] p-5 space-y-4">
+                    <div>
+                      <FieldLabel>Source URL</FieldLabel>
+                      <Input
+                        placeholder="https://youtube.com/watch?v=..."
+                        className="font-mono text-sm bg-background"
+                        value={storyUrl}
+                        onChange={(e) => setStoryUrl(e.target.value)}
+                      />
+                    </div>
+                    <div>
+                      <FieldLabel>Source creator <span className="text-muted-foreground/40 normal-case">(optional)</span></FieldLabel>
+                      <Input
+                        placeholder="e.g. KSI, MrBeast, IShowSpeed"
+                        className="font-mono text-sm bg-background"
+                        value={storyCreator}
+                        onChange={(e) => setStoryCreator(e.target.value)}
+                      />
+                    </div>
+
+                    {/* Story bridge: copy prompt → run in Gemini → paste moments + narration back */}
+                    <div className="rounded-lg border border-primary/30 bg-primary/[0.05] p-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[10.5px] font-mono uppercase tracking-[0.1em] text-foreground flex items-center gap-1.5">
+                          <Film className="w-3.5 h-3.5 text-primary" /> AI Story Builder
+                          <span className="text-[8.5px] font-semibold tracking-[0.14em] text-primary border border-primary/40 rounded px-1.5 py-0.5 inline-flex items-center gap-1"><Sparkles className="w-2.5 h-2.5" />AI</span>
+                        </span>
+                        <button
+                          type="button"
+                          onClick={copyStoryPrompt}
+                          className="text-[10px] font-mono uppercase tracking-[0.08em] text-primary hover:underline flex items-center gap-1.5 shrink-0"
+                        >
+                          <ClipboardCopy className="w-3 h-3" /> Copy Gemini prompt
+                        </button>
+                      </div>
+                      <Textarea
+                        value={storyPaste}
+                        onChange={(e) => setStoryPaste(e.target.value)}
+                        placeholder={"Paste Gemini's reply here (SEGMENTS + NARRATION blocks)…"}
+                        className="text-sm bg-background mt-2.5 font-mono min-h-[96px]"
+                      />
+                      <button
+                        type="button"
+                        onClick={applyStoryPaste}
+                        disabled={!storyPaste.trim()}
+                        className="mt-2 w-full flex items-center justify-center gap-2 rounded-md border border-dashed border-primary/40 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-primary hover:bg-primary/10 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        <Plus className="w-3.5 h-3.5" /> Fill moments + narration from paste
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Segments (moments) */}
+                  <div className="space-y-3">
+                    <p className="font-mono text-[11px] uppercase tracking-[0.13em] text-muted-foreground">
+                      Moments <span className="text-muted-foreground/50">({storySegments.length}/5 · min 2)</span>
+                    </p>
+                    {storySegments.map((seg, index) => {
+                      const bad = !/^\d{2}:\d{2}:\d{2}$/.test(seg.startTime) || !/^\d{2}:\d{2}:\d{2}$/.test(seg.endTime) || toSecs(seg.endTime) <= toSecs(seg.startTime);
+                      return (
+                        <div key={index} className="rounded-xl border border-border bg-background/40 p-4 space-y-3">
+                          <div className="flex items-center gap-3">
+                            <span className="font-mono text-[11px] text-primary bg-primary/[0.08] border border-primary/20 w-7 h-7 rounded-md grid place-items-center font-semibold tabular-nums">
+                              {String(index + 1).padStart(2, "0")}
+                            </span>
+                            <span className="font-mono text-[10px] text-muted-foreground uppercase tracking-[0.12em]">
+                              {bad ? <span className="text-destructive">check times</span> : `length ${fmtDuration(seg.startTime, seg.endTime)}`}
+                            </span>
+                            {storySegments.length > 2 && (
+                              <button
+                                type="button"
+                                onClick={() => setStorySegments((p) => p.filter((_, i) => i !== index))}
+                                className="ml-auto w-7 h-7 grid place-items-center rounded-md border border-border text-muted-foreground hover:text-destructive hover:border-destructive/40 hover:bg-destructive/10 transition-colors"
+                                aria-label="Remove moment"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            )}
+                          </div>
+                          <div className="grid grid-cols-2 gap-3">
+                            <div>
+                              <FieldLabel>In</FieldLabel>
+                              <Input
+                                placeholder="00:00:00"
+                                className={`font-mono text-sm bg-background ${bad ? "border-destructive/50" : ""}`}
+                                value={seg.startTime}
+                                onChange={(e) => updateStorySeg(index, { startTime: e.target.value })}
+                              />
+                            </div>
+                            <div>
+                              <FieldLabel>Out</FieldLabel>
+                              <Input
+                                placeholder="00:00:15"
+                                className={`font-mono text-sm bg-background ${bad ? "border-destructive/50" : ""}`}
+                                value={seg.endTime}
+                                onChange={(e) => updateStorySeg(index, { endTime: e.target.value })}
+                              />
+                            </div>
+                          </div>
+                          <div>
+                            <FieldLabel>Headline</FieldLabel>
+                            <Input
+                              placeholder="On-screen headline for this moment…"
+                              className="text-sm bg-background"
+                              value={seg.headline}
+                              onChange={(e) => updateStorySeg(index, { headline: e.target.value })}
+                            />
+                          </div>
+                        </div>
+                      );
+                    })}
+                    <button
+                      type="button"
+                      onClick={() => storySegments.length < 5 && setStorySegments((p) => [...p, { startTime: "00:00:00", endTime: "00:00:15", headline: "" }])}
+                      disabled={storySegments.length >= 5}
+                      className={`w-full flex items-center justify-center gap-2 rounded-xl border border-dashed py-3 font-mono text-[11px] uppercase tracking-[0.1em] transition-colors ${
+                        storySegments.length >= 5
+                          ? "text-muted-foreground/30 border-border cursor-not-allowed"
+                          : "text-muted-foreground border-border hover:text-primary hover:border-primary/40"
+                      }`}
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      {storySegments.length >= 5 ? "Max 5 moments" : `Add moment (${storySegments.length}/5)`}
+                    </button>
+                  </div>
+
+                  {/* Bridging narration */}
+                  <div className="rounded-xl border border-[#9b7bff]/30 bg-gradient-to-b from-[#9b7bff]/[0.08] to-[#9b7bff]/[0.02] p-4">
+                    <div className="flex items-center gap-1.5 mb-2">
+                      <Mic className="w-3.5 h-3.5 text-[#9b7bff]" />
+                      <span className="text-[10.5px] font-mono uppercase tracking-[0.1em] text-[#c9b8ff]">Bridging narration</span>
+                      <span className="text-[8.5px] font-semibold tracking-[0.14em] text-[#b69dff] border border-[#9b7bff]/40 rounded px-1.5 py-0.5">PRO</span>
+                    </div>
+                    <Textarea
+                      value={storyNarration}
+                      onChange={(e) => setStoryNarration(e.target.value)}
+                      placeholder={"Timed on the STITCHED timeline — one line per beat:\n1 | It started as an ordinary bet.\n16 | But that was only the beginning."}
+                      className="text-sm bg-background font-mono min-h-[84px]"
+                    />
+                    <p className="mt-2 text-[10.5px] text-muted-foreground/60 leading-relaxed">
+                      Seconds count from the start of the FINAL stitched video (0 = first moment). Spoken by Piper, ducking the footage while it plays.
+                    </p>
+                  </div>
+
+                  {/* Global toggles */}
+                  <div className="flex flex-wrap gap-2">
+                    <ToggleChip label="Captions" checked={storyCaptions} onChange={setStoryCaptions} />
+                    <ToggleChip label="Outro card" checked={storyOutro} onChange={setStoryOutro} />
+                  </div>
+
+                  <div className="flex items-center justify-between gap-4 flex-wrap pt-1">
+                    <span className="font-mono text-[11px] text-muted-foreground">
+                      {storySegments.length} moments · one stitched Short · slow on phone
+                    </span>
+                    <Button
+                      type="button"
+                      disabled={storySubmitting}
+                      onClick={submitStory}
+                      className="font-mono uppercase tracking-[0.13em] text-xs h-12 px-7"
+                    >
+                      {storySubmitting ? (
+                        <><Loader2 className="mr-2 h-4 w-4 animate-spin" />DISPATCHING…</>
+                      ) : (
+                        <><Film className="mr-2 h-4 w-4" />ENQUEUE STORY</>
                       )}
                     </Button>
                   </div>
