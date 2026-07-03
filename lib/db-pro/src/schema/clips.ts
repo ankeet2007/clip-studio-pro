@@ -12,6 +12,18 @@ export interface StorySegment {
   punchInEnabled?: boolean;
 }
 
+// Pro-only: one ranked moment of a TOP 5 countdown (jobType "top5"). Superset of
+// StorySegment: each moment can carry its OWN source URL (multi-source top-5s pull each
+// rank from a different video; empty ⇒ fall back to the job-level youtubeUrl), a `rank`
+// (5→1), the source channel for its "Credit:" line, and one spoken countdown line
+// ("Number five: ..."). Stored in the same `segments` jsonb column as StorySegment.
+export interface Top5Segment extends StorySegment {
+  rank: number;
+  youtubeUrl?: string;
+  sourceChannel?: string;
+  narrationLine?: string;
+}
+
 export const clipsTable = pgTable("clips_pro", {
   id: serial("id").primaryKey(),
   youtubeUrl: text("youtube_url"),
@@ -56,9 +68,11 @@ export const clipsTable = pgTable("clips_pro", {
   // Pro-only: Multi-clip Story mode (Feature 2). jobType "clip" = normal single clip;
   // "story" = stitch `segments` (9-10 moments from one source) into one video with
   // bridging narration (reuses narrationScript, timestamped on the STITCHED timeline).
-  // Persisted so Retry re-renders the whole story from the same row.
+  // "top5" = a Top 5 countdown: `segments` are Top5Segments (each with a rank + optional
+  // per-moment source URL), stitched behind a title card with #5→#1 rank badges and a
+  // countdown voiceover. Persisted so Retry re-renders the whole job from the same row.
   jobType: text("job_type").notNull().default("clip"),
-  segments: jsonb("segments").$type<StorySegment[]>().notNull().default([]),
+  segments: jsonb("segments").$type<(StorySegment | Top5Segment)[]>().notNull().default([]),
 });
 
 export const insertClipSchema = createInsertSchema(clipsTable).omit({

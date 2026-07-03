@@ -12,7 +12,7 @@ import {
   GetClipResponse,
   GetClipStatsResponse,
 } from "@workspace/api-zod";
-import { processClip, processStory, enqueueClipJob, getOutputFilePath, getUploadsDir, normalizeYoutubeUrl, parseProcessingError, validateSegmentWithinVideo, type StorySegment } from "../lib/clipProcessor";
+import { processClip, processStory, processTop5, enqueueClipJob, getOutputFilePath, getUploadsDir, normalizeYoutubeUrl, parseProcessingError, validateSegmentWithinVideo, type StorySegment, type Top5Segment } from "../lib/clipProcessor";
 import { logger } from "../lib/logger";
 import { readSettings } from "../lib/settings";
 
@@ -206,6 +206,151 @@ router.post("/clips/story", async (req, res): Promise<void> => {
 
   const outputFilename = `clip_${clip.id}_${Date.now()}.mp4`;
   dispatchStoryJob(clip.id, youtubeUrl, outputFilename, frameStyle, sourceChannel, captionsEnabled, outroEnabled, captionColor, narrationScript, segments);
+});
+
+/**
+ * Enqueues a TOP 5 job: render each ranked moment (possibly from its own source URL),
+ * stitch them behind a title card with #5→#1 badges, caption once, then add a
+ * countdown voiceover. Mirrors dispatchStoryJob's status handling.
+ */
+function dispatchTop5Job(
+  clipId: number,
+  outputFilename: string,
+  title: string,
+  frameStyle: "standard" | "immersive",
+  sourceChannel: string,
+  captionsEnabled: boolean,
+  outroEnabled: boolean,
+  captionColor: string,
+  order: "5to1" | "1to5",
+  segments: Top5Segment[]
+) {
+  const { channelHandle } = readSettings();
+  enqueueClipJob(async () => {
+    try {
+      await db.update(clipsTable).set({ status: "processing" }).where(eq(clipsTable.id, clipId)).execute();
+    } catch (err: unknown) {
+      logger.error({ err, clipId }, "Failed to mark Top 5 as processing");
+    }
+    await processTop5(outputFilename, title, channelHandle, clipId, frameStyle, sourceChannel, captionsEnabled, outroEnabled, captionColor, order, segments)
+      .then(async () => {
+        await db.update(clipsTable).set({ status: "done", progress: 100, outputFilename }).where(eq(clipsTable.id, clipId));
+      })
+      .catch(async (err: unknown) => {
+        const raw = err instanceof Error ? err.message : String(err);
+        const msg = parseProcessingError(raw);
+        await db.update(clipsTable).set({ status: "error", progress: 0, errorMessage: msg }).where(eq(clipsTable.id, clipId));
+      });
+  });
+}
+
+/**
+ * Normalises + validates a raw Top 5 moments array. Each moment needs a rank, a
+ * start/end time, and a source URL — for single-source jobs the per-moment URL is
+ * blank and we fall back to `jobUrl`. Broken rows are dropped.
+ */
+function sanitizeTop5Segments(raw: unknown, jobUrl: string): Top5Segment[] {
+  if (!Array.isArray(raw)) return [];
+  const timeRe = /^\d{1,2}:\d{2}(:\d{2})?$/;
+  const toHMS = (t: string) => { const p = t.split(":"); while (p.length < 3) p.unshift("00"); return p.slice(-3).map((x) => x.padStart(2, "0")).join(":"); };
+  const fallback = jobUrl.trim() ? normalizeYoutubeUrl(jobUrl.trim()) : "";
+  const out: Top5Segment[] = [];
+  for (const s of raw) {
+    if (!s || typeof s !== "object") continue;
+    const seg = s as Record<string, unknown>;
+    const st = String(seg.startTime ?? "").trim();
+    const en = String(seg.endTime ?? "").trim();
+    if (!timeRe.test(st) || !timeRe.test(en)) continue;
+    const rank = Number(seg.rank);
+    if (!Number.isFinite(rank) || rank < 1) continue;
+    const rawUrl = String(seg.youtubeUrl ?? "").trim();
+    const segUrl = rawUrl ? normalizeYoutubeUrl(rawUrl) : fallback;
+    if (!segUrl) continue;
+    out.push({
+      rank: Math.round(rank),
+      youtubeUrl: segUrl,
+      startTime: toHMS(st),
+      endTime: toHMS(en),
+      headline: String(seg.headline ?? "").slice(0, 120),
+      sourceChannel: String(seg.sourceChannel ?? "").slice(0, 80),
+      narrationLine: String(seg.narrationLine ?? "").slice(0, 200),
+      zoomMoments: typeof seg.zoomMoments === "string" ? seg.zoomMoments : "",
+      punchInEnabled: seg.punchInEnabled === true,
+    });
+    if (out.length >= 10) break;
+  }
+  return out;
+}
+
+/**
+ * POST /clips/top5/verify — check each moment's timestamp actually exists in its source
+ * video (Gemini's timestamps are guesses). Read-only; runs sequentially to stay light on
+ * the phone. Returns per-rank { ok, message, videoDuration } so the UI can flag bad rows.
+ */
+router.post("/clips/top5/verify", async (req, res): Promise<void> => {
+  const body = req.body as { youtubeUrl?: string; segments?: unknown };
+  const segments = sanitizeTop5Segments(body.segments, body.youtubeUrl ?? "");
+  if (segments.length === 0) {
+    res.status(400).json({ error: "No valid moments to verify." });
+    return;
+  }
+  const results: { rank: number; ok: boolean; message: string | null; videoDuration: number | null }[] = [];
+  for (const seg of segments) {
+    try {
+      const r = await validateSegmentWithinVideo(seg.youtubeUrl!, seg.startTime, seg.endTime);
+      results.push({ rank: seg.rank, ok: r.ok, message: r.message ?? null, videoDuration: r.videoDuration ?? null });
+    } catch {
+      results.push({ rank: seg.rank, ok: true, message: null, videoDuration: null });
+    }
+  }
+  res.json({ results });
+});
+
+/**
+ * POST /clips/top5 — create a Top 5 countdown job. `youtubeUrl` is the optional
+ * single-source fallback; multi-source jobs put a URL on each moment instead.
+ */
+router.post("/clips/top5", async (req, res): Promise<void> => {
+  const body = req.body as {
+    title?: string; youtubeUrl?: string; frameStyle?: string; sourceChannel?: string;
+    captionsEnabled?: boolean; outroEnabled?: boolean; captionColor?: string;
+    order?: string; segments?: unknown;
+  };
+  const segments = sanitizeTop5Segments(body.segments, body.youtubeUrl ?? "");
+  if (segments.length < 2) {
+    res.status(400).json({ error: "A Top 5 needs at least 2 moments (each with a rank, a source URL, and a start/end time)." });
+    return;
+  }
+
+  const title = (body.title ?? "").trim().slice(0, 120) || `Top ${segments.length}`;
+  const frameStyle = (body.frameStyle === "standard" ? "standard" : "immersive") as "standard" | "immersive";
+  const sourceChannel = body.sourceChannel ?? "";
+  const captionsEnabled = body.captionsEnabled ?? true;
+  const outroEnabled = body.outroEnabled ?? true;
+  const captionColor = body.captionColor ?? "";
+  const order = (body.order === "1to5" ? "1to5" : "5to1") as "5to1" | "1to5";
+
+  // Representative fields so the row displays sensibly in the timeline/detail.
+  const playOrder = [...segments].sort((a, b) => (order === "1to5" ? a.rank - b.rank : b.rank - a.rank));
+  const startTime = playOrder[0]!.startTime;
+  const endTime = playOrder[playOrder.length - 1]!.endTime;
+  const repUrl = playOrder[0]!.youtubeUrl ?? "";
+
+  const [clip] = await db
+    .insert(clipsTable)
+    .values({
+      youtubeUrl: repUrl, startTime, endTime, headline: title, mode: "edited", frameStyle, sourceChannel,
+      captionsEnabled, captionColor, outroEnabled, narrationScript: "",
+      jobType: "top5", segments, sourceType: "youtube", status: "pending",
+    })
+    .returning();
+
+  if (!clip) { res.status(500).json({ error: "Failed to create Top 5" }); return; }
+
+  res.status(201).json(GetClipResponse.parse(clip));
+
+  const outputFilename = `clip_${clip.id}_${Date.now()}.mp4`;
+  dispatchTop5Job(clip.id, outputFilename, title, frameStyle, sourceChannel, captionsEnabled, outroEnabled, captionColor, order, segments);
 });
 
 router.post("/clips", async (req, res): Promise<void> => {
@@ -466,6 +611,24 @@ router.post("/clips/:id/retry", async (req, res): Promise<void> => {
       clip.captionColor ?? "",
       clip.narrationScript ?? "",
       (clip.segments ?? []) as StorySegment[],
+    );
+    return;
+  }
+
+  // Top 5 retry: re-render the whole countdown from the persisted moments. Order isn't
+  // stored separately, so retries default to 5→1 (the default and by far the common case).
+  if (clip.jobType === "top5") {
+    dispatchTop5Job(
+      clip.id,
+      outputFilename,
+      clip.headline ?? "Top 5",
+      clipFrameStyle,
+      clip.sourceChannel ?? "",
+      clip.captionsEnabled ?? true,
+      clip.outroEnabled ?? true,
+      clip.captionColor ?? "",
+      "5to1",
+      (clip.segments ?? []) as Top5Segment[],
     );
     return;
   }

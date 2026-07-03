@@ -1684,6 +1684,18 @@ export interface StorySegment {
   punchInEnabled?: boolean;
 }
 
+// Pro-only: one ranked moment of a TOP 5 countdown (jobType "top5"). Superset of
+// StorySegment — each moment carries its own `rank` (5→1), an optional per-moment
+// source `youtubeUrl` (multi-source top-5s pull each rank from a different video;
+// empty ⇒ single-source, the route fills it from the job URL), the `sourceChannel`
+// for its "Credit:" line, and one spoken countdown `narrationLine` ("Number five: …").
+export interface Top5Segment extends StorySegment {
+  rank: number;
+  youtubeUrl?: string;
+  sourceChannel?: string;
+  narrationLine?: string;
+}
+
 /**
  * Transcribes `filePath` with whisper.cpp and burns animated karaoke captions
  * into it in place. Faithful copy of processClip's caption step, run once over the
@@ -1934,6 +1946,172 @@ export async function processStory(
       }
     } catch (cleanupErr) {
       logger.warn({ cleanupErr, tmpId }, "Failed to clean up story temp files");
+    }
+  }
+}
+
+/**
+ * Renders a TOP 5 countdown: a title card, then each ranked moment composited (via
+ * processClip, composite-only) with a #5→#1 rank badge burned on, all stitched into
+ * one video, captioned once, then given a countdown voiceover ("Number five: …").
+ *
+ * Mirrors processStory's memory-safe sequential structure. Two differences from a
+ * story: (a) each moment can come from its OWN source URL (multi-source), and (b) the
+ * per-moment badge pass re-encodes every part to identical params (canvas/fps/pix_fmt/
+ * audio), so parts from different sources still concat with a plain stream copy.
+ */
+export async function processTop5(
+  outputFilename: string,
+  title: string,
+  channelHandle: string,
+  clipId: number,
+  frameStyle: "standard" | "immersive",
+  sourceChannel: string,
+  captionsEnabled: boolean,
+  outroEnabled: boolean,
+  captionColor: string,
+  order: "5to1" | "1to5",
+  segments: Top5Segment[]
+): Promise<void> {
+  const outputDir = getOutputDir();
+  const finalOutputPath = path.join(outputDir, outputFilename);
+  const updateProgress = makeProgressUpdater(clipId);
+  const tmpId = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+
+  // Play order: default 5→1 (best/most-agreed moment last, as the finale).
+  const ordered = [...segments].sort((a, b) =>
+    order === "1to5" ? a.rank - b.rank : b.rank - a.rank
+  );
+  if (ordered.length < 2) throw new Error("A Top 5 needs at least 2 moments.");
+  for (const s of ordered) {
+    if (!s.youtubeUrl || !s.youtubeUrl.trim()) {
+      throw new Error(`Moment #${s.rank} is missing a source video URL.`);
+    }
+  }
+
+  const canvasW = 1080, canvasH = 1920, fps = 30;
+  const font = findFont();
+  const titleDur = 2.6;
+
+  // parts[0] = title card; parts[i+1] = badged moment file for ordered[i]. Kept in
+  // play order so the concat list and the voiceover timeline line up.
+  const parts: string[] = [];
+  try {
+    await updateProgress(2, true);
+
+    // 1) Title card — black canvas, "TOP 5" over the wrapped topic, silent audio.
+    //    Encoded to the SAME params as the moment parts so the concat seam is clean.
+    {
+      const subLines = wrapText(title.toUpperCase(), 18).slice(0, 3);
+      const draw = [
+        `drawtext=fontfile='${font}':text='TOP 5':fontsize=210:fontcolor=white:borderw=8:bordercolor=black:x=(w-text_w)/2:y=560`,
+        ...subLines.map((ln, i) =>
+          `drawtext=fontfile='${font}':text='${escapeDrawtext(ln)}':fontsize=78:fontcolor=0xF5C518:borderw=5:bordercolor=black:x=(w-text_w)/2:y=${880 + i * 98}`
+        ),
+      ].join(",");
+      const titleCard = path.join(outputDir, `top5_${clipId}_title_${tmpId}.mp4`);
+      await spawnProcess("ffmpeg", [
+        "-y",
+        "-f", "lavfi", "-i", `color=c=black:s=${canvasW}x${canvasH}:d=${titleDur}:r=${fps}`,
+        "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+        "-vf", draw, "-t", String(titleDur),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "14", "-pix_fmt", "yuv420p", "-r", String(fps),
+        "-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-ac", "2",
+        "-movflags", "+faststart", titleCard,
+      ], 120_000, () => {}, RENDER_STALL_MS, "render");
+      if (!fs.existsSync(titleCard)) throw new Error("Top 5: title card render failed");
+      parts.push(titleCard);
+    }
+    await updateProgress(6, true);
+
+    // 2) Each moment: composite via processClip (clipId=0 → composite only, captions
+    //    off; captions run once at the end). The outro/subscribe card rides the LAST
+    //    played moment. Then burn the rank badge + normalize encode for a clean concat.
+    for (let i = 0; i < ordered.length; i++) {
+      const seg = ordered[i]!;
+      const isLast = i === ordered.length - 1;
+      const rawFile = `top5_${clipId}_seg_${i}_${tmpId}.mp4`;
+      logger.info({ clipId, moment: i + 1, of: ordered.length, rank: seg.rank }, "Rendering Top 5 moment");
+      await processClip(
+        seg.youtubeUrl!, seg.startTime, seg.endTime, seg.headline ?? "",
+        rawFile, "edited", channelHandle, 0, undefined, frameStyle, seg.sourceChannel || sourceChannel,
+        false, isLast && outroEnabled, false, "",
+        seg.punchInEnabled ?? false, seg.zoomMoments ?? "", "", "hook", ""
+      );
+      const rawPath = path.join(outputDir, rawFile);
+      if (!fs.existsSync(rawPath)) throw new Error(`Top 5: moment #${seg.rank} produced no file`);
+
+      const badgedPath = path.join(outputDir, `top5_${clipId}_badge_${i}_${tmpId}.mp4`);
+      const badge = `drawtext=fontfile='${font}':text='#${seg.rank}':fontsize=170:fontcolor=white:borderw=8:bordercolor=black:box=1:boxcolor=black@0.45:boxborderw=28:x=64:y=210`;
+      await spawnProcess("ffmpeg", [
+        "-y", "-i", rawPath, "-vf", badge,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p", "-r", String(fps),
+        "-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-ac", "2",
+        "-movflags", "+faststart", badgedPath,
+      ], 300_000, () => {}, RENDER_STALL_MS, "render");
+      try { fs.existsSync(rawPath) && fs.unlinkSync(rawPath); } catch { /* ignore */ }
+      if (!fs.existsSync(badgedPath)) throw new Error(`Top 5: badge pass failed for moment #${seg.rank}`);
+      parts.push(badgedPath);
+      await updateProgress(6 + ((i + 1) / ordered.length) * 55, true);
+    }
+
+    // 3) Concat — every part shares identical encode params, so stream-copy is safe.
+    const listPath = path.join(outputDir, `top5_${clipId}_list_${tmpId}.txt`);
+    fs.writeFileSync(listPath, parts.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join("\n") + "\n");
+    const stitchedPath = path.join(outputDir, `top5_${clipId}_stitched_${tmpId}.mp4`);
+    await spawnProcess("ffmpeg", [
+      "-y", "-f", "concat", "-safe", "0", "-i", listPath,
+      "-c", "copy", "-movflags", "+faststart", stitchedPath,
+    ], 300_000, () => {}, RENDER_STALL_MS, "render");
+    if (!fs.existsSync(stitchedPath)) throw new Error("Top 5 concat produced no output");
+    fs.renameSync(stitchedPath, finalOutputPath);
+    await updateProgress(68, true);
+
+    const totalDuration = (await probeContentDuration(finalOutputPath)) || 0;
+    logger.info({ clipId, totalDuration, moments: ordered.length }, "Top 5 stitched");
+
+    // 4) Thumbnail (non-fatal)
+    try {
+      const thumbPath = path.join(outputDir, `clip_${clipId}_thumb.jpg`);
+      await spawnProcess("ffmpeg", ["-y", "-i", finalOutputPath, "-vf", "thumbnail=300", "-frames:v", "1", thumbPath], 60000, () => {});
+    } catch (thumbErr) {
+      logger.warn({ thumbErr }, "Top 5 thumbnail failed (non-fatal)");
+    }
+
+    // 5) Captions once over the whole stitched countdown.
+    if (captionsEnabled && totalDuration > 0) {
+      await burnCaptionsOnFile(clipId, finalOutputPath, totalDuration, outroEnabled, captionColor);
+    }
+    await updateProgress(85, true);
+
+    // 6) Countdown voiceover — one narration line per moment, placed at that moment's
+    //    START on the stitched timeline (after the title card + earlier moments).
+    //    Reuses the story narration mixer (Piper TTS + loudnorm).
+    const narrLines: string[] = [];
+    let offset = titleDur;
+    for (let i = 0; i < ordered.length; i++) {
+      const seg = ordered[i]!;
+      const line = (seg.narrationLine ?? "").trim();
+      if (line) narrLines.push(`${Math.round(offset + 0.25)} | ${line}`);
+      offset += (await probeContentDuration(parts[i + 1]!)) || 0;
+    }
+    const narrationScript = narrLines.join("\n");
+    if (narrationScript && totalDuration > 0) {
+      await mixNarrationOnFile(clipId, finalOutputPath, totalDuration, outroEnabled, narrationScript);
+    }
+    await updateProgress(99, true);
+    logger.info({ finalOutputPath }, "Top 5 processing complete");
+  } finally {
+    // Clean up the title card + per-moment parts + list + any leftover top5 temp files.
+    try {
+      for (const f of parts) { try { fs.existsSync(f) && fs.unlinkSync(f); } catch { /* ignore */ } }
+      const leftovers = fs.readdirSync(outputDir).filter((f) => f.includes(tmpId));
+      for (const f of leftovers) {
+        const p = path.join(outputDir, f);
+        try { fs.existsSync(p) && fs.unlinkSync(p); } catch { /* ignore */ }
+      }
+    } catch (cleanupErr) {
+      logger.warn({ cleanupErr, tmpId }, "Failed to clean up Top 5 temp files");
     }
   }
 }

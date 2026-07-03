@@ -35,6 +35,7 @@ import {
   Sparkles,
   Film,
   Trash2,
+  Trophy,
 } from "lucide-react";
 
 const MAX_CLIPS = 10;
@@ -92,12 +93,37 @@ const defaultClip = {
   narrationScript: "",
 };
 
-type SourceTab = "youtube" | "local" | "story";
+type SourceTab = "youtube" | "local" | "story" | "top5";
 
 interface StorySeg {
   startTime: string;
   endTime: string;
   headline: string;
+}
+
+interface Top5Seg {
+  rank: number;
+  youtubeUrl: string;
+  startTime: string;
+  endTime: string;
+  sourceChannel: string;
+  headline: string;
+  narrationLine: string;
+  verify: { ok: boolean; message: string | null } | null;
+}
+
+// Normalises a "M:SS" / "MM:SS" / "H:MM:SS" timestamp to zero-padded HH:MM:SS.
+function padHMS(t: string): string {
+  const parts = t.split(":");
+  while (parts.length < 3) parts.unshift("0");
+  return parts.slice(-3).map((p) => p.padStart(2, "0")).join(":");
+}
+
+function defaultTop5(): Top5Seg[] {
+  return [5, 4, 3, 2, 1].map((rank) => ({
+    rank, youtubeUrl: "", startTime: "00:00:00", endTime: "00:00:12",
+    sourceChannel: "", headline: "", narrationLine: "", verify: null,
+  }));
 }
 
 interface LocalForm {
@@ -417,6 +443,19 @@ export default function Home() {
   const [storyCaptions, setStoryCaptions] = useState(true);
   const [storyOutro, setStoryOutro] = useState(true);
   const [storySubmitting, setStorySubmitting] = useState(false);
+
+  // ----- Top 5 mode state -----
+  const [t5Topic, setT5Topic] = useState("");
+  const [t5MultiSource, setT5MultiSource] = useState(true);
+  const [t5Url, setT5Url] = useState("");
+  const [t5Creator, setT5Creator] = useState("");
+  const [t5Segments, setT5Segments] = useState<Top5Seg[]>(defaultTop5);
+  const [t5Paste, setT5Paste] = useState("");
+  const [t5Captions, setT5Captions] = useState(true);
+  const [t5Outro, setT5Outro] = useState(true);
+  const [t5Order, setT5Order] = useState<"5to1" | "1to5">("5to1");
+  const [t5Verifying, setT5Verifying] = useState(false);
+  const [t5Submitting, setT5Submitting] = useState(false);
 
   const [, navigate] = useLocation();
   const isSubmitting = form.formState.isSubmitting;
@@ -805,6 +844,201 @@ export default function Home() {
     }
   }
 
+  /* ---------- Top 5 mode ---------- */
+
+  // Research brief for Gemini. Research is the make-or-break of these videos, so this is
+  // a full brief (evidence → rubric → final 5 + alternates), not just a format spec.
+  async function copyTop5Prompt() {
+    const topic = t5Topic.trim() || "<your topic — e.g. Top 5 craziest F1 crashes ever>";
+    const single = !t5MultiSource;
+    const sourceRule = single
+      ? `ALL five moments are inside THIS ONE video: ${t5Url.trim() || "<paste the source video URL first>"}\n  Only use timestamps within THAT video — do not reference any other video.`
+      : `Use ONLY real, public YouTube videos that actually contain the moment. NEVER invent a URL, channel, or video. If unsure a video is real & public, drop it and pick another.`;
+    const outputBlock = single
+      ? `TITLE: <the video's title>\nMOMENTS:\n5 | HH:MM:SS - HH:MM:SS | <channel> | <headline> | Number five: <narration> | why: <reason>\n4 | ...\n3 | ...\n2 | ...\n1 | HH:MM:SS - HH:MM:SS | <channel> | <headline> | Number one: <narration> | why: <reason>`
+      : `TITLE: <the video's title>\nMOMENTS:\n5 | <youtube url> | HH:MM:SS - HH:MM:SS | <channel> | <headline> | Number five: <narration> | why: <reason>\n4 | ...\n3 | ...\n2 | ...\n1 | <youtube url> | HH:MM:SS - HH:MM:SS | <channel> | <headline> | Number one: <narration> | why: <reason>\nALTERNATES:\n<youtube url> | HH:MM:SS - HH:MM:SS | <channel> | <what it is>   (2-3 backups if a video above is unavailable)`;
+    const prompt =
+`ROLE: You are a world-class YouTube compilation researcher building the DEFINITIVE "Top 5" countdown for the topic below. The PICKS are everything — a great edit can't save weak moments — so base every choice on real evidence, not memory.
+
+TOPIC: ${topic}
+
+USE YOUR TOOLS: search the web / run deep research. Judge candidates using existing "best of / top 10" lists & articles, view counts, other popular compilations, Reddit/forum/comment consensus, and official highlight reels.
+
+STEP 1 (internal): gather 12-20 candidate moments; note how iconic each is + where the clip lives.
+STEP 2 (internal): rank by — Notoriety (instantly recognizable?) · Peak intensity (shock/awe/hype/drama/laughter) · Consensus (do sources/community agree?) · Clean source (real public video that clearly shows it) · Variety (5 distinct clips).
+STEP 3: pick the FINAL 5, ordered 5 → 1, best/most-agreed moment as #1 (the finale).
+
+HARD RULES:
+- ${sourceRule}
+- Timestamp = best estimate, ABSOLUTE HH:MM:SS - HH:MM:SS, 6-15s, tight on the moment (I verify & fine-tune every one — close is fine, wild guesses are not).
+- HEADLINE: punchy 4-7 word on-screen title.
+- NARRATION: one line starting with the rank ("Number five: ..."), under 12 words, hype building to #1.
+- After each pick add "why:" — one honest line on why it ranks there.
+
+OUTPUT — return EXACTLY this and nothing else (fields separated by " | "):
+${outputBlock}`;
+    const ok = await copyTextToClipboard(prompt);
+    toast(ok
+      ? { title: "Research prompt copied", description: "Run it in Gemini 2.5 Pro · Deep Research, then paste its reply below." }
+      : { title: "Copy failed", description: "Couldn't access the clipboard.", variant: "destructive" });
+  }
+
+  // Parses Gemini's reply. Strips zero-width chars (Gemini injects them on section headers),
+  // reads TITLE + the MOMENTS block (ignores ALTERNATES), and tolerates the single-source
+  // variant where the URL field is absent by locating fields by shape, not position.
+  function applyTop5Paste() {
+    const text = t5Paste.replace(/[​‌‍﻿⁠]/g, "");
+    const titleMatch = text.match(/^\s*TITLE\s*:\s*(.+)$/im);
+    if (titleMatch && titleMatch[1].trim() && !t5Topic.trim()) {
+      setT5Topic(titleMatch[1].trim().slice(0, 120));
+    }
+    let body = text;
+    const altIdx = body.search(/ALTERNATES\s*:/i);
+    if (altIdx >= 0) body = body.slice(0, altIdx);
+
+    const timeRe = /(\d{1,2}:\d{1,2}(?::\d{1,2})?)\s*(?:-|–|—|to|→)\s*(\d{1,2}:\d{1,2}(?::\d{1,2})?)/;
+    const segs: Top5Seg[] = [];
+    for (const rawLine of body.split(/\r?\n/)) {
+      const m = rawLine.trim().match(/^(\d{1,2})\s*\|(.+)$/);
+      if (!m) continue;
+      const rank = Number(m[1]);
+      if (!Number.isFinite(rank) || rank < 1) continue;
+      const fields = m[2].split("|").map((f) => f.trim()).filter((f) => f.length > 0);
+      const timeField = fields.find((f) => timeRe.test(f));
+      if (!timeField) continue;
+      const tm = timeField.match(timeRe)!;
+      const urlField = fields.find((f) => /^https?:\/\//i.test(f)) ?? "";
+      const rest = fields.filter((f) => f !== urlField && f !== timeField && !/^why\s*:/i.test(f));
+      segs.push({
+        rank,
+        youtubeUrl: urlField,
+        startTime: padHMS(tm[1]),
+        endTime: padHMS(tm[2]),
+        sourceChannel: (rest[0] ?? "").slice(0, 80),
+        headline: (rest[1] ?? "").slice(0, 120),
+        narrationLine: (rest[2] ?? "").replace(/\s*\|?\s*why\s*:.*$/i, "").trim().slice(0, 200),
+        verify: null,
+      });
+    }
+    if (segs.length < 2) {
+      toast({ title: "Couldn't read the moments", description: "Paste Gemini's MOMENTS lines like  5 | url | 00:00:22 - 00:00:35 | Channel | Headline | Number five: …", variant: "destructive" });
+      return;
+    }
+    segs.sort((a, b) => b.rank - a.rank);
+    if (segs.some((s) => s.youtubeUrl)) setT5MultiSource(true);
+    setT5Segments(segs);
+    setT5Paste("");
+    toast({ title: `${segs.length} moments loaded`, description: "Review, Verify timestamps, then Enqueue." });
+  }
+
+  function updateT5Seg(i: number, patch: Partial<Top5Seg>) {
+    setT5Segments((prev) => prev.map((s, idx) => {
+      if (idx !== i) return s;
+      const next = { ...s, ...patch };
+      // Editing time or URL invalidates a prior verify result.
+      if (patch.startTime !== undefined || patch.endTime !== undefined || patch.youtubeUrl !== undefined) next.verify = null;
+      return next;
+    }));
+  }
+
+  async function verifyTop5() {
+    if (!t5MultiSource && !/(youtube\.com|youtu\.be)/.test(t5Url)) {
+      toast({ title: "Add the source URL first", variant: "destructive" });
+      return;
+    }
+    const payload = t5Segments
+      .filter((s) => /^\d{2}:\d{2}:\d{2}$/.test(s.startTime) && /^\d{2}:\d{2}:\d{2}$/.test(s.endTime))
+      .map((s) => ({ rank: s.rank, youtubeUrl: t5MultiSource ? s.youtubeUrl : t5Url, startTime: s.startTime, endTime: s.endTime }));
+    if (payload.length === 0) {
+      toast({ title: "Nothing to verify", description: "Add valid in/out times first.", variant: "destructive" });
+      return;
+    }
+    setT5Verifying(true);
+    try {
+      const r = await fetch(`${API_BASE}/api/clips/top5/verify`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ youtubeUrl: t5MultiSource ? "" : t5Url, segments: payload }),
+      });
+      const data = (await r.json()) as { results?: { rank: number; ok: boolean; message: string | null }[]; error?: string };
+      if (!r.ok) throw new Error(data.error ?? "Verify failed");
+      const byRank = new Map((data.results ?? []).map((x) => [x.rank, x]));
+      setT5Segments((prev) => prev.map((s) => {
+        const v = byRank.get(s.rank);
+        return v ? { ...s, verify: { ok: v.ok, message: v.message } } : s;
+      }));
+      const bad = (data.results ?? []).filter((x) => !x.ok).length;
+      toast(bad
+        ? { title: `${bad} moment${bad > 1 ? "s" : ""} out of range`, description: "Fix the flagged timestamps, then re-verify.", variant: "destructive" }
+        : { title: "All timestamps look valid", description: "You're clear to enqueue." });
+    } catch (e) {
+      toast({ title: e instanceof Error ? e.message : "Verify failed", variant: "destructive" });
+    } finally {
+      setT5Verifying(false);
+    }
+  }
+
+  async function submitTop5() {
+    if (!t5MultiSource && !/(youtube\.com|youtu\.be)/.test(t5Url)) {
+      toast({ title: "Add a valid source URL", variant: "destructive" });
+      return;
+    }
+    const valid = t5Segments.filter((s) =>
+      /^\d{2}:\d{2}:\d{2}$/.test(s.startTime) &&
+      /^\d{2}:\d{2}:\d{2}$/.test(s.endTime) &&
+      toSecs(s.endTime) > toSecs(s.startTime) &&
+      (t5MultiSource ? /(youtube\.com|youtu\.be)/.test(s.youtubeUrl) : true)
+    );
+    if (valid.length < 2) {
+      toast({ title: "Need at least 2 complete moments", description: t5MultiSource ? "Each moment needs a URL and a valid in/out." : "Each moment needs a valid in/out.", variant: "destructive" });
+      return;
+    }
+    if (t5Segments.some((s) => s.verify && !s.verify.ok)) {
+      toast({ title: "Fix flagged timestamps first", description: "A moment is out of range — re-verify after fixing.", variant: "destructive" });
+      return;
+    }
+    setT5Submitting(true);
+    try {
+      const r = await fetch(`${API_BASE}/api/clips/top5`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: t5Topic,
+          youtubeUrl: t5MultiSource ? "" : t5Url,
+          frameStyle: wFrame,
+          sourceChannel: t5Creator,
+          captionsEnabled: t5Captions,
+          outroEnabled: t5Outro,
+          captionColor: "#FFF400",
+          order: t5Order,
+          segments: valid.map((s) => ({
+            rank: s.rank,
+            youtubeUrl: t5MultiSource ? s.youtubeUrl : t5Url,
+            startTime: s.startTime,
+            endTime: s.endTime,
+            headline: s.headline,
+            sourceChannel: s.sourceChannel,
+            narrationLine: s.narrationLine,
+          })),
+        }),
+      });
+      if (!r.ok) {
+        let msg = "Failed to create Top 5";
+        try { msg = ((await r.json()) as { error?: string }).error ?? msg; } catch { /* ignore */ }
+        throw new Error(msg);
+      }
+      queryClient.invalidateQueries({ queryKey: getListClipsQueryKey() });
+      queryClient.invalidateQueries({ queryKey: getGetClipStatsQueryKey() });
+      toast({ title: "Top 5 job enqueued", description: "It renders each moment, badges + stitches them, then narrates — watch the Timeline." });
+      setT5Segments(defaultTop5());
+      setT5Paste("");
+    } catch (e) {
+      toast({ title: e instanceof Error ? e.message : "Failed", variant: "destructive" });
+    } finally {
+      setT5Submitting(false);
+    }
+  }
+
   async function onSubmit(values: FormValues) {
     let successCount = 0;
     const failReasons: string[] = [];
@@ -980,6 +1214,7 @@ export default function Home() {
                     { value: "youtube", label: "YouTube", icon: <Youtube className="w-3.5 h-3.5" /> },
                     { value: "local", label: "Local file", icon: <Upload className="w-3.5 h-3.5" /> },
                     { value: "story", label: "Story", icon: <Film className="w-3.5 h-3.5" /> },
+                    { value: "top5", label: "Top 5", icon: <Trophy className="w-3.5 h-3.5" /> },
                   ]}
                 />
                 <Segmented
@@ -1685,6 +1920,254 @@ export default function Home() {
                         <><Loader2 className="mr-2 h-4 w-4 animate-spin" />DISPATCHING…</>
                       ) : (
                         <><Film className="mr-2 h-4 w-4" />ENQUEUE STORY</>
+                      )}
+                    </Button>
+                  </div>
+                </div>
+              )}
+
+              {sourceTab === "top5" && (
+                <div className="space-y-5">
+                  <div className="rounded-xl border border-border bg-gradient-to-b from-card to-[hsl(240_10%_5%)] p-5 space-y-4">
+                    <div>
+                      <FieldLabel>Video title / topic</FieldLabel>
+                      <Input
+                        placeholder="e.g. Top 5 Craziest F1 Crashes Ever"
+                        className="text-sm bg-background"
+                        value={t5Topic}
+                        onChange={(e) => setT5Topic(e.target.value)}
+                      />
+                    </div>
+
+                    <div className="flex flex-wrap items-end gap-3">
+                      <div>
+                        <FieldLabel>Sources</FieldLabel>
+                        <Segmented
+                          value={t5MultiSource ? "multi" : "single"}
+                          onChange={(v) => setT5MultiSource(v === "multi")}
+                          options={[
+                            { value: "multi", label: "Different videos" },
+                            { value: "single", label: "One video" },
+                          ]}
+                        />
+                      </div>
+                      <div>
+                        <FieldLabel>Countdown</FieldLabel>
+                        <Segmented
+                          value={t5Order}
+                          onChange={(v) => setT5Order(v === "1to5" ? "1to5" : "5to1")}
+                          options={[
+                            { value: "5to1", label: "5 → 1" },
+                            { value: "1to5", label: "1 → 5" },
+                          ]}
+                        />
+                      </div>
+                    </div>
+
+                    {!t5MultiSource && (
+                      <div>
+                        <FieldLabel>Source URL <span className="text-muted-foreground/40 normal-case">(all moments from this one video)</span></FieldLabel>
+                        <Input
+                          placeholder="https://youtube.com/watch?v=..."
+                          className="font-mono text-sm bg-background"
+                          value={t5Url}
+                          onChange={(e) => setT5Url(e.target.value)}
+                        />
+                      </div>
+                    )}
+
+                    <div>
+                      <FieldLabel>Channel credit <span className="text-muted-foreground/40 normal-case">(fallback "Credit:" line)</span></FieldLabel>
+                      <Input
+                        placeholder="e.g. FORMULA 1"
+                        className="font-mono text-sm bg-background"
+                        value={t5Creator}
+                        onChange={(e) => setT5Creator(e.target.value)}
+                      />
+                    </div>
+
+                    {/* Research bridge: copy prompt → Gemini Deep Research → paste back */}
+                    <div className="rounded-lg border border-primary/30 bg-primary/[0.05] p-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[10.5px] font-mono uppercase tracking-[0.1em] text-foreground flex items-center gap-1.5">
+                          <Trophy className="w-3.5 h-3.5 text-primary" /> AI Top 5 Researcher
+                          <span className="text-[8.5px] font-semibold tracking-[0.14em] text-primary border border-primary/40 rounded px-1.5 py-0.5 inline-flex items-center gap-1"><Sparkles className="w-2.5 h-2.5" />AI</span>
+                        </span>
+                        <button
+                          type="button"
+                          onClick={copyTop5Prompt}
+                          className="text-[10px] font-mono uppercase tracking-[0.08em] text-primary hover:underline flex items-center gap-1.5 shrink-0"
+                        >
+                          <ClipboardCopy className="w-3 h-3" /> Copy research prompt
+                        </button>
+                      </div>
+                      <p className="mt-2 text-[10.5px] text-muted-foreground/70 leading-relaxed">
+                        Run it in <span className="text-foreground/80">Gemini 2.5 Pro · Deep Research</span> — the research is what makes or breaks these videos.
+                      </p>
+                      <Textarea
+                        value={t5Paste}
+                        onChange={(e) => setT5Paste(e.target.value)}
+                        placeholder={"Paste Gemini's reply here (TITLE + MOMENTS + ALTERNATES)…"}
+                        className="text-sm bg-background mt-2.5 font-mono min-h-[96px]"
+                      />
+                      <button
+                        type="button"
+                        onClick={applyTop5Paste}
+                        disabled={!t5Paste.trim()}
+                        className="mt-2 w-full flex items-center justify-center gap-2 rounded-md border border-dashed border-primary/40 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-primary hover:bg-primary/10 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        <Plus className="w-3.5 h-3.5" /> Fill moments from paste
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Ranked moments */}
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="font-mono text-[11px] uppercase tracking-[0.13em] text-muted-foreground">
+                        Ranked moments <span className="text-muted-foreground/50">({t5Segments.length} · min 2)</span>
+                      </p>
+                      <button
+                        type="button"
+                        onClick={verifyTop5}
+                        disabled={t5Verifying}
+                        className="text-[10px] font-mono uppercase tracking-[0.08em] text-primary hover:underline flex items-center gap-1.5 shrink-0 disabled:opacity-40"
+                      >
+                        {t5Verifying ? <><Loader2 className="w-3 h-3 animate-spin" /> Verifying…</> : <><Eye className="w-3 h-3" /> Verify timestamps</>}
+                      </button>
+                    </div>
+
+                    {t5Segments.map((seg, index) => {
+                      const bad = !/^\d{2}:\d{2}:\d{2}$/.test(seg.startTime) || !/^\d{2}:\d{2}:\d{2}$/.test(seg.endTime) || toSecs(seg.endTime) <= toSecs(seg.startTime);
+                      return (
+                        <div key={index} className="rounded-xl border border-border bg-background/40 p-4 space-y-3">
+                          <div className="flex items-center gap-3">
+                            <span className="font-mono text-[13px] text-primary bg-primary/[0.08] border border-primary/20 min-w-[2.6rem] h-7 px-2 rounded-md grid place-items-center font-bold tabular-nums">
+                              #{seg.rank}
+                            </span>
+                            <span className="font-mono text-[10px] uppercase tracking-[0.12em]">
+                              {bad
+                                ? <span className="text-destructive">check times</span>
+                                : seg.verify
+                                  ? (seg.verify.ok
+                                      ? <span className="text-emerald-400 inline-flex items-center gap-1"><Check className="w-3 h-3" /> valid</span>
+                                      : <span className="text-destructive inline-flex items-center gap-1" title={seg.verify.message ?? ""}><X className="w-3 h-3" /> not in video</span>)
+                                  : <span className="text-muted-foreground">length {fmtDuration(seg.startTime, seg.endTime)}</span>}
+                            </span>
+                            {t5Segments.length > 2 && (
+                              <button
+                                type="button"
+                                onClick={() => setT5Segments((p) => p.filter((_, i) => i !== index))}
+                                className="ml-auto w-7 h-7 grid place-items-center rounded-md border border-border text-muted-foreground hover:text-destructive hover:border-destructive/40 hover:bg-destructive/10 transition-colors"
+                                aria-label="Remove moment"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            )}
+                          </div>
+
+                          {t5MultiSource && (
+                            <div>
+                              <FieldLabel>Source URL</FieldLabel>
+                              <Input
+                                placeholder="https://youtube.com/watch?v=..."
+                                className="font-mono text-sm bg-background"
+                                value={seg.youtubeUrl}
+                                onChange={(e) => updateT5Seg(index, { youtubeUrl: e.target.value })}
+                              />
+                            </div>
+                          )}
+
+                          <div className="grid grid-cols-2 gap-3">
+                            <div>
+                              <FieldLabel>In</FieldLabel>
+                              <Input
+                                placeholder="00:00:00"
+                                className={`font-mono text-sm bg-background ${bad ? "border-destructive/50" : ""}`}
+                                value={seg.startTime}
+                                onChange={(e) => updateT5Seg(index, { startTime: e.target.value })}
+                              />
+                            </div>
+                            <div>
+                              <FieldLabel>Out</FieldLabel>
+                              <Input
+                                placeholder="00:00:12"
+                                className={`font-mono text-sm bg-background ${bad ? "border-destructive/50" : ""}`}
+                                value={seg.endTime}
+                                onChange={(e) => updateT5Seg(index, { endTime: e.target.value })}
+                              />
+                            </div>
+                          </div>
+
+                          <div className="grid grid-cols-2 gap-3">
+                            <div>
+                              <FieldLabel>Headline</FieldLabel>
+                              <Input
+                                placeholder="On-screen title…"
+                                className="text-sm bg-background"
+                                value={seg.headline}
+                                onChange={(e) => updateT5Seg(index, { headline: e.target.value })}
+                              />
+                            </div>
+                            <div>
+                              <FieldLabel>Channel</FieldLabel>
+                              <Input
+                                placeholder="Credit channel…"
+                                className="font-mono text-sm bg-background"
+                                value={seg.sourceChannel}
+                                onChange={(e) => updateT5Seg(index, { sourceChannel: e.target.value })}
+                              />
+                            </div>
+                          </div>
+
+                          <div>
+                            <FieldLabel>Voiceover line</FieldLabel>
+                            <Input
+                              placeholder='e.g. "Number five: this rookie lost control at 200mph."'
+                              className="text-sm bg-background"
+                              value={seg.narrationLine}
+                              onChange={(e) => updateT5Seg(index, { narrationLine: e.target.value })}
+                            />
+                          </div>
+                        </div>
+                      );
+                    })}
+
+                    <button
+                      type="button"
+                      onClick={() => t5Segments.length < 10 && setT5Segments((p) => [...p, { rank: p.length ? Math.max(...p.map((s) => s.rank)) + 1 : 1, youtubeUrl: "", startTime: "00:00:00", endTime: "00:00:12", sourceChannel: "", headline: "", narrationLine: "", verify: null }])}
+                      disabled={t5Segments.length >= 10}
+                      className={`w-full flex items-center justify-center gap-2 rounded-xl border border-dashed py-3 font-mono text-[11px] uppercase tracking-[0.1em] transition-colors ${
+                        t5Segments.length >= 10
+                          ? "text-muted-foreground/30 border-border cursor-not-allowed"
+                          : "text-muted-foreground border-border hover:text-primary hover:border-primary/40"
+                      }`}
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      {t5Segments.length >= 10 ? "Max 10 moments" : `Add moment (${t5Segments.length})`}
+                    </button>
+                  </div>
+
+                  {/* Toggles + submit */}
+                  <div className="flex flex-wrap gap-2">
+                    <ToggleChip label="Captions" checked={t5Captions} onChange={setT5Captions} />
+                    <ToggleChip label="Outro card" checked={t5Outro} onChange={setT5Outro} />
+                  </div>
+
+                  <div className="flex items-center justify-between gap-4 flex-wrap pt-1">
+                    <span className="font-mono text-[11px] text-muted-foreground">
+                      Title card · rank badges · countdown VO · slow on phone
+                    </span>
+                    <Button
+                      type="button"
+                      disabled={t5Submitting}
+                      onClick={submitTop5}
+                      className="font-mono uppercase tracking-[0.13em] text-xs h-12 px-7"
+                    >
+                      {t5Submitting ? (
+                        <><Loader2 className="mr-2 h-4 w-4 animate-spin" />DISPATCHING…</>
+                      ) : (
+                        <><Trophy className="mr-2 h-4 w-4" />ENQUEUE TOP 5</>
                       )}
                     </Button>
                   </div>
