@@ -173,7 +173,7 @@ function findFont(): string {
   return CAPTION_FONTS[0]!;
 }
 
-function timeToSeconds(ts: string): number {
+export function timeToSeconds(ts: string): number {
   const parts = ts.split(":").map(Number);
   if (parts.length === 3) return parts[0]! * 3600 + parts[1]! * 60 + parts[2]!;
   if (parts.length === 2) return parts[0]! * 60 + parts[1]!;
@@ -238,11 +238,13 @@ export function formatHMS(total: number): string {
 const durationCache = new Map<string, { dur: number; at: number }>();
 const DURATION_CACHE_TTL_MS = 10 * 60_000;
 
+export type SegmentCheckReason = "ok" | "start-past-end" | "end-past-end";
+
 export async function validateSegmentWithinVideo(
   youtubeUrl: string,
   startTime: string,
   endTime: string
-): Promise<{ ok: boolean; message?: string; videoDuration?: number }> {
+): Promise<{ ok: boolean; reason?: SegmentCheckReason; message?: string; videoDuration?: number }> {
   let videoDuration = 0;
   const cached = durationCache.get(youtubeUrl);
   if (cached && Date.now() - cached.at < DURATION_CACHE_TTL_MS) {
@@ -265,14 +267,174 @@ export async function validateSegmentWithinVideo(
   if (videoDuration <= 0) return { ok: true };
 
   const startSeconds = timeToSeconds(startTime);
+  const endSeconds = timeToSeconds(endTime);
   if (startSeconds >= videoDuration) {
     return {
       ok: false,
+      reason: "start-past-end",
       videoDuration,
       message: `That timestamp doesn't exist in this video. The video is only ${formatHMS(videoDuration)} long, but the clip starts at ${startTime}. Pick a start time within ${formatHMS(videoDuration)}.`,
     };
   }
-  return { ok: true, videoDuration };
+  // End past the end still short-downloads (part of the window doesn't exist). Half-second
+  // epsilon so an exactly-at-the-end cut isn't flagged (the render clamps that harmlessly).
+  if (endSeconds > videoDuration + 0.5) {
+    return {
+      ok: false,
+      reason: "end-past-end",
+      videoDuration,
+      message: `This clip runs to ${endTime}, but the video is only ${formatHMS(videoDuration)} long. Trim the end to within ${formatHMS(videoDuration)}.`,
+    };
+  }
+  return { ok: true, reason: "ok", videoDuration };
+}
+
+/** Zero-padded HH:MM:SS from a seconds count (form fields require this exact shape). */
+function secondsToHMS(total: number): string {
+  const s = Math.max(0, Math.round(total));
+  return [Math.floor(s / 3600), Math.floor((s % 3600) / 60), s % 60]
+    .map((n) => String(n).padStart(2, "0")).join(":");
+}
+
+const transcriptCache = new Map<string, { cues: { start: number; text: string }[]; at: number }>();
+
+/** Parses WebVTT into timed cues. Strips inline karaoke tags; dedupes YouTube's rolling repeats. */
+function parseVttCues(vtt: string): { start: number; text: string }[] {
+  const cues: { start: number; text: string }[] = [];
+  const lines = vtt.split(/\r?\n/);
+  const timeRe = /(\d{1,2}:\d{2}:\d{2})[.,](\d{3})\s*-->/;
+  let lastText = "";
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i]!.match(timeRe);
+    if (!m) continue;
+    const start = timeToSeconds(m[1]!) + Number(m[2]) / 1000;
+    const txt: string[] = [];
+    for (let j = i + 1; j < lines.length && lines[j]!.trim() !== "" && !timeRe.test(lines[j]!); j++) {
+      txt.push(lines[j]!.replace(/<[^>]+>/g, "").replace(/&nbsp;/g, " ").trim());
+    }
+    const text = txt.join(" ").replace(/\s+/g, " ").trim();
+    if (!text || text === lastText) continue;
+    lastText = text;
+    cues.push({ start, text });
+  }
+  return cues;
+}
+
+/**
+ * Fetches a video's English transcript (auto-captions) via yt-dlp and parses it into timed
+ * cues, for deterministically auto-locating a moment whose Gemini timestamp is out of range.
+ * NOT an AI call — plain keyword matching downstream. Best-effort: returns [] when the video
+ * has no captions, and caches per-URL like durationCache.
+ */
+export async function fetchTranscriptCues(youtubeUrl: string): Promise<{ start: number; text: string }[]> {
+  const cached = transcriptCache.get(youtubeUrl);
+  if (cached && Date.now() - cached.at < DURATION_CACHE_TTL_MS) return cached.cues;
+  const stem = path.join(os.tmpdir(), `t5sub_${Date.now()}_${Math.random().toString(36).slice(2)}`);
+  const base = path.basename(stem);
+  const dir = path.dirname(stem);
+  let cues: { start: number; text: string }[] = [];
+  try {
+    await execFileAsync(
+      findYtDlp(),
+      ["--no-playlist", "--no-warnings", ...getCookiesArgs(),
+       "--skip-download", "--write-auto-subs", "--write-subs",
+       "--sub-langs", "en.*,en", "--sub-format", "vtt/best", "--convert-subs", "vtt",
+       "-o", stem, youtubeUrl],
+      { timeout: 60_000 }
+    );
+    const vtt = fs.readdirSync(dir).find((f) => f.startsWith(base) && f.endsWith(".vtt"));
+    if (vtt) cues = parseVttCues(fs.readFileSync(path.join(dir, vtt), "utf8"));
+  } catch {
+    cues = [];
+  } finally {
+    try { for (const f of fs.readdirSync(dir)) if (f.startsWith(base)) fs.unlinkSync(path.join(dir, f)); } catch { /* ignore */ }
+  }
+  transcriptCache.set(youtubeUrl, { cues, at: Date.now() });
+  return cues;
+}
+
+const LOCATE_STOPWORDS = new Set(
+  ("the a an and or of to in on at is are was were be been being by for with from into out over as it its his her their our your my he she they we you i this that these those number one two three four five six seven eight nine ten most best top ever goes go into very really just about after before during while when where what which who how then than more much many big huge massive crazy craziest insane amazing incredible terrifying unbelievable")
+    .split(" ")
+);
+
+/**
+ * Locates a moment inside a transcript by weighted keyword overlap. Capitalized mid-phrase
+ * tokens (driver/place names) weigh 3× — those are what actually pin a moment. Scores a ±1-cue
+ * window (spoken words often land a beat off the visual). Returns the best window of
+ * `requestedDur`, or null when nothing clears the confidence bar → caller uses the re-ask path.
+ */
+export function locateMomentInTranscript(
+  cues: { start: number; text: string }[],
+  headline: string,
+  narration: string,
+  requestedDur: number,
+  videoDuration: number
+): { startTime: string; endTime: string; confidence: number; evidence: string } | null {
+  if (cues.length === 0) return null;
+  // NAMES (drivers/places) disambiguate WHICH moment this is; TERMS are generic descriptors.
+  // Names come from the NARRATION only — it's sentence-case prose, so any capitalized non-initial
+  // word is a real proper noun (incl. surnames like "Kubica"). The HEADLINE is Title Case, so its
+  // capitals mean nothing — take it as terms only, or "Pure First Lap Carnage" would look like a
+  // pile of names and match the wrong clip (a compilation repeats "first lap" everywhere).
+  const narrTokens = narration.replace(/^\s*Number\s+\w+\s*:/i, " ").match(/[A-Za-z][A-Za-z'-]{2,}/g) ?? [];
+  const names = new Map<string, number>();
+  narrTokens.forEach((tok, idx) => {
+    const low = tok.toLowerCase();
+    if (LOCATE_STOPWORDS.has(low)) return;
+    if (idx > 0 && /^[A-Z]/.test(tok)) names.set(low, 3);
+  });
+  const terms = new Map<string, number>();
+  for (const tok of [...(headline.match(/[A-Za-z][A-Za-z'-]{2,}/g) ?? []), ...narrTokens]) {
+    const low = tok.toLowerCase();
+    if (LOCATE_STOPWORDS.has(low) || names.has(low)) continue;
+    terms.set(low, 1);
+  }
+  const total = [...names.values(), ...terms.values()].reduce((a, b) => a + b, 0);
+  if (total === 0) return null;
+  // Whole-word matching (a keyword must be its own word, not a substring — otherwise "spa"
+  // matches "Sparks" and "flip" matches "backflip", pinning the wrong cue).
+  const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const nameRes = [...names].map(([n, w]) => ({ re: new RegExp(`\\b${esc(n)}\\b`), w }));
+  const termRes = [...terms].map(([t, w]) => ({ re: new RegExp(`\\b${esc(t)}\\b`), w }));
+
+  // Full weight for a hit in THIS cue, partial credit for an adjacent one (rolling captions
+  // split a moment across cues) — so the cue that actually contains the words wins the timestamp.
+  const scoreCue = (i: number): { score: number; nameHit: boolean } => {
+    const own = cues[i]!.text.toLowerCase();
+    const neighbor = `${cues[i - 1]?.text ?? ""} ${cues[i + 1]?.text ?? ""}`.toLowerCase();
+    let score = 0, nameHit = false;
+    for (const { re, w } of nameRes) {
+      if (re.test(own)) { score += w; nameHit = true; }
+      else if (re.test(neighbor)) { score += w * 0.4; nameHit = true; }
+    }
+    for (const { re, w } of termRes) {
+      if (re.test(own)) score += w;
+      else if (re.test(neighbor)) score += w * 0.4;
+    }
+    return { score, nameHit };
+  };
+
+  // When the moment names a driver/place, only consider cues that actually mention it; otherwise
+  // fall back to best keyword coverage with a higher bar (so a nameless generic match isn't trusted).
+  let best = { score: 0, start: 0, evidence: "" };
+  for (let i = 0; i < cues.length; i++) {
+    const { score, nameHit } = scoreCue(i);
+    const eligible = names.size > 0 ? nameHit : true;
+    if (eligible && score > best.score) best = { score, start: cues[i]!.start, evidence: cues[i]!.text };
+  }
+  const confidence = best.score / total;
+  const bar = names.size > 0 ? 0 : 0.6;
+  if (best.score <= 0 || confidence <= bar) return null;
+
+  const maxStart = Math.max(0, videoDuration - requestedDur);
+  const start = Math.max(0, Math.min(best.start - 1.5, maxStart));
+  return {
+    startTime: secondsToHMS(start),
+    endTime: secondsToHMS(Math.min(videoDuration, start + requestedDur)),
+    confidence: Math.round(Math.min(1, confidence) * 100) / 100,
+    evidence: best.evidence.slice(0, 120),
+  };
 }
 
 export function parseProcessingError(raw: string): string {
@@ -822,16 +984,54 @@ function parseNarrationLines(raw: string, duration: number, outroEnabled: boolea
   return spaced.slice(0, 8);
 }
 
+// Pro-only: which Piper voice + speaking pace a job's voiceover uses. Threaded from the
+// clip row (voiceoverVoice / voiceoverSpeed) down to every Piper call. Both optional —
+// blank fields fall back to the smart per-mode default below.
+export type VoiceOpts = { voice?: string; speed?: string };
+
+// Piper voices installed on the phone (~/piper/*.onnx). An unknown name is ignored and
+// the per-mode default is used instead, so a stale/typo'd voice never breaks a render.
+const KNOWN_VOICES = new Set([
+  "en_GB-alan-medium",
+  "en_US-joe-medium",
+  "en_US-norman-medium",
+  "en_GB-northern_english_male-medium",
+  "en_US-hfc_male-medium",
+  "en_US-ryan-medium",
+  "en_US-lessac-medium",
+]);
+
+/**
+ * Resolves the Piper voice for a job. An explicit, installed voice wins; otherwise the
+ * default matches each mode's character (and the picker's defaults): Top 5 → Joe (deep,
+ * "epic countdown"), Story / full-narration → Alan (warm documentary narrator), a
+ * single-clip intro hook → Joe.
+ */
+function resolveVoice(voice: string | undefined, kind: "top5" | "story" | "script" | "hook"): string {
+  const v = (voice ?? "").trim();
+  if (v && KNOWN_VOICES.has(v)) return v;
+  if (kind === "story" || kind === "script") return "en_GB-alan-medium";
+  return "en_US-joe-medium"; // top5 + single-clip hook
+}
+
+/** Piper length_scale as a clean string: normal = "1.0", higher = slower. Clamped. */
+function resolveSpeed(speed: string | undefined): string {
+  const s = parseFloat(speed ?? "");
+  if (Number.isFinite(s) && s >= 0.7 && s <= 1.8) return s.toFixed(2);
+  return "1.0";
+}
+
 /**
  * Speaks `text` to `outWav` via the local Piper TTS script (same script the intro
- * hook uses). Resolves true only if the WAV was actually produced. Non-throwing —
- * a missing script / failed synth resolves false so the caller can skip that line.
+ * hook uses), in the given voice + pace. Resolves true only if the WAV was actually
+ * produced. Non-throwing — a missing script / failed synth resolves false so the caller
+ * can skip that line.
  */
-async function generateNarrationWav(text: string, outWav: string): Promise<boolean> {
+async function generateNarrationWav(text: string, outWav: string, voice: string, speed: string): Promise<boolean> {
   const voiceScript = path.join(os.homedir(), "myapp/scripts/generate_voiceover.sh");
   if (!fs.existsSync(voiceScript)) return false;
   await new Promise<void>((resolve) => {
-    const v = spawn("bash", [voiceScript, text, outWav], { timeout: 120_000 });
+    const v = spawn("bash", [voiceScript, text, outWav, voice, speed], { timeout: 120_000 });
     v.on("close", () => resolve());
     v.on("error", () => resolve());
   });
@@ -953,12 +1153,16 @@ export async function processClip(
   zoomMoments = "",
   captionColor = "",
   voiceoverMode: "hook" | "script" = "hook",
-  narrationScript = ""
+  narrationScript = "",
+  voiceOpts: VoiceOpts = {}
 ): Promise<void> {
   const isLocalFile = !!localFilePath;
   const ytDlp = findYtDlp();
   const outputDir = getOutputDir();
   const finalOutputPath = path.join(outputDir, outputFilename);
+  // Voice + pace for this clip's hook / full narration (resolved once).
+  const jobVoice = resolveVoice(voiceOpts.voice, voiceoverMode === "script" ? "script" : "hook");
+  const jobSpeed = resolveSpeed(voiceOpts.speed);
 
   const startSeconds = timeToSeconds(startTime);
   const endSeconds = timeToSeconds(endTime);
@@ -1502,7 +1706,7 @@ export async function processClip(
         const spoken: { start: number; end: number }[] = [];
         for (const [i, ln] of lines.entries()) {
           const wav = path.join(outputDir, `clip_${clipId}_narr_${i}.wav`);
-          if (!(await generateNarrationWav(ln.text, wav))) {
+          if (!(await generateNarrationWav(ln.text, wav, jobVoice, jobSpeed))) {
             logger.warn({ clipId, line: i }, "Narration WAV not produced — skipping this line");
             continue;
           }
@@ -1586,7 +1790,7 @@ export async function processClip(
 
         if (fs.existsSync(voiceScript)) {
           await new Promise<void>((resolve) => {
-            const v = spawn("bash", [voiceScript, voiceoverHook.trim(), hookWav], { timeout: 120_000 });
+            const v = spawn("bash", [voiceScript, voiceoverHook.trim(), hookWav, jobVoice, jobSpeed], { timeout: 120_000 });
             v.on("close", () => resolve());
             v.on("error", () => resolve());
           });
@@ -1786,7 +1990,9 @@ async function mixNarrationOnFile(
   filePath: string,
   duration: number,
   outroEnabled: boolean,
-  narrationScript: string
+  narrationScript: string,
+  voice: string,
+  speed: string
 ): Promise<void> {
   const outputDir = getOutputDir();
   try {
@@ -1795,7 +2001,7 @@ async function mixNarrationOnFile(
     const spoken: { start: number; end: number }[] = [];
     for (const [i, ln] of lines.entries()) {
       const wav = path.join(outputDir, `clip_${clipId}_snarr_${i}.wav`);
-      if (!(await generateNarrationWav(ln.text, wav))) {
+      if (!(await generateNarrationWav(ln.text, wav, voice, speed))) {
         logger.warn({ clipId, line: i }, "Story narration WAV not produced — skipping line");
         continue;
       }
@@ -1864,12 +2070,15 @@ export async function processStory(
   outroEnabled: boolean,
   captionColor: string,
   narrationScript: string,
-  segments: StorySegment[]
+  segments: StorySegment[],
+  voiceOpts: VoiceOpts = {}
 ): Promise<void> {
   const outputDir = getOutputDir();
   const finalOutputPath = path.join(outputDir, outputFilename);
   const updateProgress = makeProgressUpdater(clipId);
   const tmpId = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const storyVoice = resolveVoice(voiceOpts.voice, "story");
+  const storySpeed = resolveSpeed(voiceOpts.speed);
 
   const segs = (segments ?? []).slice(0, 10);
   if (segs.length < 2) throw new Error("A story needs at least 2 segments.");
@@ -1931,7 +2140,7 @@ export async function processStory(
 
     // 5) Bridging narration across the stitched timeline
     if (narrationScript && narrationScript.trim() && storyDuration > 0) {
-      await mixNarrationOnFile(clipId, finalOutputPath, storyDuration, outroEnabled, narrationScript);
+      await mixNarrationOnFile(clipId, finalOutputPath, storyDuration, outroEnabled, narrationScript, storyVoice, storySpeed);
     }
     await updateProgress(99, true);
     logger.info({ finalOutputPath }, "Story processing complete");
@@ -1971,12 +2180,15 @@ export async function processTop5(
   outroEnabled: boolean,
   captionColor: string,
   order: "5to1" | "1to5",
-  segments: Top5Segment[]
+  segments: Top5Segment[],
+  voiceOpts: VoiceOpts = {}
 ): Promise<void> {
   const outputDir = getOutputDir();
   const finalOutputPath = path.join(outputDir, outputFilename);
   const updateProgress = makeProgressUpdater(clipId);
   const tmpId = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const top5Voice = resolveVoice(voiceOpts.voice, "top5");
+  const top5Speed = resolveSpeed(voiceOpts.speed);
 
   // Play order: default 5→1 (best/most-agreed moment last, as the finale).
   const ordered = [...segments].sort((a, b) =>
@@ -1987,6 +2199,14 @@ export async function processTop5(
     if (!s.youtubeUrl || !s.youtubeUrl.trim()) {
       throw new Error(`Moment #${s.rank} is missing a source video URL.`);
     }
+  }
+
+  // Pre-flight: validate every moment's window before rendering anything. A hallucinated
+  // timestamp then fails in seconds (durations are cached from the verify step) instead of
+  // after ~15 min of composites, and the message names the exact moment so a Retry is targeted.
+  for (const s of ordered) {
+    const check = await validateSegmentWithinVideo(s.youtubeUrl!, s.startTime, s.endTime);
+    if (!check.ok) throw new Error(`Moment #${s.rank}: ${check.message}`);
   }
 
   const canvasW = 1080, canvasH = 1920, fps = 30;
@@ -2032,12 +2252,17 @@ export async function processTop5(
       const isLast = i === ordered.length - 1;
       const rawFile = `top5_${clipId}_seg_${i}_${tmpId}.mp4`;
       logger.info({ clipId, moment: i + 1, of: ordered.length, rank: seg.rank }, "Rendering Top 5 moment");
-      await processClip(
-        seg.youtubeUrl!, seg.startTime, seg.endTime, seg.headline ?? "",
-        rawFile, "edited", channelHandle, 0, undefined, frameStyle, seg.sourceChannel || sourceChannel,
-        false, isLast && outroEnabled, false, "",
-        seg.punchInEnabled ?? false, seg.zoomMoments ?? "", "", "hook", ""
-      );
+      try {
+        await processClip(
+          seg.youtubeUrl!, seg.startTime, seg.endTime, seg.headline ?? "",
+          rawFile, "edited", channelHandle, 0, undefined, frameStyle, seg.sourceChannel || sourceChannel,
+          false, isLast && outroEnabled, false, "",
+          seg.punchInEnabled ?? false, seg.zoomMoments ?? "", "", "hook", ""
+        );
+      } catch (err) {
+        // Clean the inner yt-dlp/ffmpeg error, then tag which moment failed so a Retry is targeted.
+        throw new Error(`Moment #${seg.rank}: ${parseProcessingError(err instanceof Error ? err.message : String(err))}`);
+      }
       const rawPath = path.join(outputDir, rawFile);
       if (!fs.existsSync(rawPath)) throw new Error(`Top 5: moment #${seg.rank} produced no file`);
 
@@ -2097,7 +2322,7 @@ export async function processTop5(
     }
     const narrationScript = narrLines.join("\n");
     if (narrationScript && totalDuration > 0) {
-      await mixNarrationOnFile(clipId, finalOutputPath, totalDuration, outroEnabled, narrationScript);
+      await mixNarrationOnFile(clipId, finalOutputPath, totalDuration, outroEnabled, narrationScript, top5Voice, top5Speed);
     }
     await updateProgress(99, true);
     logger.info({ finalOutputPath }, "Top 5 processing complete");

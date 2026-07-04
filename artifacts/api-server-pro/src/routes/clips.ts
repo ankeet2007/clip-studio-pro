@@ -12,7 +12,7 @@ import {
   GetClipResponse,
   GetClipStatsResponse,
 } from "@workspace/api-zod";
-import { processClip, processStory, processTop5, enqueueClipJob, getOutputFilePath, getUploadsDir, normalizeYoutubeUrl, parseProcessingError, validateSegmentWithinVideo, type StorySegment, type Top5Segment } from "../lib/clipProcessor";
+import { processClip, processStory, processTop5, enqueueClipJob, getOutputFilePath, getUploadsDir, normalizeYoutubeUrl, parseProcessingError, validateSegmentWithinVideo, fetchTranscriptCues, locateMomentInTranscript, timeToSeconds, type StorySegment, type Top5Segment } from "../lib/clipProcessor";
 import { logger } from "../lib/logger";
 import { readSettings } from "../lib/settings";
 
@@ -65,7 +65,9 @@ function dispatchClipJob(
   zoomMoments = "",
   captionColor = "",
   voiceoverMode: "hook" | "script" = "hook",
-  narrationScript = ""
+  narrationScript = "",
+  voiceoverVoice = "",
+  voiceoverSpeed = ""
 ) {
   const { channelHandle } = readSettings();
 
@@ -81,7 +83,7 @@ function dispatchClipJob(
       logger.error({ err, clipId }, "Failed to mark clip as processing");
     }
 
-    await processClip(youtubeUrl, startTime, endTime, headline, outputFilename, mode, channelHandle, clipId, localFilePath, frameStyle, sourceChannel, captionsEnabled, outroEnabled, voiceoverEnabled, voiceoverHook, punchInEnabled, zoomMoments, captionColor, voiceoverMode, narrationScript)
+    await processClip(youtubeUrl, startTime, endTime, headline, outputFilename, mode, channelHandle, clipId, localFilePath, frameStyle, sourceChannel, captionsEnabled, outroEnabled, voiceoverEnabled, voiceoverHook, punchInEnabled, zoomMoments, captionColor, voiceoverMode, narrationScript, { voice: voiceoverVoice, speed: voiceoverSpeed })
       .then(async () => {
         await db
           .update(clipsTable)
@@ -113,7 +115,9 @@ function dispatchStoryJob(
   outroEnabled: boolean,
   captionColor: string,
   narrationScript: string,
-  segments: StorySegment[]
+  segments: StorySegment[],
+  voiceoverVoice = "",
+  voiceoverSpeed = ""
 ) {
   const { channelHandle } = readSettings();
   enqueueClipJob(async () => {
@@ -122,7 +126,7 @@ function dispatchStoryJob(
     } catch (err: unknown) {
       logger.error({ err, clipId }, "Failed to mark story as processing");
     }
-    await processStory(youtubeUrl, outputFilename, channelHandle, clipId, frameStyle, sourceChannel, captionsEnabled, outroEnabled, captionColor, narrationScript, segments)
+    await processStory(youtubeUrl, outputFilename, channelHandle, clipId, frameStyle, sourceChannel, captionsEnabled, outroEnabled, captionColor, narrationScript, segments, { voice: voiceoverVoice, speed: voiceoverSpeed })
       .then(async () => {
         await db.update(clipsTable).set({ status: "done", progress: 100, outputFilename }).where(eq(clipsTable.id, clipId));
       })
@@ -168,6 +172,7 @@ router.post("/clips/story", async (req, res): Promise<void> => {
     youtubeUrl?: string; frameStyle?: string; sourceChannel?: string;
     captionsEnabled?: boolean; outroEnabled?: boolean; captionColor?: string;
     narrationScript?: string; segments?: unknown;
+    voiceoverVoice?: string; voiceoverSpeed?: string;
   };
   const rawUrl = (body.youtubeUrl ?? "").trim();
   if (!rawUrl) { res.status(400).json({ error: "A source YouTube URL is required" }); return; }
@@ -185,6 +190,8 @@ router.post("/clips/story", async (req, res): Promise<void> => {
   const outroEnabled = body.outroEnabled ?? true;
   const captionColor = body.captionColor ?? "";
   const narrationScript = body.narrationScript ?? "";
+  const voiceoverVoice = body.voiceoverVoice ?? "";
+  const voiceoverSpeed = body.voiceoverSpeed ?? "";
 
   // Representative fields so a story row displays sensibly in the timeline/detail.
   const headline = segments[0]!.headline?.trim() || `Story · ${segments.length} moments`;
@@ -195,7 +202,7 @@ router.post("/clips/story", async (req, res): Promise<void> => {
     .insert(clipsTable)
     .values({
       youtubeUrl, startTime, endTime, headline, mode: "edited", frameStyle, sourceChannel,
-      captionsEnabled, captionColor, outroEnabled, narrationScript,
+      captionsEnabled, captionColor, outroEnabled, narrationScript, voiceoverVoice, voiceoverSpeed,
       jobType: "story", segments, sourceType: "youtube", status: "pending",
     })
     .returning();
@@ -205,7 +212,7 @@ router.post("/clips/story", async (req, res): Promise<void> => {
   res.status(201).json(GetClipResponse.parse(clip));
 
   const outputFilename = `clip_${clip.id}_${Date.now()}.mp4`;
-  dispatchStoryJob(clip.id, youtubeUrl, outputFilename, frameStyle, sourceChannel, captionsEnabled, outroEnabled, captionColor, narrationScript, segments);
+  dispatchStoryJob(clip.id, youtubeUrl, outputFilename, frameStyle, sourceChannel, captionsEnabled, outroEnabled, captionColor, narrationScript, segments, voiceoverVoice, voiceoverSpeed);
 });
 
 /**
@@ -223,7 +230,9 @@ function dispatchTop5Job(
   outroEnabled: boolean,
   captionColor: string,
   order: "5to1" | "1to5",
-  segments: Top5Segment[]
+  segments: Top5Segment[],
+  voiceoverVoice = "",
+  voiceoverSpeed = ""
 ) {
   const { channelHandle } = readSettings();
   enqueueClipJob(async () => {
@@ -232,13 +241,16 @@ function dispatchTop5Job(
     } catch (err: unknown) {
       logger.error({ err, clipId }, "Failed to mark Top 5 as processing");
     }
-    await processTop5(outputFilename, title, channelHandle, clipId, frameStyle, sourceChannel, captionsEnabled, outroEnabled, captionColor, order, segments)
+    await processTop5(outputFilename, title, channelHandle, clipId, frameStyle, sourceChannel, captionsEnabled, outroEnabled, captionColor, order, segments, { voice: voiceoverVoice, speed: voiceoverSpeed })
       .then(async () => {
         await db.update(clipsTable).set({ status: "done", progress: 100, outputFilename }).where(eq(clipsTable.id, clipId));
       })
       .catch(async (err: unknown) => {
         const raw = err instanceof Error ? err.message : String(err);
-        const msg = parseProcessingError(raw);
+        // processTop5's per-moment / pre-flight errors are already clean, user-facing, and name the
+        // failing moment — pass them through verbatim (parseProcessingError would strip them because
+        // they can contain a URL that matches its noise filter).
+        const msg = raw.startsWith("Moment #") ? raw.slice(0, 400) : parseProcessingError(raw);
         await db.update(clipsTable).set({ status: "error", progress: 0, errorMessage: msg }).where(eq(clipsTable.id, clipId));
       });
   });
@@ -294,13 +306,23 @@ router.post("/clips/top5/verify", async (req, res): Promise<void> => {
     res.status(400).json({ error: "No valid moments to verify." });
     return;
   }
-  const results: { rank: number; ok: boolean; message: string | null; videoDuration: number | null }[] = [];
+  type Suggestion = { startTime: string; endTime: string; confidence: number; evidence: string };
+  const results: { rank: number; ok: boolean; reason: string | null; message: string | null; videoDuration: number | null; suggested: Suggestion | null }[] = [];
   for (const seg of segments) {
     try {
       const r = await validateSegmentWithinVideo(seg.youtubeUrl!, seg.startTime, seg.endTime);
-      results.push({ rank: seg.rank, ok: r.ok, message: r.message ?? null, videoDuration: r.videoDuration ?? null });
+      let suggested: Suggestion | null = null;
+      if (!r.ok && r.videoDuration && r.videoDuration > 0) {
+        // Gemini's timestamp is out of range — try to auto-locate the real one from the
+        // transcript (deterministic keyword match, no AI call). null → the UI offers a
+        // targeted "re-ask Gemini" prompt instead.
+        const cues = await fetchTranscriptCues(seg.youtubeUrl!);
+        const reqDur = Math.max(6, timeToSeconds(seg.endTime) - timeToSeconds(seg.startTime));
+        suggested = locateMomentInTranscript(cues, seg.headline ?? "", seg.narrationLine ?? "", reqDur, r.videoDuration);
+      }
+      results.push({ rank: seg.rank, ok: r.ok, reason: r.reason ?? null, message: r.message ?? null, videoDuration: r.videoDuration ?? null, suggested });
     } catch {
-      results.push({ rank: seg.rank, ok: true, message: null, videoDuration: null });
+      results.push({ rank: seg.rank, ok: true, reason: null, message: null, videoDuration: null, suggested: null });
     }
   }
   res.json({ results });
@@ -315,6 +337,7 @@ router.post("/clips/top5", async (req, res): Promise<void> => {
     title?: string; youtubeUrl?: string; frameStyle?: string; sourceChannel?: string;
     captionsEnabled?: boolean; outroEnabled?: boolean; captionColor?: string;
     order?: string; segments?: unknown;
+    voiceoverVoice?: string; voiceoverSpeed?: string;
   };
   const segments = sanitizeTop5Segments(body.segments, body.youtubeUrl ?? "");
   if (segments.length < 2) {
@@ -329,6 +352,8 @@ router.post("/clips/top5", async (req, res): Promise<void> => {
   const outroEnabled = body.outroEnabled ?? true;
   const captionColor = body.captionColor ?? "";
   const order = (body.order === "1to5" ? "1to5" : "5to1") as "5to1" | "1to5";
+  const voiceoverVoice = body.voiceoverVoice ?? "";
+  const voiceoverSpeed = body.voiceoverSpeed ?? "";
 
   // Representative fields so the row displays sensibly in the timeline/detail.
   const playOrder = [...segments].sort((a, b) => (order === "1to5" ? a.rank - b.rank : b.rank - a.rank));
@@ -340,7 +365,7 @@ router.post("/clips/top5", async (req, res): Promise<void> => {
     .insert(clipsTable)
     .values({
       youtubeUrl: repUrl, startTime, endTime, headline: title, mode: "edited", frameStyle, sourceChannel,
-      captionsEnabled, captionColor, outroEnabled, narrationScript: "",
+      captionsEnabled, captionColor, outroEnabled, narrationScript: "", voiceoverVoice, voiceoverSpeed,
       jobType: "top5", segments, sourceType: "youtube", status: "pending",
     })
     .returning();
@@ -350,7 +375,7 @@ router.post("/clips/top5", async (req, res): Promise<void> => {
   res.status(201).json(GetClipResponse.parse(clip));
 
   const outputFilename = `clip_${clip.id}_${Date.now()}.mp4`;
-  dispatchTop5Job(clip.id, outputFilename, title, frameStyle, sourceChannel, captionsEnabled, outroEnabled, captionColor, order, segments);
+  dispatchTop5Job(clip.id, outputFilename, title, frameStyle, sourceChannel, captionsEnabled, outroEnabled, captionColor, order, segments, voiceoverVoice, voiceoverSpeed);
 });
 
 router.post("/clips", async (req, res): Promise<void> => {
@@ -375,6 +400,8 @@ router.post("/clips", async (req, res): Promise<void> => {
   const captionColor = (req.body as { captionColor?: string }).captionColor ?? "";
   const voiceoverMode = ((req.body as { voiceoverMode?: string }).voiceoverMode === "script" ? "script" : "hook") as "hook" | "script";
   const narrationScript = (req.body as { narrationScript?: string }).narrationScript ?? "";
+  const voiceoverVoice = (req.body as { voiceoverVoice?: string }).voiceoverVoice ?? "";
+  const voiceoverSpeed = (req.body as { voiceoverSpeed?: string }).voiceoverSpeed ?? "";
 
   // Up-front guard: reject a start time that falls past the end of the source video so the user
   // gets an immediate, clear "that timestamp doesn't exist" error instead of a frozen/failed
@@ -387,7 +414,7 @@ router.post("/clips", async (req, res): Promise<void> => {
 
   const [clip] = await db
     .insert(clipsTable)
-    .values({ youtubeUrl, startTime, endTime, headline, mode, frameStyle, sourceChannel, captionsEnabled, captionColor, voiceoverEnabled, voiceoverHook, voiceoverMode, narrationScript, punchInEnabled, zoomMoments, outroEnabled, sourceType: "youtube", status: "pending" })
+    .values({ youtubeUrl, startTime, endTime, headline, mode, frameStyle, sourceChannel, captionsEnabled, captionColor, voiceoverEnabled, voiceoverHook, voiceoverMode, narrationScript, voiceoverVoice, voiceoverSpeed, punchInEnabled, zoomMoments, outroEnabled, sourceType: "youtube", status: "pending" })
     .returning();
 
   if (!clip) {
@@ -398,7 +425,7 @@ router.post("/clips", async (req, res): Promise<void> => {
   res.status(201).json(GetClipResponse.parse(clip));
 
   const outputFilename = `clip_${clip.id}_${Date.now()}.mp4`;
-  dispatchClipJob(clip.id, youtubeUrl, startTime, endTime, headline, outputFilename, mode, frameStyle, undefined, sourceChannel, captionsEnabled, outroEnabled, voiceoverEnabled, voiceoverHook, punchInEnabled, zoomMoments, captionColor, voiceoverMode, narrationScript);
+  dispatchClipJob(clip.id, youtubeUrl, startTime, endTime, headline, outputFilename, mode, frameStyle, undefined, sourceChannel, captionsEnabled, outroEnabled, voiceoverEnabled, voiceoverHook, punchInEnabled, zoomMoments, captionColor, voiceoverMode, narrationScript, voiceoverVoice, voiceoverSpeed);
 });
 
 /**
@@ -421,6 +448,8 @@ router.post("/clips/upload", (req, res): void => {
   let voiceoverHook = "";
   let voiceoverMode: "hook" | "script" = "hook";
   let narrationScript = "";
+  let voiceoverVoice = "";
+  let voiceoverSpeed = "";
   let punchInEnabled = false;
   let zoomMoments = "";
   let outroEnabled = true;
@@ -452,6 +481,8 @@ router.post("/clips/upload", (req, res): void => {
     if (name === "voiceoverHook") voiceoverHook = value;
     if (name === "voiceoverMode" && (value === "hook" || value === "script")) voiceoverMode = value;
     if (name === "narrationScript") narrationScript = value;
+    if (name === "voiceoverVoice") voiceoverVoice = value;
+    if (name === "voiceoverSpeed") voiceoverSpeed = value;
     if (name === "punchInEnabled") punchInEnabled = value === "true";
     if (name === "zoomMoments") zoomMoments = value;
     if (name === "outroEnabled") outroEnabled = value !== "false";
@@ -512,6 +543,8 @@ router.post("/clips/upload", (req, res): void => {
             voiceoverHook,
             voiceoverMode,
             narrationScript,
+            voiceoverVoice,
+            voiceoverSpeed,
             punchInEnabled,
             zoomMoments,
             outroEnabled,
@@ -530,7 +563,7 @@ router.post("/clips/upload", (req, res): void => {
         res.status(201).json(GetClipResponse.parse(clip));
 
         const outputFilename = `clip_${clip.id}_${Date.now()}.mp4`;
-        dispatchClipJob(clip.id, null, startTime, endTime, headline, outputFilename, mode, frameStyle, savedFilePath, sourceChannel, captionsEnabled, outroEnabled, voiceoverEnabled, voiceoverHook, punchInEnabled, zoomMoments, captionColor, voiceoverMode, narrationScript);
+        dispatchClipJob(clip.id, null, startTime, endTime, headline, outputFilename, mode, frameStyle, savedFilePath, sourceChannel, captionsEnabled, outroEnabled, voiceoverEnabled, voiceoverHook, punchInEnabled, zoomMoments, captionColor, voiceoverMode, narrationScript, voiceoverVoice, voiceoverSpeed);
       } catch (err) {
         if (savedFilePath) {
           try { if (fs.existsSync(savedFilePath)) fs.unlinkSync(savedFilePath); } catch { /* ignore */ }
@@ -611,6 +644,8 @@ router.post("/clips/:id/retry", async (req, res): Promise<void> => {
       clip.captionColor ?? "",
       clip.narrationScript ?? "",
       (clip.segments ?? []) as StorySegment[],
+      clip.voiceoverVoice ?? "",
+      clip.voiceoverSpeed ?? "",
     );
     return;
   }
@@ -629,6 +664,8 @@ router.post("/clips/:id/retry", async (req, res): Promise<void> => {
       clip.captionColor ?? "",
       "5to1",
       (clip.segments ?? []) as Top5Segment[],
+      clip.voiceoverVoice ?? "",
+      clip.voiceoverSpeed ?? "",
     );
     return;
   }
@@ -657,7 +694,9 @@ router.post("/clips/:id/retry", async (req, res): Promise<void> => {
     clip.zoomMoments ?? "",
     clip.captionColor ?? "",
     (clip.voiceoverMode === "script" ? "script" : "hook"),
-    clip.narrationScript ?? ""
+    clip.narrationScript ?? "",
+    clip.voiceoverVoice ?? "",
+    clip.voiceoverSpeed ?? ""
   );
 });
 

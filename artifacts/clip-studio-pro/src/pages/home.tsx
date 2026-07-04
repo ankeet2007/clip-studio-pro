@@ -109,7 +109,12 @@ interface Top5Seg {
   sourceChannel: string;
   headline: string;
   narrationLine: string;
-  verify: { ok: boolean; message: string | null } | null;
+  verify: {
+    ok: boolean;
+    message: string | null;
+    videoDuration?: number | null;
+    suggested?: { startTime: string; endTime: string; confidence: number; evidence: string } | null;
+  } | null;
 }
 
 // Normalises a "M:SS" / "MM:SS" / "H:MM:SS" timestamp to zero-padded HH:MM:SS.
@@ -247,6 +252,64 @@ function Segmented({
           {o.label}
         </button>
       ))}
+    </div>
+  );
+}
+
+// AI voiceover voices. All are local Piper models on the phone (~/piper/*.onnx). Deep /
+// human-sounding voices are listed first; "" = let the server pick the best default for the
+// job (Top 5 → Joe, Story/Narration → Alan). Keep in sync with KNOWN_VOICES in clipProcessor.
+const VOICE_OPTIONS = [
+  { value: "", label: "Auto — best deep voice for this mode" },
+  { value: "en_GB-alan-medium", label: "Alan · British, deep & warm (narrator)" },
+  { value: "en_US-joe-medium", label: "Joe · deep American male" },
+  { value: "en_US-norman-medium", label: "Norman · mature, gravelly US" },
+  { value: "en_GB-northern_english_male-medium", label: "Northern English · deep British" },
+  { value: "en_US-hfc_male-medium", label: "HFC Male · clean, neutral US" },
+  { value: "en_US-ryan-medium", label: "Ryan · expressive (old default)" },
+  { value: "en_US-lessac-medium", label: "Lessac · neutral reference" },
+];
+
+// Speaking pace → Piper length_scale (higher = slower). Values match the preview samples.
+const SPEED_OPTIONS = [
+  { value: "1.0", label: "Normal" },
+  { value: "1.15", label: "Slightly slow" },
+  { value: "1.3", label: "Slow · dramatic" },
+];
+
+// Shared voice + pace picker. `voice`/`speed` come from the page-level state so the choice
+// applies to whichever job (clip / story / top 5) the user submits.
+function VoicePicker({
+  voice,
+  speed,
+  onVoice,
+  onSpeed,
+}: {
+  voice: string;
+  speed: string;
+  onVoice: (v: string) => void;
+  onSpeed: (v: string) => void;
+}) {
+  return (
+    <div className="mt-2.5 space-y-2">
+      <div>
+        <span className="text-[9.5px] font-mono uppercase tracking-[0.14em] text-[#b69dff] flex items-center gap-1.5 mb-1">
+          <Mic className="w-3 h-3" /> Voice
+        </span>
+        <select
+          value={voice}
+          onChange={(e) => onVoice(e.target.value)}
+          className="w-full text-sm bg-background border border-border rounded-md px-2.5 py-2 font-mono text-foreground focus:outline-none focus:ring-1 focus:ring-[#9b7bff]"
+        >
+          {VOICE_OPTIONS.map((o) => (
+            <option key={o.value} value={o.value}>{o.label}</option>
+          ))}
+        </select>
+      </div>
+      <div>
+        <span className="text-[9.5px] font-mono uppercase tracking-[0.14em] text-[#b69dff] mb-1 block">Pace</span>
+        <Segmented value={speed} onChange={onSpeed} options={SPEED_OPTIONS} />
+      </div>
     </div>
   );
 }
@@ -456,6 +519,11 @@ export default function Home() {
   const [t5Order, setT5Order] = useState<"5to1" | "1to5">("5to1");
   const [t5Verifying, setT5Verifying] = useState(false);
   const [t5Submitting, setT5Submitting] = useState(false);
+
+  // ----- Shared AI voice + pace (applies to whichever job you create) -----
+  // voVoice "" = let the server pick the best deep voice per mode; voSpeed = Piper length_scale.
+  const [voVoice, setVoVoice] = useState("");
+  const [voSpeed, setVoSpeed] = useState("1.0");
 
   const [, navigate] = useLocation();
   const isSubmitting = form.formState.isSubmitting;
@@ -825,6 +893,8 @@ export default function Home() {
           outroEnabled: storyOutro,
           captionColor: "#FFF400",
           narrationScript: storyNarration,
+          voiceoverVoice: voVoice,
+          voiceoverSpeed: voSpeed,
           segments: valid.slice(0, 10),
         }),
       });
@@ -875,6 +945,7 @@ STEP 3: pick the FINAL 5, ordered 5 → 1, best/most-agreed moment as #1 (the fi
 HARD RULES:
 - ${sourceRule}
 - Timestamp = best estimate, ABSOLUTE HH:MM:SS - HH:MM:SS, 6-15s, tight on the moment (I verify & fine-tune every one — close is fine, wild guesses are not).
+- CHECK THE LENGTH first: confirm each source video's real duration and keep BOTH times inside it — never past the end. Prefer moments a narrator names on-camera (so a wrong time can be auto-recovered from the transcript).
 - HEADLINE: punchy 4-7 word on-screen title.
 - NARRATION: one line starting with the rank ("Number five: ..."), under 12 words, hype building to #1.
 - After each pick add "why:" — one honest line on why it ranks there.
@@ -952,7 +1023,7 @@ ${outputBlock}`;
     }
     const payload = t5Segments
       .filter((s) => /^\d{2}:\d{2}:\d{2}$/.test(s.startTime) && /^\d{2}:\d{2}:\d{2}$/.test(s.endTime))
-      .map((s) => ({ rank: s.rank, youtubeUrl: t5MultiSource ? s.youtubeUrl : t5Url, startTime: s.startTime, endTime: s.endTime }));
+      .map((s) => ({ rank: s.rank, youtubeUrl: t5MultiSource ? s.youtubeUrl : t5Url, startTime: s.startTime, endTime: s.endTime, headline: s.headline, narrationLine: s.narrationLine }));
     if (payload.length === 0) {
       toast({ title: "Nothing to verify", description: "Add valid in/out times first.", variant: "destructive" });
       return;
@@ -964,12 +1035,12 @@ ${outputBlock}`;
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ youtubeUrl: t5MultiSource ? "" : t5Url, segments: payload }),
       });
-      const data = (await r.json()) as { results?: { rank: number; ok: boolean; message: string | null }[]; error?: string };
+      const data = (await r.json()) as { results?: { rank: number; ok: boolean; message: string | null; videoDuration?: number | null; suggested?: { startTime: string; endTime: string; confidence: number; evidence: string } | null }[]; error?: string };
       if (!r.ok) throw new Error(data.error ?? "Verify failed");
       const byRank = new Map((data.results ?? []).map((x) => [x.rank, x]));
       setT5Segments((prev) => prev.map((s) => {
         const v = byRank.get(s.rank);
-        return v ? { ...s, verify: { ok: v.ok, message: v.message } } : s;
+        return v ? { ...s, verify: { ok: v.ok, message: v.message, videoDuration: v.videoDuration ?? null, suggested: v.suggested ?? null } } : s;
       }));
       const bad = (data.results ?? []).filter((x) => !x.ok).length;
       toast(bad
@@ -980,6 +1051,33 @@ ${outputBlock}`;
     } finally {
       setT5Verifying(false);
     }
+  }
+
+  // Fallback when a flagged moment has no transcript match (wrong video, or no captions):
+  // copies a surgical prompt asking Gemini to fix ONLY the broken moments, armed with each
+  // video's real length so it re-locates within range (or swaps in a correct video).
+  async function reaskTop5Flagged() {
+    const flagged = t5Segments.filter((s) => s.verify && !s.verify.ok);
+    if (flagged.length === 0) {
+      toast({ title: "Nothing flagged", description: "Run Verify timestamps first.", variant: "destructive" });
+      return;
+    }
+    const blocks = flagged.map((s) => {
+      const url = (t5MultiSource ? s.youtubeUrl : t5Url) || "<video url>";
+      const len = s.verify?.videoDuration
+        ? `${Math.floor(s.verify.videoDuration / 60)}:${String(Math.round(s.verify.videoDuration % 60)).padStart(2, "0")}`
+        : "its real length";
+      return `#${s.rank} — ${s.headline || s.narrationLine || "(this moment)"}\n  video: ${url}\n  This video is only ${len} long, but you gave ${s.startTime}–${s.endTime} (out of range). WATCH it and reply with a corrected timestamp WITHIN ${len}. If the moment isn't actually in this video, replace it with a real public YouTube video that clearly shows it, and give that video's URL + timestamp.`;
+    }).join("\n\n");
+    const prompt =
+`These Top 5 moments have out-of-range timestamps. Fix ONLY these — verify each video's real length first, then reply with corrected lines in this exact format (one per moment):
+<rank> | <youtube url> | HH:MM:SS - HH:MM:SS | <channel> | <headline> | Number <n>: <narration>
+
+${blocks}`;
+    const ok = await copyTextToClipboard(prompt);
+    toast(ok
+      ? { title: "Re-ask prompt copied", description: "Run it in Gemini, paste the reply into the box above, then re-Verify." }
+      : { title: "Copy failed", description: "Couldn't access the clipboard.", variant: "destructive" });
   }
 
   async function submitTop5() {
@@ -1015,6 +1113,8 @@ ${outputBlock}`;
           outroEnabled: t5Outro,
           captionColor: "#FFF400",
           order: t5Order,
+          voiceoverVoice: voVoice,
+          voiceoverSpeed: voSpeed,
           segments: valid.map((s) => ({
             rank: s.rank,
             youtubeUrl: t5MultiSource ? s.youtubeUrl : t5Url,
@@ -1069,6 +1169,8 @@ ${outputBlock}`;
             voiceoverHook: clip.voiceoverHook ?? "",
             voiceoverMode: clip.voiceoverMode ?? "hook",
             narrationScript: clip.narrationScript ?? "",
+            voiceoverVoice: voVoice,
+            voiceoverSpeed: voSpeed,
           }),
         });
         if (!r.ok) {
@@ -1569,6 +1671,7 @@ ${outputBlock}`;
                                         {...form.register(`clips.${index}.voiceoverHook`)}
                                       />
                                     )}
+                                    <VoicePicker voice={voVoice} speed={voSpeed} onVoice={setVoVoice} onSpeed={setVoSpeed} />
                                   </>
                                 )}
                               </div>
@@ -1902,6 +2005,7 @@ ${outputBlock}`;
                     <p className="mt-2 text-[10.5px] text-muted-foreground/60 leading-relaxed">
                       Seconds count from the start of the FINAL stitched video (0 = first moment). Spoken by Piper, ducking the footage while it plays.
                     </p>
+                    <VoicePicker voice={voVoice} speed={voSpeed} onVoice={setVoVoice} onSpeed={setVoSpeed} />
                   </div>
 
                   {/* Global toggles */}
@@ -2031,14 +2135,25 @@ ${outputBlock}`;
                       <p className="font-mono text-[11px] uppercase tracking-[0.13em] text-muted-foreground">
                         Ranked moments <span className="text-muted-foreground/50">({t5Segments.length} · min 2)</span>
                       </p>
-                      <button
-                        type="button"
-                        onClick={verifyTop5}
-                        disabled={t5Verifying}
-                        className="text-[10px] font-mono uppercase tracking-[0.08em] text-primary hover:underline flex items-center gap-1.5 shrink-0 disabled:opacity-40"
-                      >
-                        {t5Verifying ? <><Loader2 className="w-3 h-3 animate-spin" /> Verifying…</> : <><Eye className="w-3 h-3" /> Verify timestamps</>}
-                      </button>
+                      <div className="flex items-center gap-3 shrink-0">
+                        {t5Segments.some((s) => s.verify && !s.verify.ok) && (
+                          <button
+                            type="button"
+                            onClick={reaskTop5Flagged}
+                            className="text-[10px] font-mono uppercase tracking-[0.08em] text-amber-400 hover:underline flex items-center gap-1.5"
+                          >
+                            <ClipboardCopy className="w-3 h-3" /> Re-ask Gemini
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={verifyTop5}
+                          disabled={t5Verifying}
+                          className="text-[10px] font-mono uppercase tracking-[0.08em] text-primary hover:underline flex items-center gap-1.5 disabled:opacity-40"
+                        >
+                          {t5Verifying ? <><Loader2 className="w-3 h-3 animate-spin" /> Verifying…</> : <><Eye className="w-3 h-3" /> Verify timestamps</>}
+                        </button>
+                      </div>
                     </div>
 
                     {t5Segments.map((seg, index) => {
@@ -2103,6 +2218,32 @@ ${outputBlock}`;
                             </div>
                           </div>
 
+                          {seg.verify && !seg.verify.ok && (
+                            <div className="rounded-lg border border-destructive/30 bg-destructive/[0.06] p-3 space-y-2">
+                              <p className="text-[11px] text-destructive leading-snug">{seg.verify.message}</p>
+                              {seg.verify.suggested ? (
+                                <div className="flex items-start gap-2">
+                                  <div className="flex-1 min-w-0">
+                                    <p className="text-[11px] text-foreground">
+                                      Transcript match: <span className="font-mono">{seg.verify.suggested.startTime}–{seg.verify.suggested.endTime}</span>
+                                      <span className="text-muted-foreground"> · {Math.round(seg.verify.suggested.confidence * 100)}% conf</span>
+                                    </p>
+                                    <p className="text-[10px] text-muted-foreground italic truncate">“{seg.verify.suggested.evidence}”</p>
+                                  </div>
+                                  <button
+                                    type="button"
+                                    onClick={() => updateT5Seg(index, { startTime: seg.verify!.suggested!.startTime, endTime: seg.verify!.suggested!.endTime })}
+                                    className="shrink-0 text-[10px] font-mono uppercase tracking-[0.08em] px-2.5 h-7 rounded-md bg-primary/15 border border-primary/30 text-primary hover:bg-primary/25 transition-colors"
+                                  >
+                                    Apply
+                                  </button>
+                                </div>
+                              ) : (
+                                <p className="text-[10px] text-muted-foreground">No transcript match — use “Re-ask Gemini for flagged moments” below, or fix the time manually.</p>
+                              )}
+                            </div>
+                          )}
+
                           <div className="grid grid-cols-2 gap-3">
                             <div>
                               <FieldLabel>Headline</FieldLabel>
@@ -2150,6 +2291,16 @@ ${outputBlock}`;
                       <Plus className="w-3.5 h-3.5" />
                       {t5Segments.length >= 10 ? "Max 10 moments" : `Add moment (${t5Segments.length})`}
                     </button>
+                  </div>
+
+                  {/* Countdown voiceover voice */}
+                  <div className="rounded-xl border border-[#9b7bff]/30 bg-gradient-to-b from-[#9b7bff]/[0.08] to-[#9b7bff]/[0.02] p-4">
+                    <div className="flex items-center gap-1.5">
+                      <Mic className="w-3.5 h-3.5 text-[#9b7bff]" />
+                      <span className="text-[10.5px] font-mono uppercase tracking-[0.1em] text-[#c9b8ff]">Countdown voiceover</span>
+                      <span className="text-[8.5px] font-semibold tracking-[0.14em] text-[#b69dff] border border-[#9b7bff]/40 rounded px-1.5 py-0.5">PRO</span>
+                    </div>
+                    <VoicePicker voice={voVoice} speed={voSpeed} onVoice={setVoVoice} onSpeed={setVoSpeed} />
                   </div>
 
                   {/* Toggles + submit */}

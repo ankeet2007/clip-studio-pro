@@ -57,6 +57,13 @@ export const clipsTable = pgTable("clips_pro", {
   // server-side like zoomMoments. Persisted so Retry re-renders the same narration.
   voiceoverMode: text("voiceover_mode").notNull().default("hook"),
   narrationScript: text("narration_script").notNull().default(""),
+  // Pro-only: which Piper voice + speaking speed drives ALL voiceover in this job.
+  // voiceoverVoice = a Piper model name (e.g. "en_GB-alan-medium"); "" ⇒ the smart
+  // per-mode default (Top 5 → Joe, Story/narration → Alan, single-clip hook → Joe).
+  // voiceoverSpeed = Piper length_scale as a string ("1.0" normal, higher = slower);
+  // "" ⇒ 1.0. Persisted so Retry re-renders with the exact same voice + pace.
+  voiceoverVoice: text("voiceover_voice").notNull().default(""),
+  voiceoverSpeed: text("voiceover_speed").notNull().default(""),
   // Pro-only: AI Auto-Zoom. punchInEnabled gates the effect; zoomMoments is the
   // Gemini-chosen "second type" list. Persisted so Retry re-renders WITH the zoom
   // (previously these rode only the create request and were lost on retry).
