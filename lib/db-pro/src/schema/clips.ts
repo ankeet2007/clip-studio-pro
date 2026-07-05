@@ -4,12 +4,18 @@ import { z } from "zod/v4";
 
 // Pro-only: one moment of a multi-clip STORY (Feature 2). A story row carries an
 // array of these in the `segments` jsonb column; timestamps are absolute in the source.
+// Match Story (jobType "matchstory") reuses this same shape but fills the optional
+// youtubeUrl/sourceChannel so each beat can come from a DIFFERENT source video
+// (multi-source montage); classic single-source Story leaves them blank.
 export interface StorySegment {
   startTime: string;
   endTime: string;
   headline?: string;
   zoomMoments?: string;
   punchInEnabled?: boolean;
+  // Match Story only: this beat's own source video + channel (blank ⇒ job-level url).
+  youtubeUrl?: string;
+  sourceChannel?: string;
 }
 
 // Pro-only: one ranked moment of a TOP 5 countdown (jobType "top5"). Superset of
@@ -77,7 +83,10 @@ export const clipsTable = pgTable("clips_pro", {
   // bridging narration (reuses narrationScript, timestamped on the STITCHED timeline).
   // "top5" = a Top 5 countdown: `segments` are Top5Segments (each with a rank + optional
   // per-moment source URL), stitched behind a title card with #5→#1 rank badges and a
-  // countdown voiceover. Persisted so Retry re-renders the whole job from the same row.
+  // countdown voiceover. "matchstory" = a research-driven multi-SOURCE narrated montage:
+  // `segments` are StorySegments each with their own youtubeUrl, stitched (no title/badges)
+  // with dense play-by-play narration on the stitched timeline (job-level narrationScript).
+  // Persisted so Retry re-renders the whole job from the same row.
   jobType: text("job_type").notNull().default("clip"),
   segments: jsonb("segments").$type<(StorySegment | Top5Segment)[]>().notNull().default([]),
 });

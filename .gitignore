@@ -17,3 +17,6 @@ SETUP-SUMMARY.md
 # Local data / large artifacts
 downloaded_clips/
 uploads/
+
+# Editor pre-edit backups
+*.prems

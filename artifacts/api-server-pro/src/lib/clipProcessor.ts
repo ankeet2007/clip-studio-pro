@@ -950,7 +950,7 @@ interface NarrationLine { sec: number; text: string; }
  * min start-gap so two lines can't begin on top of each other, and caps the count
  * (a length / OOM guard — each line is a separate Piper synth + amix input).
  */
-function parseNarrationLines(raw: string, duration: number, outroEnabled: boolean): NarrationLine[] {
+function parseNarrationLines(raw: string, duration: number, outroEnabled: boolean, maxLines = 8): NarrationLine[] {
   if (!raw || !raw.trim()) return [];
   // Latest a line may START. With the outro card on, keep it clear of the last 2s.
   const latestStart = (outroEnabled ? duration - 2.2 : duration - 0.5);
@@ -981,7 +981,7 @@ function parseNarrationLines(raw: string, duration: number, outroEnabled: boolea
     if (spaced.length && e.sec - spaced[spaced.length - 1]!.sec < 0.8) continue;
     spaced.push(e);
   }
-  return spaced.slice(0, 8);
+  return spaced.slice(0, Math.max(1, maxLines));
 }
 
 // Pro-only: which Piper voice + speaking pace a job's voiceover uses. Threaded from the
@@ -1007,10 +1007,10 @@ const KNOWN_VOICES = new Set([
  * "epic countdown"), Story / full-narration → Alan (warm documentary narrator), a
  * single-clip intro hook → Joe.
  */
-function resolveVoice(voice: string | undefined, kind: "top5" | "story" | "script" | "hook"): string {
+function resolveVoice(voice: string | undefined, kind: "top5" | "story" | "script" | "hook" | "matchstory"): string {
   const v = (voice ?? "").trim();
   if (v && KNOWN_VOICES.has(v)) return v;
-  if (kind === "story" || kind === "script") return "en_GB-alan-medium";
+  if (kind === "story" || kind === "script" || kind === "matchstory") return "en_GB-alan-medium";
   return "en_US-joe-medium"; // top5 + single-clip hook
 }
 
@@ -1154,7 +1154,12 @@ export async function processClip(
   captionColor = "",
   voiceoverMode: "hook" | "script" = "hook",
   narrationScript = "",
-  voiceOpts: VoiceOpts = {}
+  voiceOpts: VoiceOpts = {},
+  // Top-5 only: when set, a big gold "#N" rank number is burned CENTERED ABOVE the moment's
+  // title (drawn here in the composite, where the title's Y is known, so it always sits just
+  // above the headline instead of over the footage). The title's height is trimmed to leave
+  // room for it. Left undefined for normal clips/story.
+  topRank?: number
 ): Promise<void> {
   const isLocalFile = !!localFilePath;
   const ytDlp = findYtDlp();
@@ -1283,8 +1288,9 @@ export async function processClip(
         line_spacing: lineSpacing,
         max_chars: 28,
         canvas_width: canvasW,
-        // Keep the title block inside the top bar (videoY tall) with breathing room.
-        max_height: videoY - 40,
+        // Keep the title block inside the top bar (videoY tall) with breathing room. For a
+        // Top-5 moment, trim it further so the "#N" rank number has a clear strip above it.
+        max_height: videoY - 40 - (topRank ? 96 : 0),
         output_path: tmpPngPath,
       });
       const python3 = findPython();
@@ -1435,9 +1441,10 @@ export async function processClip(
       `[composedsc]drawbox=x=0:y=${videoY - 3}:w=${canvasW}:h=3:color=FF0000:t=fill[composedac]`,
       // Credit line, bottom-LEFT of the video frame. Left (not right) so it never clashes
       // with the source creator's own logo/handle, which almost always sits bottom-centre/
-      // right. Uppercase "CREDIT <name>" (no colon) matches the reference layout and avoids
-      // the drawtext colon-escaping entirely.
-      sourceChannel && sourceChannel.trim() ? `[composedac]drawtext=text='CREDIT ${sourceChannel.trim().replace(/'/g,"").toUpperCase()}':fontsize=24:fontcolor=white@0.85:x=16:y=${videoY + videoH - 36}:shadowx=1:shadowy=1:shadowcolor=black@0.9[composed]` : `[composedac]null[composed]`,
+      // right. Rendered "Credit:- <name>" (name in its natural case). The colon must be
+      // backslash-escaped INSIDE the single-quoted value or ffmpeg's filtergraph parser
+      // treats it as an option separator (verified: only text='Credit\:- x' parses).
+      sourceChannel && sourceChannel.trim() ? `[composedac]drawtext=text='Credit\\:- ${sourceChannel.trim().replace(/['\\]/g,"")}':fontsize=24:fontcolor=white@0.85:x=16:y=${videoY + videoH - 36}:shadowx=1:shadowy=1:shadowcolor=black@0.9[composed]` : `[composedac]null[composed]`,
     ];
     let prevLabel = "composed";
 
@@ -1447,6 +1454,16 @@ export async function processClip(
       filters.push(`[1:v]format=rgba[hl]`);
       filters.push(`[${prevLabel}][hl]overlay=x=0:y=${hlY}[after_hl]`);
       prevLabel = "after_hl";
+    }
+
+    // Top 5: big gold "#N" rank number, centered in the strip ABOVE the title (reserved via
+    // the trimmed headline max_height above). Drawn here — not in a later pass — because this
+    // is where the title's Y (hlY) is known, so the number always lands just above it.
+    if (topRank) {
+      filters.push(
+        `[${prevLabel}]drawtext=fontfile='${headlineFont}':text='#${topRank}':fontsize=92:fontcolor=0xF5C518:borderw=6:bordercolor=black:shadowx=2:shadowy=2:shadowcolor=black@0.8:x=(w-text_w)/2:y=(${hlY}-text_h)/2[after_rank]`
+      );
+      prevLabel = "after_rank";
     }
 
     // Channel handle watermark: small white text with shadow near the bottom of the video frame
@@ -1886,6 +1903,10 @@ export interface StorySegment {
   headline?: string;
   zoomMoments?: string;
   punchInEnabled?: boolean;
+  // Match Story only: this beat's own source video + channel (multi-source montage).
+  // Classic single-source Story leaves these blank and uses the job-level URL.
+  youtubeUrl?: string;
+  sourceChannel?: string;
 }
 
 // Pro-only: one ranked moment of a TOP 5 countdown (jobType "top5"). Superset of
@@ -1992,11 +2013,18 @@ async function mixNarrationOnFile(
   outroEnabled: boolean,
   narrationScript: string,
   voice: string,
-  speed: string
+  speed: string,
+  // How far to duck the original footage WHILE a narration line plays (0-1). Outside the
+  // spoken windows the footage returns to full volume. Top 5 passes a near-silent 0.05 so
+  // the countdown voice is crystal-clear; Story keeps the gentler 0.22 default.
+  duckVolume = 0.22,
+  // Max narration lines to keep. Story/Top 5 use the default 8; Match Story raises it for
+  // dense play-by-play. Threaded into parseNarrationLines' cap.
+  maxLines = 8
 ): Promise<void> {
   const outputDir = getOutputDir();
   try {
-    const lines = parseNarrationLines(narrationScript, duration, outroEnabled);
+    const lines = parseNarrationLines(narrationScript, duration, outroEnabled, maxLines);
     const wavPaths: string[] = [];
     const spoken: { start: number; end: number }[] = [];
     for (const [i, ln] of lines.entries()) {
@@ -2022,7 +2050,7 @@ async function mixNarrationOnFile(
       const parts: string[] = [];
       if (narrHasAudio) {
         const enableExpr = spoken.map((s) => `between(t,${s.start.toFixed(2)},${s.end.toFixed(2)})`).join("+");
-        parts.push(`[0:a]volume=enable='${enableExpr}':volume=0.22,aresample=48000,aformat=channel_layouts=stereo[base]`);
+        parts.push(`[0:a]volume=enable='${enableExpr}':volume=${duckVolume},aresample=48000,aformat=channel_layouts=stereo[base]`);
       } else {
         parts.push(`[${anullIdx}:a]aresample=48000,aformat=channel_layouts=stereo[base]`);
       }
@@ -2160,6 +2188,151 @@ export async function processStory(
 }
 
 /**
+ * Re-encodes one composited part to the canonical Match Story params (1080x1920 canvas
+ * comes from processClip; here we force fps 30 + yuv420p + aac 48k stereo). Parts of a
+ * Match Story come from DIFFERENT source videos, so processClip may emit them at
+ * different fps (it preserves the source's — 60 vs 30). Normalizing every part lets the
+ * final concat stay a plain stream copy. Same idea as the Top 5 badge pass, minus the badge.
+ */
+async function canonicalizePart(inPath: string, outPath: string): Promise<void> {
+  await spawnProcess("ffmpeg", [
+    "-y", "-i", inPath,
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p", "-r", "30",
+    "-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-ac", "2",
+    "-movflags", "+faststart", outPath,
+  ], 300_000, () => {}, RENDER_STALL_MS, "render");
+}
+
+/**
+ * Renders a MATCH STORY (jobType "matchstory"): a research-driven, MULTI-SOURCE narrated
+ * montage. Each beat is a StorySegment carrying its OWN youtubeUrl (different broadcast /
+ * fan-cam / club angles). Structure mirrors processStory (memory-safe sequential compositing
+ * → concat → captions → narration) but, like Top 5, normalizes every part to identical encode
+ * params so cross-source stream-copy concat is clean. Unlike Top 5 there is no title card and
+ * no rank badges — it opens straight on the action — and the narration is the user's free-form
+ * DENSE play-by-play on the stitched timeline (up to 16 lines instead of the usual 8).
+ */
+export async function processMatchStory(
+  outputFilename: string,
+  channelHandle: string,
+  clipId: number,
+  frameStyle: "standard" | "immersive",
+  sourceChannel: string,
+  captionsEnabled: boolean,
+  outroEnabled: boolean,
+  captionColor: string,
+  narrationScript: string,
+  segments: StorySegment[],
+  voiceOpts: VoiceOpts = {}
+): Promise<void> {
+  const outputDir = getOutputDir();
+  const finalOutputPath = path.join(outputDir, outputFilename);
+  const updateProgress = makeProgressUpdater(clipId);
+  const tmpId = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const msVoice = resolveVoice(voiceOpts.voice, "matchstory");
+  const msSpeed = resolveSpeed(voiceOpts.speed);
+
+  const segs = (segments ?? []).slice(0, 8);
+  if (segs.length < 2) throw new Error("A Match Story needs at least 2 beats.");
+  for (let i = 0; i < segs.length; i++) {
+    const s = segs[i]!;
+    if (!s.youtubeUrl || !s.youtubeUrl.trim()) {
+      throw new Error(`Beat #${i + 1} is missing a source video URL.`);
+    }
+  }
+
+  // Pre-flight every beat's window (durations are cached from the verify step) so a
+  // hallucinated timestamp fails in seconds and names the exact beat, not after ~15 min.
+  for (let i = 0; i < segs.length; i++) {
+    const s = segs[i]!;
+    const check = await validateSegmentWithinVideo(s.youtubeUrl!, s.startTime, s.endTime);
+    if (!check.ok) throw new Error(`Beat #${i + 1}: ${check.message}`);
+  }
+
+  const parts: string[] = [];
+  try {
+    await updateProgress(2, true);
+
+    // 1) Composite each beat from its OWN source (processClip, composite-only: captions/
+    //    thumb/voiceover off — those run once at the end), then normalize the encode so
+    //    parts from different sources concat cleanly. Outro rides the LAST beat.
+    for (let i = 0; i < segs.length; i++) {
+      const seg = segs[i]!;
+      const isLast = i === segs.length - 1;
+      const rawFile = `match_${clipId}_seg_${i}_${tmpId}.mp4`;
+      logger.info({ clipId, beat: i + 1, of: segs.length }, "Rendering Match Story beat");
+      try {
+        await processClip(
+          seg.youtubeUrl!, seg.startTime, seg.endTime, seg.headline ?? "",
+          rawFile, "edited", channelHandle, 0, undefined, frameStyle, seg.sourceChannel || sourceChannel,
+          false, isLast && outroEnabled, false, "",
+          seg.punchInEnabled ?? false, seg.zoomMoments ?? "", "", "hook", ""
+        );
+      } catch (err) {
+        throw new Error(`Beat #${i + 1}: ${parseProcessingError(err instanceof Error ? err.message : String(err))}`);
+      }
+      const rawPath = path.join(outputDir, rawFile);
+      if (!fs.existsSync(rawPath)) throw new Error(`Match Story: beat #${i + 1} produced no file`);
+
+      const canonPath = path.join(outputDir, `match_${clipId}_canon_${i}_${tmpId}.mp4`);
+      await canonicalizePart(rawPath, canonPath);
+      try { fs.existsSync(rawPath) && fs.unlinkSync(rawPath); } catch { /* ignore */ }
+      if (!fs.existsSync(canonPath)) throw new Error(`Match Story: normalize pass failed for beat #${i + 1}`);
+      parts.push(canonPath);
+      await updateProgress(5 + ((i + 1) / segs.length) * 60, true);
+    }
+
+    // 2) Concat — every part shares identical encode params, so stream-copy is safe.
+    const listPath = path.join(outputDir, `match_${clipId}_list_${tmpId}.txt`);
+    fs.writeFileSync(listPath, parts.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join("\n") + "\n");
+    const stitchedPath = path.join(outputDir, `match_${clipId}_stitched_${tmpId}.mp4`);
+    await spawnProcess("ffmpeg", [
+      "-y", "-f", "concat", "-safe", "0", "-i", listPath,
+      "-c", "copy", "-movflags", "+faststart", stitchedPath,
+    ], 300_000, () => {}, RENDER_STALL_MS, "render");
+    if (!fs.existsSync(stitchedPath)) throw new Error("Match Story concat produced no output");
+    fs.renameSync(stitchedPath, finalOutputPath);
+    await updateProgress(72, true);
+
+    const totalDuration = (await probeContentDuration(finalOutputPath)) || 0;
+    logger.info({ clipId, totalDuration, beats: segs.length }, "Match Story stitched");
+
+    // 3) Thumbnail (non-fatal)
+    try {
+      const thumbPath = path.join(outputDir, `clip_${clipId}_thumb.jpg`);
+      await spawnProcess("ffmpeg", ["-y", "-i", finalOutputPath, "-vf", "thumbnail=300", "-frames:v", "1", thumbPath], 60000, () => {});
+    } catch (thumbErr) {
+      logger.warn({ thumbErr }, "Match Story thumbnail failed (non-fatal)");
+    }
+
+    // 4) Captions over the whole stitched montage
+    if (captionsEnabled && totalDuration > 0) {
+      await burnCaptionsOnFile(clipId, finalOutputPath, totalDuration, outroEnabled, captionColor);
+    }
+    await updateProgress(90, true);
+
+    // 5) Dense play-by-play narration across the stitched timeline (up to 16 lines,
+    //    gentle 0.22 duck like Story so the crowd/commentary stays audible under it).
+    if (narrationScript && narrationScript.trim() && totalDuration > 0) {
+      await mixNarrationOnFile(clipId, finalOutputPath, totalDuration, outroEnabled, narrationScript, msVoice, msSpeed, 0.22, 16);
+    }
+    await updateProgress(99, true);
+    logger.info({ finalOutputPath }, "Match Story processing complete");
+  } finally {
+    try {
+      for (const f of parts) { try { fs.existsSync(f) && fs.unlinkSync(f); } catch { /* ignore */ } }
+      const leftovers = fs.readdirSync(outputDir).filter((f) => f.includes(tmpId));
+      for (const f of leftovers) {
+        const p = path.join(outputDir, f);
+        try { fs.existsSync(p) && fs.unlinkSync(p); } catch { /* ignore */ }
+      }
+    } catch (cleanupErr) {
+      logger.warn({ cleanupErr, tmpId }, "Failed to clean up Match Story temp files");
+    }
+  }
+}
+
+/**
  * Renders a TOP 5 countdown: a title card, then each ranked moment composited (via
  * processClip, composite-only) with a #5→#1 rank badge burned on, all stitched into
  * one video, captioned once, then given a countdown voiceover ("Number five: …").
@@ -2246,7 +2419,8 @@ export async function processTop5(
 
     // 2) Each moment: composite via processClip (clipId=0 → composite only, captions
     //    off; captions run once at the end). The outro/subscribe card rides the LAST
-    //    played moment. Then burn the rank badge + normalize encode for a clean concat.
+    //    played moment. The "#N" rank number is already burned above the title inside the
+    //    composite; this pass just normalizes the encode params for a clean stream-copy concat.
     for (let i = 0; i < ordered.length; i++) {
       const seg = ordered[i]!;
       const isLast = i === ordered.length - 1;
@@ -2257,7 +2431,7 @@ export async function processTop5(
           seg.youtubeUrl!, seg.startTime, seg.endTime, seg.headline ?? "",
           rawFile, "edited", channelHandle, 0, undefined, frameStyle, seg.sourceChannel || sourceChannel,
           false, isLast && outroEnabled, false, "",
-          seg.punchInEnabled ?? false, seg.zoomMoments ?? "", "", "hook", ""
+          seg.punchInEnabled ?? false, seg.zoomMoments ?? "", "", "hook", "", {}, seg.rank
         );
       } catch (err) {
         // Clean the inner yt-dlp/ffmpeg error, then tag which moment failed so a Retry is targeted.
@@ -2266,16 +2440,15 @@ export async function processTop5(
       const rawPath = path.join(outputDir, rawFile);
       if (!fs.existsSync(rawPath)) throw new Error(`Top 5: moment #${seg.rank} produced no file`);
 
-      const badgedPath = path.join(outputDir, `top5_${clipId}_badge_${i}_${tmpId}.mp4`);
-      const badge = `drawtext=fontfile='${font}':text='#${seg.rank}':fontsize=170:fontcolor=white:borderw=8:bordercolor=black:box=1:boxcolor=black@0.45:boxborderw=28:x=64:y=210`;
+      const badgedPath = path.join(outputDir, `top5_${clipId}_norm_${i}_${tmpId}.mp4`);
       await spawnProcess("ffmpeg", [
-        "-y", "-i", rawPath, "-vf", badge,
+        "-y", "-i", rawPath,
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p", "-r", String(fps),
         "-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-ac", "2",
         "-movflags", "+faststart", badgedPath,
       ], 300_000, () => {}, RENDER_STALL_MS, "render");
       try { fs.existsSync(rawPath) && fs.unlinkSync(rawPath); } catch { /* ignore */ }
-      if (!fs.existsSync(badgedPath)) throw new Error(`Top 5: badge pass failed for moment #${seg.rank}`);
+      if (!fs.existsSync(badgedPath)) throw new Error(`Top 5: normalize pass failed for moment #${seg.rank}`);
       parts.push(badgedPath);
       await updateProgress(6 + ((i + 1) / ordered.length) * 55, true);
     }
@@ -2322,7 +2495,9 @@ export async function processTop5(
     }
     const narrationScript = narrLines.join("\n");
     if (narrationScript && totalDuration > 0) {
-      await mixNarrationOnFile(clipId, finalOutputPath, totalDuration, outroEnabled, narrationScript, top5Voice, top5Speed);
+      // Duck the footage to near-silent (0.05) under the countdown voiceover so each
+      // "Number five: …" line is crystal-clear; it snaps back to full volume between lines.
+      await mixNarrationOnFile(clipId, finalOutputPath, totalDuration, outroEnabled, narrationScript, top5Voice, top5Speed, 0.05);
     }
     await updateProgress(99, true);
     logger.info({ finalOutputPath }, "Top 5 processing complete");

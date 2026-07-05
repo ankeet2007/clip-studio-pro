@@ -30,6 +30,7 @@ import {
   Check,
   Eye,
   Play,
+  Pause,
   SendHorizonal,
   ZoomIn,
   Sparkles,
@@ -93,7 +94,7 @@ const defaultClip = {
   narrationScript: "",
 };
 
-type SourceTab = "youtube" | "local" | "story" | "top5";
+type SourceTab = "youtube" | "local" | "story" | "top5" | "matchstory";
 
 interface StorySeg {
   startTime: string;
@@ -128,6 +129,30 @@ function defaultTop5(): Top5Seg[] {
   return [5, 4, 3, 2, 1].map((rank) => ({
     rank, youtubeUrl: "", startTime: "00:00:00", endTime: "00:00:12",
     sourceChannel: "", headline: "", narrationLine: "", verify: null,
+  }));
+}
+
+// One beat of a MATCH STORY: a research-driven MULTI-SOURCE narrated montage (jobType
+// "matchstory"). Like a Top 5 moment but with no rank and no per-beat narration — the
+// narration is ONE job-level dense play-by-play script. Each beat is its own source video.
+interface MatchSeg {
+  youtubeUrl: string;
+  startTime: string;
+  endTime: string;
+  sourceChannel: string;
+  headline: string;
+  verify: {
+    ok: boolean;
+    message: string | null;
+    videoDuration?: number | null;
+    suggested?: { startTime: string; endTime: string; confidence: number; evidence: string } | null;
+  } | null;
+}
+
+function defaultMatchStory(): MatchSeg[] {
+  return Array.from({ length: 4 }, () => ({
+    youtubeUrl: "", startTime: "00:00:00", endTime: "00:00:10",
+    sourceChannel: "", headline: "", verify: null,
   }));
 }
 
@@ -277,18 +302,94 @@ const SPEED_OPTIONS = [
   { value: "1.3", label: "Slow · dramatic" },
 ];
 
+// Only one voice preview plays at a time across every picker on the page. Kept at module
+// scope so starting a new audition (or leaving the page) stops whatever was playing.
+let activePreviewAudio: HTMLAudioElement | null = null;
+function stopActivePreview() {
+  if (activePreviewAudio) {
+    activePreviewAudio.pause();
+    activePreviewAudio.src = "";
+    activePreviewAudio = null;
+  }
+}
+
+// Play/stop button that auditions a Piper voice by streaming a short sample WAV from the
+// server (GET /api/voices/preview/:voice — cached after the first hit). `voice` is the model
+// to preview; for the "Auto" option we preview `autoVoice`, the default that mode would use.
+function VoicePreviewButton({ voice, autoVoice }: { voice: string; autoVoice: string }) {
+  const { toast } = useToast();
+  const [state, setState] = useState<"idle" | "loading" | "playing">("idle");
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const previewVoice = voice || autoVoice;
+
+  const stop = useCallback(() => {
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.src = "";
+      if (activePreviewAudio === audioRef.current) activePreviewAudio = null;
+      audioRef.current = null;
+    }
+    setState("idle");
+  }, []);
+
+  // Stop playback when the chosen voice changes or the picker unmounts, so we never keep
+  // playing a sample the user has moved past.
+  useEffect(() => stop, [previewVoice, stop]);
+
+  const play = useCallback(() => {
+    if (state !== "idle") { stop(); return; }
+    stopActivePreview();
+    const audio = new Audio(`${API_BASE}/api/voices/preview/${encodeURIComponent(previewVoice)}`);
+    audioRef.current = audio;
+    activePreviewAudio = audio;
+    setState("loading");
+    audio.onplaying = () => setState("playing");
+    audio.onended = () => stop();
+    audio.onerror = () => {
+      stop();
+      toast({
+        title: "Preview unavailable",
+        description: "Couldn't generate that voice sample. Try again in a moment.",
+        variant: "destructive",
+      });
+    };
+    audio.play().catch(() => { /* onerror handles the toast */ });
+  }, [state, previewVoice, stop, toast]);
+
+  return (
+    <button
+      type="button"
+      onClick={(e) => { e.preventDefault(); play(); }}
+      title={state === "idle" ? "Preview this voice" : "Stop preview"}
+      aria-label={state === "idle" ? "Preview this voice" : "Stop preview"}
+      className="shrink-0 inline-flex items-center justify-center w-9 h-9 rounded-md border border-[#9b7bff]/40 bg-[#9b7bff]/[0.08] text-[#b69dff] hover:bg-[#9b7bff]/[0.18] transition-colors"
+    >
+      {state === "loading" ? (
+        <Loader2 className="w-4 h-4 animate-spin" />
+      ) : state === "playing" ? (
+        <Pause className="w-4 h-4" />
+      ) : (
+        <Play className="w-4 h-4" />
+      )}
+    </button>
+  );
+}
+
 // Shared voice + pace picker. `voice`/`speed` come from the page-level state so the choice
-// applies to whichever job (clip / story / top 5) the user submits.
+// applies to whichever job (clip / story / top 5) the user submits. `autoVoice` is the model
+// the "Auto" option resolves to for THIS mode, so its preview matches what would be rendered.
 function VoicePicker({
   voice,
   speed,
   onVoice,
   onSpeed,
+  autoVoice = "en_US-joe-medium",
 }: {
   voice: string;
   speed: string;
   onVoice: (v: string) => void;
   onSpeed: (v: string) => void;
+  autoVoice?: string;
 }) {
   return (
     <div className="mt-2.5 space-y-2">
@@ -296,15 +397,21 @@ function VoicePicker({
         <span className="text-[9.5px] font-mono uppercase tracking-[0.14em] text-[#b69dff] flex items-center gap-1.5 mb-1">
           <Mic className="w-3 h-3" /> Voice
         </span>
-        <select
-          value={voice}
-          onChange={(e) => onVoice(e.target.value)}
-          className="w-full text-sm bg-background border border-border rounded-md px-2.5 py-2 font-mono text-foreground focus:outline-none focus:ring-1 focus:ring-[#9b7bff]"
-        >
-          {VOICE_OPTIONS.map((o) => (
-            <option key={o.value} value={o.value}>{o.label}</option>
-          ))}
-        </select>
+        <div className="flex items-center gap-2">
+          <select
+            value={voice}
+            onChange={(e) => onVoice(e.target.value)}
+            className="flex-1 min-w-0 text-sm bg-background border border-border rounded-md px-2.5 py-2 font-mono text-foreground focus:outline-none focus:ring-1 focus:ring-[#9b7bff]"
+          >
+            {VOICE_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value}>{o.label}</option>
+            ))}
+          </select>
+          <VoicePreviewButton voice={voice} autoVoice={autoVoice} />
+        </div>
+        <span className="text-[9px] font-mono text-muted-foreground/70 mt-1 block">
+          ▶ Tap play to hear this voice
+        </span>
       </div>
       <div>
         <span className="text-[9.5px] font-mono uppercase tracking-[0.14em] text-[#b69dff] mb-1 block">Pace</span>
@@ -519,6 +626,17 @@ export default function Home() {
   const [t5Order, setT5Order] = useState<"5to1" | "1to5">("5to1");
   const [t5Verifying, setT5Verifying] = useState(false);
   const [t5Submitting, setT5Submitting] = useState(false);
+
+  // ----- Match Story mode (research-driven, multi-source narrated montage) state -----
+  const [msTopic, setMsTopic] = useState("");
+  const [msCreator, setMsCreator] = useState("");
+  const [msSegments, setMsSegments] = useState<MatchSeg[]>(defaultMatchStory);
+  const [msNarration, setMsNarration] = useState("");
+  const [msPaste, setMsPaste] = useState("");
+  const [msCaptions, setMsCaptions] = useState(true);
+  const [msOutro, setMsOutro] = useState(true);
+  const [msVerifying, setMsVerifying] = useState(false);
+  const [msSubmitting, setMsSubmitting] = useState(false);
 
   // ----- Shared AI voice + pace (applies to whichever job you create) -----
   // voVoice "" = let the server pick the best deep voice per mode; voSpeed = Piper length_scale.
@@ -1143,6 +1261,234 @@ ${blocks}`;
     }
   }
 
+  /* ---------- Match Story mode (research-driven, multi-source narrated montage) ---------- */
+
+  // The research brain. Research is the make-or-break of these videos, so this is a full
+  // deep-research brief: pick the single most viral SEQUENCE of a match, source a REAL
+  // public video per beat (multi-angle encouraged), and write DENSE play-by-play narration
+  // on the stitched timeline. Same human-in-the-loop pattern — the server makes no AI call.
+  async function copyMatchStoryPrompt() {
+    const topic = msTopic.trim() || "<the match — e.g. Argentina vs Cape Verde, [date]>";
+    const prompt =
+`ROLE: You are a world-class football short-form researcher + editor. Build ONE 60-90 second vertical "story" montage about the match below, told as a single dramatic arc (hook → escalation → payoff) that holds viewers to the very end. The PICKS are everything — a great edit can't save weak moments — so base every choice on real evidence, not memory.
+
+MATCH / TOPIC: ${topic}
+${msCreator.trim() ? `Preferred channel/credit: ${msCreator.trim()}.\n` : ""}
+USE YOUR TOOLS: search the web + run deep research. Identify the single most viral, most-talked-about SEQUENCE of this match (a goal build-up, a controversy, a comeback, a red card) using highlight reels, news clips, Reddit/forum/comment consensus and view counts.
+
+SELECT 4-8 beats that, IN ORDER, tell that one sequence:
+- Beat 1 is the HOOK — the single most curiosity-grabbing moment.
+- Each following beat RAISES the stakes; save the biggest payoff for last.
+- Every beat is a self-contained 6-12s window with clear visual action (no dead air).
+- For EACH beat find a REAL, PUBLIC YouTube video that clearly shows it — DIFFERENT videos / camera angles are encouraged (broadcast, fan cam, club upload). NEVER invent a URL; if unsure a video is real & public, drop it and pick another.
+- Timestamp = best estimate, ABSOLUTE HH:MM:SS - HH:MM:SS, tight on the action. CHECK each video's real length first and keep BOTH times inside it (I verify & fine-tune every one — close is fine, wild guesses are not). Prefer moments a commentator names on-camera so a wrong time can be auto-recovered from the transcript.
+
+THEN write DENSE play-by-play NARRATION on the FINAL stitched timeline (0 = start of the stitched video, NOT any source). Hype commentator tone, ONE short line every 3-5 seconds, building tension to the payoff — advance the story, don't just describe what's on screen.
+
+OUTPUT — return EXACTLY this and nothing else (fields separated by " | "):
+TITLE: <4-7 word title>
+SEGMENTS:
+<youtube url> | HH:MM:SS - HH:MM:SS | <channel> | <headline>
+...
+NARRATION:
+SS | line
+...
+
+Example:
+TITLE: Messi's Free Kick Masterclass
+SEGMENTS:
+https://youtu.be/abcd | 00:12:04 - 00:12:12 | FIFA | The Wall Sets Up
+https://youtu.be/efgh | 00:00:31 - 00:00:41 | ESPN | He Curls It In
+NARRATION:
+0 | Ninety-third minute. One chance left.
+5 | The wall goes up — Messi stands over it.
+11 | And what he does next... is unreal.`;
+    const ok = await copyTextToClipboard(prompt);
+    toast(ok
+      ? { title: "Research prompt copied", description: "Run it in Gemini 2.5 Pro · Deep Research, then paste its reply below." }
+      : { title: "Copy failed", description: "Couldn't access the clipboard.", variant: "destructive" });
+  }
+
+  // Parses Gemini's reply: TITLE + a SEGMENTS block (URL + time located by shape, not
+  // position) + a NARRATION block. Strips the zero-width chars Gemini injects on headers.
+  function applyMatchStoryPaste() {
+    const text = msPaste.replace(/[​‌‍﻿⁠]/g, "");
+    const titleMatch = text.match(/^\s*TITLE\s*:\s*(.+)$/im);
+    if (titleMatch && titleMatch[1].trim() && !msTopic.trim()) {
+      setMsTopic(titleMatch[1].trim().slice(0, 120));
+    }
+    const nIdx = text.search(/narration\s*:/i);
+    let segBlock = nIdx >= 0 ? text.slice(0, nIdx) : text;
+    const narrBlock = nIdx >= 0 ? text.slice(nIdx).replace(/^[^\n]*\n?/, "") : "";
+    segBlock = segBlock.replace(/segments\s*:/i, "").replace(/^\s*TITLE\s*:.*$/im, "");
+
+    const timeRe = /(\d{1,2}:\d{1,2}(?::\d{1,2})?)\s*(?:-|–|—|to|→)\s*(\d{1,2}:\d{1,2}(?::\d{1,2})?)/;
+    const segs: MatchSeg[] = [];
+    for (const rawLine of segBlock.split(/\r?\n/)) {
+      if (!timeRe.test(rawLine)) continue;
+      const fields = rawLine.split("|").map((f) => f.trim()).filter((f) => f.length > 0);
+      const timeField = fields.find((f) => timeRe.test(f));
+      if (!timeField) continue;
+      const tm = timeField.match(timeRe)!;
+      const urlField = fields.find((f) => /^https?:\/\//i.test(f)) ?? "";
+      if (!urlField) continue; // Match Story beats are multi-source — each needs its own URL
+      const rest = fields.filter((f) => f !== urlField && f !== timeField);
+      segs.push({
+        youtubeUrl: urlField,
+        startTime: padHMS(tm[1]),
+        endTime: padHMS(tm[2]),
+        sourceChannel: (rest[0] ?? "").slice(0, 80),
+        headline: (rest[1] ?? "").slice(0, 120),
+        verify: null,
+      });
+      if (segs.length >= 8) break;
+    }
+    if (segs.length < 2) {
+      toast({ title: "Couldn't read the beats", description: "Paste SEGMENTS lines like  https://youtu.be/… | 00:01:12 - 00:01:24 | Channel | Headline", variant: "destructive" });
+      return;
+    }
+    const narration = narrBlock
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => /^\d{1,2}(:\d{2})?\s*\|/.test(l))
+      .join("\n");
+    setMsSegments(segs);
+    if (narration) setMsNarration(narration);
+    setMsPaste("");
+    toast({ title: `${segs.length} beats loaded`, description: narration ? "Beats + narration filled. Verify, then Enqueue." : "Beats filled. Add narration, then Enqueue." });
+  }
+
+  function updateMsSeg(i: number, patch: Partial<MatchSeg>) {
+    setMsSegments((prev) => prev.map((s, idx) => {
+      if (idx !== i) return s;
+      const next = { ...s, ...patch };
+      // Editing time or URL invalidates a prior verify result.
+      if (patch.startTime !== undefined || patch.endTime !== undefined || patch.youtubeUrl !== undefined) next.verify = null;
+      return next;
+    }));
+  }
+
+  // Reuses the Top 5 verify endpoint (timestamp-in-video check + transcript auto-locate).
+  // We tag each beat with rank = its index+1 so the shared endpoint accepts it, then map
+  // the per-rank results back onto the beats by that same index.
+  async function verifyMatchStory() {
+    const indexed = msSegments
+      .map((s, i) => ({ s, rank: i + 1 }))
+      .filter(({ s }) => /^\d{2}:\d{2}:\d{2}$/.test(s.startTime) && /^\d{2}:\d{2}:\d{2}$/.test(s.endTime) && /(youtube\.com|youtu\.be)/.test(s.youtubeUrl));
+    if (indexed.length === 0) {
+      toast({ title: "Nothing to verify", description: "Add a source URL + valid in/out on each beat first.", variant: "destructive" });
+      return;
+    }
+    const payload = indexed.map(({ s, rank }) => ({ rank, youtubeUrl: s.youtubeUrl, startTime: s.startTime, endTime: s.endTime, headline: s.headline, narrationLine: "" }));
+    setMsVerifying(true);
+    try {
+      const r = await fetch(`${API_BASE}/api/clips/top5/verify`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ youtubeUrl: "", segments: payload }),
+      });
+      const data = (await r.json()) as { results?: { rank: number; ok: boolean; message: string | null; videoDuration?: number | null; suggested?: { startTime: string; endTime: string; confidence: number; evidence: string } | null }[]; error?: string };
+      if (!r.ok) throw new Error(data.error ?? "Verify failed");
+      const byRank = new Map((data.results ?? []).map((x) => [x.rank, x]));
+      setMsSegments((prev) => prev.map((s, i) => {
+        const v = byRank.get(i + 1);
+        return v ? { ...s, verify: { ok: v.ok, message: v.message, videoDuration: v.videoDuration ?? null, suggested: v.suggested ?? null } } : s;
+      }));
+      const bad = (data.results ?? []).filter((x) => !x.ok).length;
+      toast(bad
+        ? { title: `${bad} beat${bad > 1 ? "s" : ""} out of range`, description: "Fix the flagged timestamps, then re-verify.", variant: "destructive" }
+        : { title: "All timestamps look valid", description: "You're clear to enqueue." });
+    } catch (e) {
+      toast({ title: e instanceof Error ? e.message : "Verify failed", variant: "destructive" });
+    } finally {
+      setMsVerifying(false);
+    }
+  }
+
+  // Fallback for a flagged beat with no transcript match: a surgical prompt to fix ONLY
+  // the broken beats, armed with each video's real length so Gemini re-locates in range
+  // (or swaps in a correct video).
+  async function reaskMatchFlagged() {
+    const flagged = msSegments.map((s, i) => ({ s, n: i + 1 })).filter(({ s }) => s.verify && !s.verify.ok);
+    if (flagged.length === 0) {
+      toast({ title: "Nothing flagged", description: "Run Verify timestamps first.", variant: "destructive" });
+      return;
+    }
+    const blocks = flagged.map(({ s, n }) => {
+      const url = s.youtubeUrl || "<video url>";
+      const len = s.verify?.videoDuration
+        ? `${Math.floor(s.verify.videoDuration / 60)}:${String(Math.round(s.verify.videoDuration % 60)).padStart(2, "0")}`
+        : "its real length";
+      return `Beat #${n} — ${s.headline || "(this beat)"}\n  video: ${url}\n  This video is only ${len} long, but you gave ${s.startTime}–${s.endTime} (out of range). WATCH it and reply with a corrected timestamp WITHIN ${len}. If the moment isn't actually in this video, replace it with a real public YouTube video that clearly shows it, and give that video's URL + timestamp.`;
+    }).join("\n\n");
+    const prompt =
+`These Match Story beats have out-of-range timestamps. Fix ONLY these — verify each video's real length first, then reply with corrected lines in this exact format (one per beat):
+<youtube url> | HH:MM:SS - HH:MM:SS | <channel> | <headline>
+
+${blocks}`;
+    const ok = await copyTextToClipboard(prompt);
+    toast(ok
+      ? { title: "Re-ask prompt copied", description: "Run it in Gemini, paste the reply into the box above, then re-Verify." }
+      : { title: "Copy failed", description: "Couldn't access the clipboard.", variant: "destructive" });
+  }
+
+  async function submitMatchStory() {
+    const valid = msSegments.filter((s) =>
+      /^\d{2}:\d{2}:\d{2}$/.test(s.startTime) &&
+      /^\d{2}:\d{2}:\d{2}$/.test(s.endTime) &&
+      toSecs(s.endTime) > toSecs(s.startTime) &&
+      /(youtube\.com|youtu\.be)/.test(s.youtubeUrl)
+    );
+    if (valid.length < 2) {
+      toast({ title: "Need at least 2 complete beats", description: "Each beat needs a source URL and a valid in/out (end after start).", variant: "destructive" });
+      return;
+    }
+    if (msSegments.some((s) => s.verify && !s.verify.ok)) {
+      toast({ title: "Fix flagged timestamps first", description: "A beat is out of range — re-verify after fixing.", variant: "destructive" });
+      return;
+    }
+    setMsSubmitting(true);
+    try {
+      const r = await fetch(`${API_BASE}/api/clips/matchstory`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: msTopic,
+          frameStyle: wFrame,
+          sourceChannel: msCreator,
+          captionsEnabled: msCaptions,
+          outroEnabled: msOutro,
+          captionColor: "#FFF400",
+          narrationScript: msNarration,
+          voiceoverVoice: voVoice,
+          voiceoverSpeed: voSpeed,
+          segments: valid.slice(0, 8).map((s) => ({
+            youtubeUrl: s.youtubeUrl,
+            startTime: s.startTime,
+            endTime: s.endTime,
+            headline: s.headline,
+            sourceChannel: s.sourceChannel,
+          })),
+        }),
+      });
+      if (!r.ok) {
+        let msg = "Failed to create Match Story";
+        try { msg = ((await r.json()) as { error?: string }).error ?? msg; } catch { /* ignore */ }
+        throw new Error(msg);
+      }
+      queryClient.invalidateQueries({ queryKey: getListClipsQueryKey() });
+      queryClient.invalidateQueries({ queryKey: getGetClipStatsQueryKey() });
+      toast({ title: "Match Story job enqueued", description: "It downloads each beat, stitches the montage, then narrates — watch the Timeline." });
+      setMsSegments(defaultMatchStory());
+      setMsNarration("");
+      setMsPaste("");
+    } catch (e) {
+      toast({ title: e instanceof Error ? e.message : "Failed", variant: "destructive" });
+    } finally {
+      setMsSubmitting(false);
+    }
+  }
+
   async function onSubmit(values: FormValues) {
     let successCount = 0;
     const failReasons: string[] = [];
@@ -1321,6 +1667,7 @@ ${blocks}`;
                     { value: "local", label: "Local file", icon: <Upload className="w-3.5 h-3.5" /> },
                     { value: "story", label: "Story", icon: <Film className="w-3.5 h-3.5" /> },
                     { value: "top5", label: "Top 5", icon: <Trophy className="w-3.5 h-3.5" /> },
+                    { value: "matchstory", label: "Match Story", icon: <Zap className="w-3.5 h-3.5" /> },
                   ]}
                 />
                 <Segmented
@@ -2005,7 +2352,7 @@ ${blocks}`;
                     <p className="mt-2 text-[10.5px] text-muted-foreground/60 leading-relaxed">
                       Seconds count from the start of the FINAL stitched video (0 = first moment). Spoken by Piper, ducking the footage while it plays.
                     </p>
-                    <VoicePicker voice={voVoice} speed={voSpeed} onVoice={setVoVoice} onSpeed={setVoSpeed} />
+                    <VoicePicker voice={voVoice} speed={voSpeed} onVoice={setVoVoice} onSpeed={setVoSpeed} autoVoice="en_GB-alan-medium" />
                   </div>
 
                   {/* Global toggles */}
@@ -2323,6 +2670,263 @@ ${blocks}`;
                         <><Loader2 className="mr-2 h-4 w-4 animate-spin" />DISPATCHING…</>
                       ) : (
                         <><Trophy className="mr-2 h-4 w-4" />ENQUEUE TOP 5</>
+                      )}
+                    </Button>
+                  </div>
+                </div>
+              )}
+
+              {sourceTab === "matchstory" && (
+                <div className="space-y-5">
+                  <div className="rounded-xl border border-border bg-gradient-to-b from-card to-[hsl(240_10%_5%)] p-5 space-y-4">
+                    <div>
+                      <FieldLabel>Match / topic</FieldLabel>
+                      <Input
+                        placeholder="e.g. Argentina vs Cape Verde — the disallowed goal"
+                        className="text-sm bg-background"
+                        value={msTopic}
+                        onChange={(e) => setMsTopic(e.target.value)}
+                      />
+                    </div>
+
+                    <div>
+                      <FieldLabel>Channel credit <span className="text-muted-foreground/40 normal-case">(fallback "Credit:" line)</span></FieldLabel>
+                      <Input
+                        placeholder="e.g. FIFA"
+                        className="font-mono text-sm bg-background"
+                        value={msCreator}
+                        onChange={(e) => setMsCreator(e.target.value)}
+                      />
+                    </div>
+
+                    {/* Research bridge: copy prompt → Gemini Deep Research → paste back */}
+                    <div className="rounded-lg border border-primary/30 bg-primary/[0.05] p-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[10.5px] font-mono uppercase tracking-[0.1em] text-foreground flex items-center gap-1.5">
+                          <Zap className="w-3.5 h-3.5 text-primary" /> AI Match Researcher
+                          <span className="text-[8.5px] font-semibold tracking-[0.14em] text-primary border border-primary/40 rounded px-1.5 py-0.5 inline-flex items-center gap-1"><Sparkles className="w-2.5 h-2.5" />AI</span>
+                        </span>
+                        <button
+                          type="button"
+                          onClick={copyMatchStoryPrompt}
+                          className="text-[10px] font-mono uppercase tracking-[0.08em] text-primary hover:underline flex items-center gap-1.5 shrink-0"
+                        >
+                          <ClipboardCopy className="w-3 h-3" /> Copy research prompt
+                        </button>
+                      </div>
+                      <p className="mt-2 text-[10.5px] text-muted-foreground/70 leading-relaxed">
+                        Run it in <span className="text-foreground/80">Gemini 2.5 Pro · Deep Research</span> — it finds the real source clips + writes the play-by-play. The research is what makes or breaks these videos.
+                      </p>
+                      <Textarea
+                        value={msPaste}
+                        onChange={(e) => setMsPaste(e.target.value)}
+                        placeholder={"Paste Gemini's reply here (TITLE + SEGMENTS + NARRATION)…"}
+                        className="text-sm bg-background mt-2.5 font-mono min-h-[96px]"
+                      />
+                      <button
+                        type="button"
+                        onClick={applyMatchStoryPaste}
+                        disabled={!msPaste.trim()}
+                        className="mt-2 w-full flex items-center justify-center gap-2 rounded-md border border-dashed border-primary/40 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-primary hover:bg-primary/10 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        <Plus className="w-3.5 h-3.5" /> Fill beats + narration from paste
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Beats (each its own source clip) */}
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="font-mono text-[11px] uppercase tracking-[0.13em] text-muted-foreground">
+                        Beats <span className="text-muted-foreground/50">({msSegments.length} · min 2 · max 8)</span>
+                      </p>
+                      <div className="flex items-center gap-3 shrink-0">
+                        {msSegments.some((s) => s.verify && !s.verify.ok) && (
+                          <button
+                            type="button"
+                            onClick={reaskMatchFlagged}
+                            className="text-[10px] font-mono uppercase tracking-[0.08em] text-amber-400 hover:underline flex items-center gap-1.5"
+                          >
+                            <ClipboardCopy className="w-3 h-3" /> Re-ask Gemini
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={verifyMatchStory}
+                          disabled={msVerifying}
+                          className="text-[10px] font-mono uppercase tracking-[0.08em] text-primary hover:underline flex items-center gap-1.5 disabled:opacity-40"
+                        >
+                          {msVerifying ? <><Loader2 className="w-3 h-3 animate-spin" /> Verifying…</> : <><Eye className="w-3 h-3" /> Verify timestamps</>}
+                        </button>
+                      </div>
+                    </div>
+
+                    {msSegments.map((seg, index) => {
+                      const bad = !/^\d{2}:\d{2}:\d{2}$/.test(seg.startTime) || !/^\d{2}:\d{2}:\d{2}$/.test(seg.endTime) || toSecs(seg.endTime) <= toSecs(seg.startTime);
+                      return (
+                        <div key={index} className="rounded-xl border border-border bg-background/40 p-4 space-y-3">
+                          <div className="flex items-center gap-3">
+                            <span className="font-mono text-[13px] text-primary bg-primary/[0.08] border border-primary/20 min-w-[2.6rem] h-7 px-2 rounded-md grid place-items-center font-bold tabular-nums">
+                              #{index + 1}
+                            </span>
+                            <span className="font-mono text-[10px] uppercase tracking-[0.12em]">
+                              {bad
+                                ? <span className="text-destructive">check times</span>
+                                : seg.verify
+                                  ? (seg.verify.ok
+                                      ? <span className="text-emerald-400 inline-flex items-center gap-1"><Check className="w-3 h-3" /> valid</span>
+                                      : <span className="text-destructive inline-flex items-center gap-1" title={seg.verify.message ?? ""}><X className="w-3 h-3" /> not in video</span>)
+                                  : <span className="text-muted-foreground">length {fmtDuration(seg.startTime, seg.endTime)}</span>}
+                            </span>
+                            {msSegments.length > 2 && (
+                              <button
+                                type="button"
+                                onClick={() => setMsSegments((p) => p.filter((_, i) => i !== index))}
+                                className="ml-auto w-7 h-7 grid place-items-center rounded-md border border-border text-muted-foreground hover:text-destructive hover:border-destructive/40 hover:bg-destructive/10 transition-colors"
+                                aria-label="Remove beat"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            )}
+                          </div>
+
+                          <div>
+                            <FieldLabel>Source URL</FieldLabel>
+                            <Input
+                              placeholder="https://youtube.com/watch?v=..."
+                              className="font-mono text-sm bg-background"
+                              value={seg.youtubeUrl}
+                              onChange={(e) => updateMsSeg(index, { youtubeUrl: e.target.value })}
+                            />
+                          </div>
+
+                          <div className="grid grid-cols-2 gap-3">
+                            <div>
+                              <FieldLabel>In</FieldLabel>
+                              <Input
+                                placeholder="00:00:00"
+                                className={`font-mono text-sm bg-background ${bad ? "border-destructive/50" : ""}`}
+                                value={seg.startTime}
+                                onChange={(e) => updateMsSeg(index, { startTime: e.target.value })}
+                              />
+                            </div>
+                            <div>
+                              <FieldLabel>Out</FieldLabel>
+                              <Input
+                                placeholder="00:00:10"
+                                className={`font-mono text-sm bg-background ${bad ? "border-destructive/50" : ""}`}
+                                value={seg.endTime}
+                                onChange={(e) => updateMsSeg(index, { endTime: e.target.value })}
+                              />
+                            </div>
+                          </div>
+
+                          {seg.verify && !seg.verify.ok && (
+                            <div className="rounded-lg border border-destructive/30 bg-destructive/[0.06] p-3 space-y-2">
+                              <p className="text-[11px] text-destructive leading-snug">{seg.verify.message}</p>
+                              {seg.verify.suggested ? (
+                                <div className="flex items-start gap-2">
+                                  <div className="flex-1 min-w-0">
+                                    <p className="text-[11px] text-foreground">
+                                      Transcript match: <span className="font-mono">{seg.verify.suggested.startTime}–{seg.verify.suggested.endTime}</span>
+                                      <span className="text-muted-foreground"> · {Math.round(seg.verify.suggested.confidence * 100)}% conf</span>
+                                    </p>
+                                    <p className="text-[10px] text-muted-foreground italic truncate">“{seg.verify.suggested.evidence}”</p>
+                                  </div>
+                                  <button
+                                    type="button"
+                                    onClick={() => updateMsSeg(index, { startTime: seg.verify!.suggested!.startTime, endTime: seg.verify!.suggested!.endTime })}
+                                    className="shrink-0 text-[10px] font-mono uppercase tracking-[0.08em] px-2.5 h-7 rounded-md bg-primary/15 border border-primary/30 text-primary hover:bg-primary/25 transition-colors"
+                                  >
+                                    Apply
+                                  </button>
+                                </div>
+                              ) : (
+                                <p className="text-[10px] text-muted-foreground">No transcript match — use “Re-ask Gemini” above, or fix the time manually.</p>
+                              )}
+                            </div>
+                          )}
+
+                          <div className="grid grid-cols-2 gap-3">
+                            <div>
+                              <FieldLabel>Headline</FieldLabel>
+                              <Input
+                                placeholder="On-screen title…"
+                                className="text-sm bg-background"
+                                value={seg.headline}
+                                onChange={(e) => updateMsSeg(index, { headline: e.target.value })}
+                              />
+                            </div>
+                            <div>
+                              <FieldLabel>Channel</FieldLabel>
+                              <Input
+                                placeholder="Credit channel…"
+                                className="font-mono text-sm bg-background"
+                                value={seg.sourceChannel}
+                                onChange={(e) => updateMsSeg(index, { sourceChannel: e.target.value })}
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+
+                    <button
+                      type="button"
+                      onClick={() => msSegments.length < 8 && setMsSegments((p) => [...p, { youtubeUrl: "", startTime: "00:00:00", endTime: "00:00:10", sourceChannel: "", headline: "", verify: null }])}
+                      disabled={msSegments.length >= 8}
+                      className={`w-full flex items-center justify-center gap-2 rounded-xl border border-dashed py-3 font-mono text-[11px] uppercase tracking-[0.1em] transition-colors ${
+                        msSegments.length >= 8
+                          ? "text-muted-foreground/30 border-border cursor-not-allowed"
+                          : "text-muted-foreground border-border hover:text-primary hover:border-primary/40"
+                      }`}
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      {msSegments.length >= 8 ? "Max 8 beats" : `Add beat (${msSegments.length})`}
+                    </button>
+                  </div>
+
+                  {/* Play-by-play narration (stitched timeline) */}
+                  <div>
+                    <FieldLabel>Play-by-play narration <span className="text-muted-foreground/40 normal-case">(SS | line — seconds on the stitched timeline, 0 = start)</span></FieldLabel>
+                    <Textarea
+                      value={msNarration}
+                      onChange={(e) => setMsNarration(e.target.value)}
+                      placeholder={"0 | Ninety-third minute. One chance left.\n5 | The wall goes up — Messi stands over it.\n11 | And what he does next... is unreal."}
+                      className="text-sm bg-background font-mono min-h-[120px]"
+                    />
+                  </div>
+
+                  {/* Narration voice */}
+                  <div className="rounded-xl border border-[#9b7bff]/30 bg-gradient-to-b from-[#9b7bff]/[0.08] to-[#9b7bff]/[0.02] p-4">
+                    <div className="flex items-center gap-1.5">
+                      <Mic className="w-3.5 h-3.5 text-[#9b7bff]" />
+                      <span className="text-[10.5px] font-mono uppercase tracking-[0.1em] text-[#c9b8ff]">Commentary voiceover</span>
+                      <span className="text-[8.5px] font-semibold tracking-[0.14em] text-[#b69dff] border border-[#9b7bff]/40 rounded px-1.5 py-0.5">PRO</span>
+                    </div>
+                    <VoicePicker voice={voVoice} speed={voSpeed} onVoice={setVoVoice} onSpeed={setVoSpeed} autoVoice="en_GB-alan-medium" />
+                  </div>
+
+                  {/* Toggles + submit */}
+                  <div className="flex flex-wrap gap-2">
+                    <ToggleChip label="Captions" checked={msCaptions} onChange={setMsCaptions} />
+                    <ToggleChip label="Outro card" checked={msOutro} onChange={setMsOutro} />
+                  </div>
+
+                  <div className="flex items-center justify-between gap-4 flex-wrap pt-1">
+                    <span className="font-mono text-[11px] text-muted-foreground">
+                      Multi-source stitch · karaoke captions · commentary VO · slow on phone
+                    </span>
+                    <Button
+                      type="button"
+                      disabled={msSubmitting}
+                      onClick={submitMatchStory}
+                      className="font-mono uppercase tracking-[0.13em] text-xs h-12 px-7"
+                    >
+                      {msSubmitting ? (
+                        <><Loader2 className="mr-2 h-4 w-4 animate-spin" />DISPATCHING…</>
+                      ) : (
+                        <><Zap className="mr-2 h-4 w-4" />ENQUEUE MATCH STORY</>
                       )}
                     </Button>
                   </div>

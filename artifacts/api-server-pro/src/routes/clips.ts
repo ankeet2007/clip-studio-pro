@@ -12,7 +12,7 @@ import {
   GetClipResponse,
   GetClipStatsResponse,
 } from "@workspace/api-zod";
-import { processClip, processStory, processTop5, enqueueClipJob, getOutputFilePath, getUploadsDir, normalizeYoutubeUrl, parseProcessingError, validateSegmentWithinVideo, fetchTranscriptCues, locateMomentInTranscript, timeToSeconds, type StorySegment, type Top5Segment } from "../lib/clipProcessor";
+import { processClip, processStory, processTop5, processMatchStory, enqueueClipJob, getOutputFilePath, getUploadsDir, normalizeYoutubeUrl, parseProcessingError, validateSegmentWithinVideo, fetchTranscriptCues, locateMomentInTranscript, timeToSeconds, type StorySegment, type Top5Segment } from "../lib/clipProcessor";
 import { logger } from "../lib/logger";
 import { readSettings } from "../lib/settings";
 
@@ -163,6 +163,38 @@ function sanitizeSegments(raw: unknown): StorySegment[] {
 }
 
 /**
+ * Normalises + validates a raw MATCH STORY beats array. Unlike a single-source story,
+ * every beat carries its OWN source URL (multi-source montage) — rows without a URL or a
+ * valid start/end are dropped. Capped at 8 (render-load guard on the phone).
+ */
+function sanitizeMatchSegments(raw: unknown): StorySegment[] {
+  if (!Array.isArray(raw)) return [];
+  const timeRe = /^\d{1,2}:\d{2}(:\d{2})?$/;
+  const toHMS = (t: string) => { const p = t.split(":"); while (p.length < 3) p.unshift("00"); return p.slice(-3).map((x) => x.padStart(2, "0")).join(":"); };
+  const out: StorySegment[] = [];
+  for (const s of raw) {
+    if (!s || typeof s !== "object") continue;
+    const seg = s as Record<string, unknown>;
+    const st = String(seg.startTime ?? "").trim();
+    const en = String(seg.endTime ?? "").trim();
+    if (!timeRe.test(st) || !timeRe.test(en)) continue;
+    const rawUrl = String(seg.youtubeUrl ?? "").trim();
+    if (!rawUrl) continue;
+    out.push({
+      youtubeUrl: normalizeYoutubeUrl(rawUrl),
+      startTime: toHMS(st),
+      endTime: toHMS(en),
+      headline: String(seg.headline ?? "").slice(0, 120),
+      sourceChannel: String(seg.sourceChannel ?? "").slice(0, 80),
+      zoomMoments: typeof seg.zoomMoments === "string" ? seg.zoomMoments : "",
+      punchInEnabled: seg.punchInEnabled === true,
+    });
+    if (out.length >= 8) break;
+  }
+  return out;
+}
+
+/**
  * POST /clips/story — create a multi-clip story job (Feature 2). Reads fields off the
  * body directly (same convention as the other newer fields — the shared CreateClipBody
  * zod schema is not used here).
@@ -213,6 +245,95 @@ router.post("/clips/story", async (req, res): Promise<void> => {
 
   const outputFilename = `clip_${clip.id}_${Date.now()}.mp4`;
   dispatchStoryJob(clip.id, youtubeUrl, outputFilename, frameStyle, sourceChannel, captionsEnabled, outroEnabled, captionColor, narrationScript, segments, voiceoverVoice, voiceoverSpeed);
+});
+
+/**
+ * Enqueues a MATCH STORY job: render each beat from its OWN source URL, stitch them (no
+ * title card / no badges), caption once, then a dense play-by-play narration. Mirrors
+ * dispatchStoryJob's status handling; "Beat #…" errors are already clean and name the
+ * failing beat, so they're passed through verbatim (like Top 5's "Moment #…").
+ */
+function dispatchMatchStoryJob(
+  clipId: number,
+  outputFilename: string,
+  frameStyle: "standard" | "immersive",
+  sourceChannel: string,
+  captionsEnabled: boolean,
+  outroEnabled: boolean,
+  captionColor: string,
+  narrationScript: string,
+  segments: StorySegment[],
+  voiceoverVoice = "",
+  voiceoverSpeed = ""
+) {
+  const { channelHandle } = readSettings();
+  enqueueClipJob(async () => {
+    try {
+      await db.update(clipsTable).set({ status: "processing" }).where(eq(clipsTable.id, clipId)).execute();
+    } catch (err: unknown) {
+      logger.error({ err, clipId }, "Failed to mark Match Story as processing");
+    }
+    await processMatchStory(outputFilename, channelHandle, clipId, frameStyle, sourceChannel, captionsEnabled, outroEnabled, captionColor, narrationScript, segments, { voice: voiceoverVoice, speed: voiceoverSpeed })
+      .then(async () => {
+        await db.update(clipsTable).set({ status: "done", progress: 100, outputFilename }).where(eq(clipsTable.id, clipId));
+      })
+      .catch(async (err: unknown) => {
+        const rawMsg = err instanceof Error ? err.message : String(err);
+        const msg = rawMsg.startsWith("Beat #") ? rawMsg.slice(0, 400) : parseProcessingError(rawMsg);
+        await db.update(clipsTable).set({ status: "error", progress: 0, errorMessage: msg }).where(eq(clipsTable.id, clipId));
+      });
+  });
+}
+
+/**
+ * POST /clips/matchstory — create a research-driven, MULTI-SOURCE narrated montage. Each
+ * beat carries its own source URL; `narrationScript` is the dense play-by-play on the
+ * stitched timeline. Reads fields off the body directly (no shared zod schema, same as story).
+ */
+router.post("/clips/matchstory", async (req, res): Promise<void> => {
+  const body = req.body as {
+    title?: string; frameStyle?: string; sourceChannel?: string;
+    captionsEnabled?: boolean; outroEnabled?: boolean; captionColor?: string;
+    narrationScript?: string; segments?: unknown;
+    voiceoverVoice?: string; voiceoverSpeed?: string;
+  };
+
+  const segments = sanitizeMatchSegments(body.segments);
+  if (segments.length < 2) {
+    res.status(400).json({ error: "A Match Story needs at least 2 valid beats (each with a source URL and a start/end time)." });
+    return;
+  }
+
+  const frameStyle = (body.frameStyle === "standard" ? "standard" : "immersive") as "standard" | "immersive";
+  const sourceChannel = body.sourceChannel ?? "";
+  const captionsEnabled = body.captionsEnabled ?? true;
+  const outroEnabled = body.outroEnabled ?? true;
+  const captionColor = body.captionColor ?? "";
+  const narrationScript = body.narrationScript ?? "";
+  const voiceoverVoice = body.voiceoverVoice ?? "";
+  const voiceoverSpeed = body.voiceoverSpeed ?? "";
+
+  // Representative fields so a match-story row displays sensibly in the timeline/detail.
+  const headline = (body.title ?? "").trim().slice(0, 120) || segments[0]!.headline?.trim() || `Match Story · ${segments.length} beats`;
+  const startTime = segments[0]!.startTime;
+  const endTime = segments[segments.length - 1]!.endTime;
+  const repUrl = segments[0]!.youtubeUrl ?? "";
+
+  const [clip] = await db
+    .insert(clipsTable)
+    .values({
+      youtubeUrl: repUrl, startTime, endTime, headline, mode: "edited", frameStyle, sourceChannel,
+      captionsEnabled, captionColor, outroEnabled, narrationScript, voiceoverVoice, voiceoverSpeed,
+      jobType: "matchstory", segments, sourceType: "youtube", status: "pending",
+    })
+    .returning();
+
+  if (!clip) { res.status(500).json({ error: "Failed to create Match Story" }); return; }
+
+  res.status(201).json(GetClipResponse.parse(clip));
+
+  const outputFilename = `clip_${clip.id}_${Date.now()}.mp4`;
+  dispatchMatchStoryJob(clip.id, outputFilename, frameStyle, sourceChannel, captionsEnabled, outroEnabled, captionColor, narrationScript, segments, voiceoverVoice, voiceoverSpeed);
 });
 
 /**
@@ -630,6 +751,24 @@ router.post("/clips/:id/retry", async (req, res): Promise<void> => {
   res.json(GetClipResponse.parse(updated));
 
   const clipFrameStyle = (clip.frameStyle === "standard" ? "standard" : "immersive") as "standard" | "immersive";
+
+  // Match Story retry: re-render the whole multi-source montage from persisted beats + narration.
+  if (clip.jobType === "matchstory") {
+    dispatchMatchStoryJob(
+      clip.id,
+      outputFilename,
+      clipFrameStyle,
+      clip.sourceChannel ?? "",
+      clip.captionsEnabled ?? true,
+      clip.outroEnabled ?? true,
+      clip.captionColor ?? "",
+      clip.narrationScript ?? "",
+      (clip.segments ?? []) as StorySegment[],
+      clip.voiceoverVoice ?? "",
+      clip.voiceoverSpeed ?? "",
+    );
+    return;
+  }
 
   // Story retry: re-render the whole story from the persisted segments + narration.
   if (clip.jobType === "story") {
