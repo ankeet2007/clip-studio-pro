@@ -18,6 +18,47 @@ function findGalleryDl(): string {
   return "gallery-dl";
 }
 
+// gallery-dl's -j output for a VIDEO tweet carries no poster image (only profile pics), so the
+// review grid would show blank tiles. Twitter's public syndication CDN returns the video's
+// poster for a tweet id + a derived token (the react-tweet trick) — a tiny unauthenticated JSON
+// GET. We upgrade each candidate's thumbnail from this, falling back to the author's avatar.
+const SYNDICATION_URL = "https://cdn.syndication.twimg.com/tweet-result";
+
+function syndicationToken(tweetId: string): string {
+  return ((Number(tweetId) / 1e15) * Math.PI).toString(36).replace(/(0+|\.)/g, "");
+}
+
+async function fetchXPoster(tweetId: string): Promise<string | undefined> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 5000);
+  try {
+    const url = `${SYNDICATION_URL}?id=${encodeURIComponent(tweetId)}&token=${syndicationToken(tweetId)}&lang=en`;
+    const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" }, signal: ctrl.signal });
+    if (!res.ok) return undefined;
+    const j = (await res.json()) as { video?: { poster?: string }; mediaDetails?: { media_url_https?: string }[] };
+    return j.video?.poster ?? j.mediaDetails?.[0]?.media_url_https ?? undefined;
+  } catch {
+    return undefined;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Upgrade candidates to their real video poster in small parallel batches, bounded by an overall
+// deadline so a slow/blocked CDN never stalls the scout — anything unfetched keeps its avatar.
+async function enrichThumbnails(cands: RawCandidate[]): Promise<void> {
+  const CONCURRENCY = 8;
+  const deadline = Date.now() + 15_000;
+  for (let i = 0; i < cands.length && Date.now() < deadline; i += CONCURRENCY) {
+    await Promise.all(cands.slice(i, i + CONCURRENCY).map(async (c) => {
+      const id = c.sourceUrl.split("/status/")[1]?.split(/[/?]/)[0];
+      if (!id) return;
+      const poster = await fetchXPoster(id);
+      if (poster) c.thumbnail = poster;
+    }));
+  }
+}
+
 export const xAdapter: ScoutAdapter = {
   platform: "x" as Platform,
   isConfigured() {
@@ -57,6 +98,7 @@ export const xAdapter: ScoutAdapter = {
       const rt = Number(m.retweet_count ?? 0);
       const views = Number(m.view_count ?? 0);
       const author = m.author?.name ? `@${m.author.name}` : "x";
+      const avatar = typeof m.author?.profile_image === "string" ? m.author.profile_image : undefined;
       out.push({
         platform: "x",
         sourceUrl: `https://x.com/i/status/${tweetId}`,
@@ -66,11 +108,13 @@ export const xAdapter: ScoutAdapter = {
         engagement: fav * 3 + rt * 5 + Math.round(views / 20),
         createdAt: m.date ? Math.floor(Date.parse(String(m.date).replace(" ", "T") + "Z") / 1000) || 0 : 0,
         durationSec: typeof m.duration === "number" ? m.duration : undefined,
+        thumbnail: avatar, // baseline; upgraded to the real video poster below
         downloadUrl: mediaUrl,
         downloadKind: "hls", // direct video.twimg.com URL → ffmpeg stream-copy
       });
     }
-    logger.info({ platform: "x", hits: out.length }, "X search complete");
+    await enrichThumbnails(out);
+    logger.info({ platform: "x", hits: out.length, withPoster: out.filter((c) => c.thumbnail?.includes("video_thumb")).length }, "X search complete");
     return out;
   },
 };

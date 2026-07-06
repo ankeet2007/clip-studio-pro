@@ -101,15 +101,22 @@ export const redditAdapter: ScoutAdapter = {
     const token = await appOnlyToken();
     const cookie = token ? undefined : cookieHeaderFor("reddit", REDDIT_DOMAIN);
     const base = token ? "https://oauth.reddit.com" : "https://www.reddit.com";
-    const limit = Math.min(25, opts.maxPerPlatform ?? 25);
+    // Reddit listings allow up to 100 per page. The video-only filter drops the bulk of a
+    // generic search's hits (images/text), so we pull the full 100 to leave ~40 videos standing.
+    const limit = Math.min(100, opts.maxPerPlatform ?? 100);
     const q = encodeURIComponent(plan.primary);
 
     const urls: string[] = [];
-    // Subreddit-scoped searches (highest signal), then one site-wide net.
-    for (const sub of plan.subreddits.slice(0, 4)) {
-      urls.push(`${base}/r/${encodeURIComponent(sub)}/search.json?q=${q}&restrict_sr=1&sort=top&t=year&limit=${limit}&include_over_18=on`);
+    // Subreddit-scoped searches (highest signal), across the last year and all-time so evergreen
+    // clips backfill toward the ~40 target.
+    for (const sub of plan.subreddits.slice(0, 5)) {
+      const sr = `${base}/r/${encodeURIComponent(sub)}/search.json?q=${q}&restrict_sr=1&limit=${limit}&include_over_18=on`;
+      urls.push(`${sr}&sort=top&t=year`);
+      urls.push(`${sr}&sort=top&t=all`);
     }
+    // Site-wide nets (year + all-time) to catch clips outside the mapped subreddits.
     urls.push(`${base}/search.json?q=${q}&sort=top&t=year&limit=${limit}&type=link`);
+    urls.push(`${base}/search.json?q=${q}&sort=top&t=all&limit=${limit}&type=link`);
 
     const all: RawCandidate[] = [];
     const seen = new Set<string>();

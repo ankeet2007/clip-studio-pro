@@ -46,7 +46,7 @@ router.post("/scout", (req, res): void => {
     platforms: platforms.length ? platforms : ["reddit"],
     subreddits: Array.isArray(body.subreddits) ? body.subreddits.slice(0, 6).map(String) : undefined,
     maxCandidates: Math.min(80, Math.max(10, Number(body.maxCandidates) || 40)),
-    maxPerPlatform: 50,
+    maxPerPlatform: 100,
   };
   const job = startScout(topic, opts);
   logger.info({ jobId: job.id, topic, platforms: opts.platforms }, "Scout started");
