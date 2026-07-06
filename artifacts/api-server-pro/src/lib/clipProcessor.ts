@@ -238,7 +238,7 @@ export function formatHMS(total: number): string {
 const durationCache = new Map<string, { dur: number; at: number }>();
 const DURATION_CACHE_TTL_MS = 10 * 60_000;
 
-export type SegmentCheckReason = "ok" | "start-past-end" | "end-past-end";
+export type SegmentCheckReason = "ok" | "start-past-end" | "end-past-end" | "unverified";
 
 export async function validateSegmentWithinVideo(
   youtubeUrl: string,
@@ -261,10 +261,12 @@ export async function validateSegmentWithinVideo(
       videoDuration = parseFloat(String(stdout).trim().split("\n")[0] ?? "") || 0;
       if (videoDuration > 0) durationCache.set(youtubeUrl, { dur: videoDuration, at: Date.now() });
     } catch {
-      return { ok: true }; // Can't verify → don't block; the download-time guard backstops.
+      // Can't verify → don't BLOCK the enqueue (the download-time guard backstops), but flag
+      // it as unverified so the UI never paints a confident "valid" it didn't actually check.
+      return { ok: true, reason: "unverified", message: "Couldn't fetch this video's length right now — it'll be re-checked when the clip renders." };
     }
   }
-  if (videoDuration <= 0) return { ok: true };
+  if (videoDuration <= 0) return { ok: true, reason: "unverified", message: "Couldn't read this video's length right now — it'll be re-checked when the clip renders." };
 
   const startSeconds = timeToSeconds(startTime);
   const endSeconds = timeToSeconds(endTime);

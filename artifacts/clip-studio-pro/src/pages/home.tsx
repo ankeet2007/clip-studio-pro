@@ -37,6 +37,7 @@ import {
   Film,
   Trash2,
   Trophy,
+  AlertTriangle,
 } from "lucide-react";
 
 const MAX_CLIPS = 10;
@@ -112,6 +113,7 @@ interface Top5Seg {
   narrationLine: string;
   verify: {
     ok: boolean;
+    reason?: string | null;
     message: string | null;
     videoDuration?: number | null;
     suggested?: { startTime: string; endTime: string; confidence: number; evidence: string } | null;
@@ -1386,17 +1388,20 @@ https://youtu.be/efgh | 00:00:31 - 00:00:41 | ESPN | He Curls It In | He whips i
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ segments: payload }),
       });
-      const data = (await r.json()) as { results?: { index: number; ok: boolean; message: string | null; videoDuration?: number | null; suggested?: { startTime: string; endTime: string; confidence: number; evidence: string } | null }[]; error?: string };
+      const data = (await r.json()) as { results?: { index: number; ok: boolean; reason?: string | null; message: string | null; videoDuration?: number | null; suggested?: { startTime: string; endTime: string; confidence: number; evidence: string } | null }[]; error?: string };
       if (!r.ok) throw new Error(data.error ?? "Verify failed");
       const byIndex = new Map((data.results ?? []).map((x) => [x.index, x]));
       setMsSegments((prev) => prev.map((s, i) => {
         const v = byIndex.get(i);
-        return v ? { ...s, verify: { ok: v.ok, message: v.message, videoDuration: v.videoDuration ?? null, suggested: v.suggested ?? null } } : s;
+        return v ? { ...s, verify: { ok: v.ok, reason: v.reason ?? null, message: v.message, videoDuration: v.videoDuration ?? null, suggested: v.suggested ?? null } } : s;
       }));
       const bad = (data.results ?? []).filter((x) => !x.ok).length;
+      const unchecked = (data.results ?? []).filter((x) => x.ok && x.reason === "unverified").length;
       toast(bad
         ? { title: `${bad} beat${bad > 1 ? "s" : ""} out of range`, description: "Fix the flagged timestamps, then re-verify.", variant: "destructive" }
-        : { title: "All timestamps look valid", description: "You're clear to enqueue." });
+        : unchecked
+          ? { title: `Couldn't check ${unchecked} beat${unchecked > 1 ? "s" : ""}`, description: "YouTube length lookup failed (phone busy/throttled) — re-verify, or it's re-checked at render.", variant: "destructive" }
+          : { title: "All timestamps look valid", description: "You're clear to enqueue." });
     } catch (e) {
       toast({ title: e instanceof Error ? e.message : "Verify failed", variant: "destructive" });
     } finally {
@@ -2775,9 +2780,11 @@ ${blocks}`;
                               {bad
                                 ? <span className="text-destructive">check times</span>
                                 : seg.verify
-                                  ? (seg.verify.ok
-                                      ? <span className="text-emerald-400 inline-flex items-center gap-1"><Check className="w-3 h-3" /> valid</span>
-                                      : <span className="text-destructive inline-flex items-center gap-1" title={seg.verify.message ?? ""}><X className="w-3 h-3" /> not in video</span>)
+                                  ? (seg.verify.reason === "unverified"
+                                      ? <span className="text-amber-400 inline-flex items-center gap-1" title={seg.verify.message ?? ""}><AlertTriangle className="w-3 h-3" /> couldn't check</span>
+                                      : seg.verify.ok
+                                        ? <span className="text-emerald-400 inline-flex items-center gap-1" title={seg.verify.videoDuration ? `video is ${Math.round(seg.verify.videoDuration)}s long` : ""}><Check className="w-3 h-3" /> valid{seg.verify.videoDuration ? ` · vid ${Math.round(seg.verify.videoDuration)}s` : ""}</span>
+                                        : <span className="text-destructive inline-flex items-center gap-1" title={seg.verify.message ?? ""}><X className="w-3 h-3" /> not in video</span>)
                                   : <span className="text-muted-foreground">length {fmtDuration(seg.startTime, seg.endTime)}</span>}
                             </span>
                             {msSegments.length > 2 && (
