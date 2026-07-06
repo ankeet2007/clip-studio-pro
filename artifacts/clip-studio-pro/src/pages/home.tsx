@@ -95,7 +95,24 @@ const defaultClip = {
   narrationScript: "",
 };
 
-type SourceTab = "youtube" | "local" | "story" | "top5" | "matchstory";
+type SourceTab = "youtube" | "local" | "story" | "top5" | "matchstory" | "matchstory2";
+
+// Match Story 2.0 scout candidate (as returned by GET /api/scout/:id).
+interface ScoutCandidate {
+  id: string;
+  platform: string;
+  title: string;
+  author: string;
+  sourceUrl: string;
+  engagement: number;
+  durationSec: number;
+  width: number | null;
+  height: number | null;
+  score: number;
+  reasons: string[];
+  status: "candidate" | "keep" | "drop";
+  thumbUrl: string | null;
+}
 
 interface StorySeg {
   startTime: string;
@@ -145,6 +162,10 @@ interface MatchSeg {
   sourceChannel: string;
   headline: string;
   narrationLine: string;
+  // Match Story 2.0: a scout-downloaded local clip beat (no URL/timestamps/verify).
+  localFile?: string;
+  sourceType?: "youtube" | "local";
+  thumbUrl?: string;
   verify: {
     ok: boolean;
     message: string | null;
@@ -643,6 +664,19 @@ export default function Home() {
   const [msTitleCard, setMsTitleCard] = useState(true);
   const [msVerifying, setMsVerifying] = useState(false);
   const [msSubmitting, setMsSubmitting] = useState(false);
+
+  // ----- Match Story 2.0 (clip-scout) state -----
+  const [ms2Topic, setMs2Topic] = useState("");
+  const [ms2Subreddits, setMs2Subreddits] = useState("");
+  const [ms2Platforms, setMs2Platforms] = useState<string[]>(["reddit"]);
+  const [ms2JobId, setMs2JobId] = useState<string | null>(null);
+  const [ms2Status, setMs2Status] = useState<string>("");
+  const [ms2Progress, setMs2Progress] = useState(0);
+  const [ms2Message, setMs2Message] = useState<string>("");
+  const [ms2Candidates, setMs2Candidates] = useState<ScoutCandidate[]>([]);
+  const [ms2Adapters, setMs2Adapters] = useState<{ platform: string; configured: boolean }[]>([]);
+  const [ms2Building, setMs2Building] = useState(false);
+  const ms2Poll = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // ----- Shared AI voice + pace (applies to whichever job you create) -----
   // voVoice "" = let the server pick the best deep voice per mode; voSpeed = Piper length_scale.
@@ -1438,13 +1472,15 @@ ${blocks}`;
 
   async function submitMatchStory() {
     const valid = msSegments.filter((s) =>
-      /^\d{2}:\d{2}:\d{2}$/.test(s.startTime) &&
-      /^\d{2}:\d{2}:\d{2}$/.test(s.endTime) &&
-      toSecs(s.endTime) > toSecs(s.startTime) &&
-      /(youtube\.com|youtu\.be)/.test(s.youtubeUrl)
+      // Local (scout) beats need only a file; YouTube beats need a valid URL + in/out.
+      (s.sourceType === "local" && !!s.localFile) ||
+      (/^\d{2}:\d{2}:\d{2}$/.test(s.startTime) &&
+        /^\d{2}:\d{2}:\d{2}$/.test(s.endTime) &&
+        toSecs(s.endTime) > toSecs(s.startTime) &&
+        /(youtube\.com|youtu\.be)/.test(s.youtubeUrl))
     );
     if (valid.length < 2) {
-      toast({ title: "Need at least 2 complete beats", description: "Each beat needs a source URL and a valid in/out (end after start).", variant: "destructive" });
+      toast({ title: "Need at least 2 complete beats", description: "Each beat needs a source (URL or scouted clip) and a valid in/out.", variant: "destructive" });
       return;
     }
     if (msSegments.some((s) => s.verify && !s.verify.ok)) {
@@ -1468,14 +1504,9 @@ ${blocks}`;
           titleCardEnabled: msTitleCard,
           voiceoverVoice: voVoice,
           voiceoverSpeed: voSpeed,
-          segments: valid.slice(0, 8).map((s) => ({
-            youtubeUrl: s.youtubeUrl,
-            startTime: s.startTime,
-            endTime: s.endTime,
-            headline: s.headline,
-            sourceChannel: s.sourceChannel,
-            narrationLine: s.narrationLine,
-          })),
+          segments: valid.slice(0, 8).map((s) => (s.sourceType === "local"
+            ? { sourceType: "local", localFile: s.localFile, startTime: s.startTime, endTime: s.endTime, headline: s.headline, sourceChannel: s.sourceChannel, narrationLine: s.narrationLine }
+            : { youtubeUrl: s.youtubeUrl, startTime: s.startTime, endTime: s.endTime, headline: s.headline, sourceChannel: s.sourceChannel, narrationLine: s.narrationLine })),
         }),
       });
       if (!r.ok) {
@@ -1494,6 +1525,81 @@ ${blocks}`;
     } finally {
       setMsSubmitting(false);
     }
+  }
+
+  // ---------- Match Story 2.0 (clip-scout) ----------
+  useEffect(() => {
+    if (sourceTab === "matchstory2" && ms2Adapters.length === 0) {
+      fetch(`${API_BASE}/api/scout/adapters`).then((r) => r.json()).then((d) => setMs2Adapters(d.adapters ?? [])).catch(() => {});
+    }
+  }, [sourceTab]);
+  useEffect(() => () => { if (ms2Poll.current) clearInterval(ms2Poll.current); }, []);
+
+  function toggleMs2Platform(p: string) {
+    setMs2Platforms((prev) => (prev.includes(p) ? prev.filter((x) => x !== p) : [...prev, p]));
+  }
+
+  async function pollScout(id: string) {
+    try {
+      const r = await fetch(`${API_BASE}/api/scout/${id}`);
+      const j = await r.json();
+      if (!r.ok) return;
+      setMs2Status(j.status); setMs2Progress(j.progress ?? 0); setMs2Message(j.message ?? "");
+      setMs2Candidates(j.candidates ?? []);
+      if (j.status === "ready" || j.status === "error") { if (ms2Poll.current) clearInterval(ms2Poll.current); }
+    } catch { /* keep polling */ }
+  }
+
+  async function startScout() {
+    const topic = ms2Topic.trim();
+    if (topic.length < 2) { toast({ title: "Enter a topic to scout for", variant: "destructive" }); return; }
+    if (ms2Platforms.length === 0) { toast({ title: "Pick at least one platform", variant: "destructive" }); return; }
+    setMs2Candidates([]); setMs2Message(""); setMs2Status("searching"); setMs2Progress(2); setMs2JobId(null);
+    try {
+      const subs = ms2Subreddits.split(",").map((s) => s.trim()).filter(Boolean);
+      const r = await fetch(`${API_BASE}/api/scout`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ topic, platforms: ms2Platforms, subreddits: subs, maxDownload: 8 }) });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error ?? "Scout failed");
+      setMs2JobId(j.id);
+      if (ms2Poll.current) clearInterval(ms2Poll.current);
+      ms2Poll.current = setInterval(() => pollScout(j.id), 2500);
+    } catch (e) {
+      setMs2Status("error"); setMs2Message(e instanceof Error ? e.message : "Scout failed");
+    }
+  }
+
+  async function toggleCandidate(candId: string, keep: boolean) {
+    if (!ms2JobId) return;
+    setMs2Candidates((prev) => prev.map((c) => (c.id === candId ? { ...c, status: keep ? "keep" : "drop" } : c)));
+    try { await fetch(`${API_BASE}/api/scout/${ms2JobId}/candidate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ candId, status: keep ? "keep" : "drop" }) }); } catch { /* best effort */ }
+  }
+
+  async function buildScoutBeats() {
+    if (!ms2JobId) return;
+    const kept = ms2Candidates.filter((c) => c.status === "keep");
+    if (kept.length < 2) { toast({ title: "Keep at least 2 clips first", variant: "destructive" }); return; }
+    setMs2Building(true);
+    try {
+      const r = await fetch(`${API_BASE}/api/scout/${ms2JobId}/approve`, { method: "POST" });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error ?? "Build failed");
+      const beats: MatchSeg[] = (j.beats ?? []).map((b: { localFile: string; startTime: string; endTime: string; headline: string; sourceChannel: string; narrationLine: string }, i: number) => {
+        const tu = kept[i]?.thumbUrl ?? undefined;
+        return {
+          youtubeUrl: "", startTime: b.startTime, endTime: b.endTime,
+          sourceChannel: b.sourceChannel ?? "", headline: b.headline ?? "", narrationLine: b.narrationLine ?? "",
+          localFile: b.localFile, sourceType: "local" as const,
+          thumbUrl: tu ? (tu.startsWith("http") ? tu : `${API_BASE}${tu}`) : undefined,
+          verify: null,
+        };
+      });
+      setMsSegments(beats);
+      if (!msTopic.trim() && ms2Topic.trim()) setMsTopic(ms2Topic.trim());
+      setSourceTab("matchstory");
+      toast({ title: `${beats.length} clips loaded into Match Story`, description: "Add a narration line per beat (or use the Gemini prompt), then Enqueue." });
+    } catch (e) {
+      toast({ title: e instanceof Error ? e.message : "Build failed", variant: "destructive" });
+    } finally { setMs2Building(false); }
   }
 
   async function onSubmit(values: FormValues) {
@@ -1675,6 +1781,7 @@ ${blocks}`;
                     { value: "story", label: "Story", icon: <Film className="w-3.5 h-3.5" /> },
                     { value: "top5", label: "Top 5", icon: <Trophy className="w-3.5 h-3.5" /> },
                     { value: "matchstory", label: "Match Story", icon: <Zap className="w-3.5 h-3.5" /> },
+                    { value: "matchstory2", label: "MS 2.0 · Scout", icon: <Sparkles className="w-3.5 h-3.5" /> },
                   ]}
                 />
                 <Segmented
@@ -2683,6 +2790,79 @@ ${blocks}`;
                 </div>
               )}
 
+              {sourceTab === "matchstory2" && (
+                <div className="space-y-5">
+                  <div className="rounded-xl border border-primary/20 bg-primary/[0.04] p-4">
+                    <div className="flex items-center gap-1.5">
+                      <Sparkles className="w-3.5 h-3.5 text-primary" />
+                      <span className="text-[10.5px] font-mono uppercase tracking-[0.1em] text-primary">Clip-Scout — auto-find clips across your platforms</span>
+                    </div>
+                    <p className="text-xs text-muted-foreground mt-1.5">Enter a topic. The bot searches, ranks and downloads the best clips; you keep the ones you want, then it hands them to Match Story to narrate + render.</p>
+                  </div>
+
+                  <div>
+                    <FieldLabel>Topic</FieldLabel>
+                    <Input placeholder="e.g. Messi free kick goal" value={ms2Topic} onChange={(e) => setMs2Topic(e.target.value)} className="text-sm bg-background" />
+                  </div>
+                  <div>
+                    <FieldLabel>Subreddit hints <span className="text-muted-foreground/40 normal-case">(optional, comma-separated)</span></FieldLabel>
+                    <Input placeholder="soccer, football" value={ms2Subreddits} onChange={(e) => setMs2Subreddits(e.target.value)} className="font-mono text-sm bg-background" />
+                  </div>
+                  <div>
+                    <FieldLabel>Platforms</FieldLabel>
+                    <div className="flex flex-wrap gap-2 mt-1">
+                      {["reddit", "x", "instagram", "facebook"].map((p) => {
+                        const conf = ms2Adapters.find((a) => a.platform === p)?.configured;
+                        const on = ms2Platforms.includes(p);
+                        return (
+                          <button key={p} type="button" onClick={() => toggleMs2Platform(p)}
+                            className={`text-[11px] font-mono uppercase tracking-[0.08em] px-3 h-8 rounded-md border transition-colors ${on ? "bg-primary/15 border-primary/40 text-primary" : "border-border text-muted-foreground hover:border-primary/30"}`}>
+                            {p}{conf === false ? " · add cookie" : ""}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <p className="text-[10px] text-muted-foreground mt-1.5">Reddit works now. X / Instagram / Facebook need a cookies.txt in <span className="font-mono">~/myapp/scout_cookies/</span> (and their search is more limited).</p>
+                  </div>
+                  <Button type="button" onClick={startScout} disabled={ms2Status === "searching" || ms2Status === "downloading"} className="font-mono uppercase tracking-[0.13em] text-xs h-11 px-6">
+                    {(ms2Status === "searching" || ms2Status === "downloading") ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Scouting… {Math.round(ms2Progress)}%</> : <><Sparkles className="mr-2 h-4 w-4" />Scout clips</>}
+                  </Button>
+
+                  {ms2Message && <p className="text-xs text-muted-foreground">{ms2Message}</p>}
+
+                  {ms2Candidates.length > 0 && (
+                    <div className="space-y-3">
+                      <FieldLabel>Candidates <span className="text-muted-foreground/50">({ms2Candidates.filter((c) => c.status === "keep").length} kept / {ms2Candidates.length})</span></FieldLabel>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        {ms2Candidates.map((c) => (
+                          <div key={c.id} className={`rounded-xl border p-3 flex gap-3 ${c.status === "drop" ? "border-border opacity-50" : "border-primary/25 bg-primary/[0.03]"}`}>
+                            {c.thumbUrl ? <img src={c.thumbUrl.startsWith("http") ? c.thumbUrl : `${API_BASE}${c.thumbUrl}`} alt="" className="w-20 h-20 object-cover rounded-md border border-border shrink-0" /> : <div className="w-20 h-20 rounded-md bg-muted grid place-items-center shrink-0"><Film className="w-5 h-5 text-muted-foreground" /></div>}
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-2">
+                                <span className="text-[10px] font-mono uppercase tracking-[0.1em] text-primary">{c.platform}</span>
+                                <span className="text-[10px] font-mono text-emerald-400">{c.score}%</span>
+                                <span className="text-[10px] text-muted-foreground">{Math.round(c.durationSec)}s · {c.height ? c.height + "p" : "?"}</span>
+                              </div>
+                              <p className="text-[12px] text-foreground leading-snug line-clamp-2 mt-0.5">{c.title}</p>
+                              <p className="text-[10px] text-muted-foreground truncate">{c.author}</p>
+                              <div className="flex gap-2 mt-1.5">
+                                <button type="button" onClick={() => toggleCandidate(c.id, c.status !== "keep")} className={`text-[10px] font-mono uppercase tracking-[0.08em] px-2.5 h-7 rounded-md border transition-colors ${c.status === "keep" ? "bg-emerald-500/15 border-emerald-500/40 text-emerald-400" : "border-border text-muted-foreground hover:border-emerald-500/30"}`}>{c.status === "keep" ? "✓ keep" : "keep"}</button>
+                                <a href={c.sourceUrl} target="_blank" rel="noreferrer" className="text-[10px] font-mono uppercase tracking-[0.08em] px-2.5 h-7 rounded-md border border-border text-muted-foreground hover:text-primary inline-flex items-center">source</a>
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                      {ms2Status === "ready" && (
+                        <Button type="button" onClick={buildScoutBeats} disabled={ms2Building || ms2Candidates.filter((c) => c.status === "keep").length < 2} className="w-full font-mono uppercase tracking-[0.13em] text-xs h-11">
+                          {ms2Building ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Building…</> : <>Build {ms2Candidates.filter((c) => c.status === "keep").length} beats → Match Story</>}
+                        </Button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+
               {sourceTab === "matchstory" && (
                 <div className="space-y-5">
                   <div className="rounded-xl border border-border bg-gradient-to-b from-card to-[hsl(240_10%_5%)] p-5 space-y-4">
@@ -2799,6 +2979,20 @@ ${blocks}`;
                             )}
                           </div>
 
+                          {seg.sourceType === "local" ? (
+                            <div className="flex items-center gap-3 rounded-lg border border-primary/20 bg-primary/[0.04] p-2.5">
+                              {seg.thumbUrl ? (
+                                <img src={seg.thumbUrl} alt="" className="w-16 h-16 object-cover rounded-md border border-border shrink-0" />
+                              ) : (
+                                <div className="w-16 h-16 rounded-md bg-muted grid place-items-center shrink-0"><Film className="w-5 h-5 text-muted-foreground" /></div>
+                              )}
+                              <div className="min-w-0">
+                                <p className="text-[11px] font-mono uppercase tracking-[0.1em] text-primary">Scouted clip</p>
+                                <p className="text-[11px] text-muted-foreground truncate">{fmtDuration(seg.startTime, seg.endTime)} · {seg.sourceChannel || "—"}</p>
+                              </div>
+                            </div>
+                          ) : (
+                          <>
                           <div>
                             <FieldLabel>Source URL</FieldLabel>
                             <Input
@@ -2854,6 +3048,8 @@ ${blocks}`;
                                 <p className="text-[10px] text-muted-foreground">No transcript match — use “Re-ask Gemini” above, or fix the time manually.</p>
                               )}
                             </div>
+                          )}
+                          </>
                           )}
 
                           <div className="grid grid-cols-2 gap-3">

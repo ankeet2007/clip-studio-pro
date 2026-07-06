@@ -171,6 +171,7 @@ function sanitizeMatchSegments(raw: unknown): StorySegment[] {
   if (!Array.isArray(raw)) return [];
   const timeRe = /^\d{1,2}:\d{2}(:\d{2})?$/;
   const toHMS = (t: string) => { const p = t.split(":"); while (p.length < 3) p.unshift("00"); return p.slice(-3).map((x) => x.padStart(2, "0")).join(":"); };
+  const uploadsDir = path.resolve(getUploadsDir());
   const out: StorySegment[] = [];
   for (const s of raw) {
     if (!s || typeof s !== "object") continue;
@@ -178,6 +179,25 @@ function sanitizeMatchSegments(raw: unknown): StorySegment[] {
     const st = String(seg.startTime ?? "").trim();
     const en = String(seg.endTime ?? "").trim();
     if (!timeRe.test(st) || !timeRe.test(en)) continue;
+    // Match Story 2.0: a scout-downloaded LOCAL clip beat. Confine the path to the uploads
+    // dir (no traversal / reading arbitrary files) and require it to exist.
+    const rawLocal = String(seg.localFile ?? "").trim();
+    const isLocal = seg.sourceType === "local" && rawLocal.length > 0;
+    if (isLocal) {
+      const resolved = path.resolve(rawLocal);
+      if (!resolved.startsWith(uploadsDir + path.sep) || !fs.existsSync(resolved)) continue;
+      out.push({
+        localFile: resolved,
+        sourceType: "local",
+        startTime: toHMS(st),
+        endTime: toHMS(en),
+        headline: String(seg.headline ?? "").slice(0, 120),
+        sourceChannel: String(seg.sourceChannel ?? "").slice(0, 80),
+        narrationLine: String(seg.narrationLine ?? "").slice(0, 200),
+      });
+      if (out.length >= 8) break;
+      continue;
+    }
     const rawUrl = String(seg.youtubeUrl ?? "").trim();
     if (!rawUrl) continue;
     out.push({

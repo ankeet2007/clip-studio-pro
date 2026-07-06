@@ -680,6 +680,43 @@ function buildYtDlpArgs(
 }
 
 /**
+ * Match Story 2.0 (scout): download a WHOLE social clip (Reddit/X/Instagram/Facebook) by its
+ * post URL. Unlike downloadSegment (YouTube sections, HD-floored, HLS/DASH juggling) social
+ * clips are already short, so we just pull the best <=1080p muxed file with yt-dlp's per-site
+ * extractor. `cookiesFile` is for the platforms that need a logged-in session (X/IG/FB).
+ * Returns the output path on success, or throws.
+ */
+export async function downloadSocialClip(url: string, outPath: string, cookiesFile?: string): Promise<string> {
+  const ytDlp = findYtDlp();
+  const args = [
+    "--no-playlist", "--no-warnings", "--no-part",
+    "-f", "bv*[height<=1080]+ba/b[height<=1080]/b",
+    "--merge-output-format", "mp4",
+    "-o", outPath,
+  ];
+  if (cookiesFile && fs.existsSync(cookiesFile)) args.push("--cookies", cookiesFile);
+  else args.push(...getCookiesArgs());
+  args.push(url);
+  // 6-min hard cap, 90s stall guard — social downloads are small; a longer hang means a wall.
+  await spawnProcess(ytDlp, args, 360_000, () => {}, 90_000, "download");
+  if (!fs.existsSync(outPath)) throw new Error("Download produced no file");
+  return outPath;
+}
+
+/**
+ * Match Story 2.0 (scout): download a direct HLS/DASH manifest URL (e.g. Reddit's v.redd.it
+ * CDN playlist) straight with ffmpeg — no yt-dlp, so it avoids Reddit's IP-blocked API. The
+ * HLS variant carries audio; we stream-copy to mp4.
+ */
+export async function downloadHlsClip(url: string, outPath: string): Promise<string> {
+  await spawnProcess("ffmpeg", [
+    "-y", "-i", url, "-c", "copy", "-movflags", "+faststart", outPath,
+  ], 360_000, () => {}, 90_000, "download");
+  if (!fs.existsSync(outPath)) throw new Error("HLS download produced no file");
+  return outPath;
+}
+
+/**
  * Downloads the exact time segment from YouTube using yt-dlp --download-sections.
  *
  * Strategy (all attempts are 720p+; we NEVER downgrade to 360p):
@@ -1912,6 +1949,11 @@ export interface StorySegment {
   // Match Story only: this beat's own AI narration line. When present the beat is paced to
   // its voiceover and the line is placed at the beat's start (no flat timeline-guess script).
   narrationLine?: string;
+  // Match Story 2.0 only: a beat sourced from a LOCAL downloaded clip (scout) instead of a
+  // YouTube URL. When set, the whole file is used (no yt-dlp, no timestamp verify) and the beat
+  // is NOT window-extended past the clip's real length.
+  localFile?: string;
+  sourceType?: "youtube" | "local";
 }
 
 // Pro-only: one ranked moment of a TOP 5 countdown (jobType "top5"). Superset of
@@ -2382,17 +2424,22 @@ export async function processMatchStory(
 
   const segs = (segments ?? []).slice(0, 8);
   if (segs.length < 2) throw new Error("A Match Story needs at least 2 beats.");
+  const isLocalBeat = (s: StorySegment) => !!(s.localFile && s.localFile.trim());
   for (let i = 0; i < segs.length; i++) {
     const s = segs[i]!;
-    if (!s.youtubeUrl || !s.youtubeUrl.trim()) {
+    if (isLocalBeat(s)) {
+      if (!fs.existsSync(s.localFile!)) throw new Error(`Beat #${i + 1}: downloaded clip is missing — re-scout.`);
+    } else if (!s.youtubeUrl || !s.youtubeUrl.trim()) {
       throw new Error(`Beat #${i + 1} is missing a source video URL.`);
     }
   }
 
-  // Pre-flight every beat's window (durations are cached from the verify step) so a
-  // hallucinated timestamp fails in seconds and names the exact beat, not after ~15 min.
+  // Pre-flight every YouTube beat's window (durations are cached from the verify step) so a
+  // hallucinated timestamp fails in seconds and names the exact beat, not after ~15 min. Local
+  // (scout-downloaded) beats use the whole file, so there's nothing to validate.
   for (let i = 0; i < segs.length; i++) {
     const s = segs[i]!;
+    if (isLocalBeat(s)) continue;
     const check = await validateSegmentWithinVideo(s.youtubeUrl!, s.startTime, s.endTime);
     if (!check.ok) throw new Error(`Beat #${i + 1}: ${check.message}`);
   }
@@ -2445,18 +2492,22 @@ export async function processMatchStory(
             beatVo[i] = { text: line, wav, dur: voDur };
           }
         }
-        const reqLen = Math.max(0, timeToSeconds(seg.endTime) - timeToSeconds(seg.startTime));
-        const pad = 0.3 + 0.9 + (isLast && outroEnabled ? 2 : 0);
-        const targetLen = Math.min(24, Math.max(reqLen, voDur > 0 ? voDur + pad : reqLen));
-        if (targetLen > reqLen + 0.05) endTime = secondsToHMS(timeToSeconds(seg.startTime) + targetLen);
+        // Local (scout) beats are a fixed-length downloaded file — never window-extend them
+        // (that would freeze-pad). YouTube beats stretch to cover their voiceover.
+        if (!isLocalBeat(seg)) {
+          const reqLen = Math.max(0, timeToSeconds(seg.endTime) - timeToSeconds(seg.startTime));
+          const pad = 0.3 + 0.9 + (isLast && outroEnabled ? 2 : 0);
+          const targetLen = Math.min(24, Math.max(reqLen, voDur > 0 ? voDur + pad : reqLen));
+          if (targetLen > reqLen + 0.05) endTime = secondsToHMS(timeToSeconds(seg.startTime) + targetLen);
+        }
       }
 
       const rawFile = `match_${clipId}_seg_${i}_${tmpId}.mp4`;
-      logger.info({ clipId, beat: i + 1, of: segs.length }, "Rendering Match Story beat");
+      logger.info({ clipId, beat: i + 1, of: segs.length, local: isLocalBeat(seg) }, "Rendering Match Story beat");
       try {
         await processClip(
-          seg.youtubeUrl!, seg.startTime, endTime, seg.headline ?? "",
-          rawFile, "edited", channelHandle, 0, undefined, frameStyle, seg.sourceChannel || sourceChannel,
+          isLocalBeat(seg) ? null : seg.youtubeUrl!, seg.startTime, endTime, seg.headline ?? "",
+          rawFile, "edited", channelHandle, 0, isLocalBeat(seg) ? seg.localFile : undefined, frameStyle, seg.sourceChannel || sourceChannel,
           false, isLast && outroEnabled, false, "",
           seg.punchInEnabled ?? false, seg.zoomMoments ?? "", "", "hook", ""
         );
