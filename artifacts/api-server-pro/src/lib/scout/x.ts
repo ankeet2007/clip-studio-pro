@@ -37,8 +37,11 @@ export const xAdapter: ScoutAdapter = {
       });
     });
 
+    // Tweet IDs are 19-digit ints that exceed JS's safe-integer range; JSON.parse rounds them
+    // and the resulting /status/<id> URL 404s. Quote those big ints so they survive as strings.
+    const safe = json.replace(/"(tweet_id|retweet_id|conversation_id|quote_id)":\s*(\d{16,})/g, '"$1":"$2"');
     let entries: unknown[] = [];
-    try { entries = JSON.parse(json); } catch { entries = []; }
+    try { entries = JSON.parse(safe); } catch { entries = []; }
 
     const out: RawCandidate[] = [];
     const seen = new Set<string>();

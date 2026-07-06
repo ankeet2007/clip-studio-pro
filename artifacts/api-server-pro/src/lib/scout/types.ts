@@ -38,23 +38,18 @@ export interface ScoredCandidate extends RawCandidate {
   reasons: string[];        // human-readable "why this clip" for the review UI
 }
 
-/** A candidate after it has been downloaded + probed. */
-export interface DownloadedCandidate extends ScoredCandidate {
-  localFile: string;        // absolute path in the uploads dir
-  durationSec: number;
-  width?: number;
-  height?: number;
-  transcript?: string;      // optional whisper enrichment
-  thumbFile?: string;       // local extracted thumbnail
+/** A ranked candidate as SHOWN in the review grid — search metadata only, NOT yet downloaded.
+ * Downloading happens lazily at approve time for the kept ones (so we can show ~40 cheaply). */
+export interface ReviewCandidate extends ScoredCandidate {
   status: "candidate" | "keep" | "drop";
 }
 
 export interface ScoutOptions {
   platforms: Platform[];
   subreddits?: string[];    // Reddit target hints (else auto)
-  accounts?: string[];      // X/IG/FB target hints (later phases)
-  maxPerPlatform?: number;  // search-result cap per platform
-  maxDownload?: number;     // how many top-ranked candidates to actually download
+  accounts?: string[];      // X/IG/FB target hints
+  maxPerPlatform?: number;  // search-result cap per platform (raw, before ranking)
+  maxCandidates?: number;   // how many top-ranked candidates to PRESENT for review
   minDurationSec?: number;  // target clip window
   maxDurationSec?: number;
 }
@@ -66,7 +61,7 @@ export interface ScoutJob {
   status: "searching" | "downloading" | "ready" | "error";
   progress: number;         // 0-100
   message?: string;
-  candidates: DownloadedCandidate[];
+  candidates: ReviewCandidate[];
   createdAt: number;
 }
 

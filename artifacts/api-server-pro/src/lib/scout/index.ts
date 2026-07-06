@@ -16,7 +16,7 @@ import { facebookAdapter } from "./facebook";
 import { buildQueryPlan } from "./query";
 import { rankCandidates } from "./score";
 import { readScoutConfig, cookieFileFor, type ScoutConfig } from "./config";
-import type { ScoutAdapter, ScoutJob, ScoutOptions, RawCandidate, DownloadedCandidate, Platform } from "./types";
+import type { ScoutAdapter, ScoutJob, ScoutOptions, RawCandidate, Platform } from "./types";
 
 const execFileAsync = promisify(execFile);
 
@@ -89,8 +89,11 @@ async function runScout(job: ScoutJob): Promise<void> {
     const enabled = ADAPTERS.filter((a) => job.options.platforms.includes(a.platform) && a.isConfigured());
     if (enabled.length === 0) { job.status = "error"; job.message = "No configured platforms selected."; return; }
 
-    // 1) Search every enabled platform.
+    // Search every enabled platform, streaming the ranked shortlist to the poller as each
+    // platform returns. NOTHING is downloaded here — we present ~40 candidates from metadata
+    // (cheap) and only download the ones the user keeps, at approve time.
     job.status = "searching";
+    const cap = job.options.maxCandidates ?? 40;
     const raw: RawCandidate[] = [];
     for (let i = 0; i < enabled.length; i++) {
       try {
@@ -100,51 +103,14 @@ async function runScout(job: ScoutJob): Promise<void> {
       } catch (e) {
         logger.warn({ e, platform: enabled[i]!.platform }, "Scout adapter search failed");
       }
-      job.progress = 2 + ((i + 1) / enabled.length) * 30;
+      job.candidates = rankCandidates(raw, plan.terms, job.options).slice(0, cap).map((c) => ({ ...c, status: "candidate" as const }));
+      job.progress = 5 + ((i + 1) / enabled.length) * 90;
     }
 
-    // 2) Rank + de-dup, then take the top N to actually download.
-    const ranked = rankCandidates(raw, plan.terms, job.options);
-    const toDownload = ranked.slice(0, Math.min(12, job.options.maxDownload ?? 8));
-    if (toDownload.length === 0) { job.status = "ready"; job.progress = 100; job.message = "No matching video clips found. Try a broader topic, add platforms, or add creds/cookies."; return; }
-
-    // 3) Download + probe sequentially (memory-safe on the phone), streaming results as they land.
-    job.status = "downloading";
-    const uploads = getUploadsDir();
-    const cfg = readScoutConfig();
-    const minD = job.options.minDurationSec ?? 3;
-    const maxD = job.options.maxDurationSec ?? 60;
-    const out: DownloadedCandidate[] = [];
-    for (let i = 0; i < toDownload.length; i++) {
-      const c = toDownload[i]!;
-      const file = path.join(uploads, `scout_${job.id}_${i}.mp4`);
-      try {
-        if (c.downloadKind === "hls" && c.downloadUrl) {
-          await downloadHlsClip(c.downloadUrl, file);
-        } else {
-          await downloadSocialClip(c.downloadUrl || c.sourceUrl, file, cookieForPlatform(cfg, c.platform));
-        }
-        const meta = await probeMedia(file);
-        if (meta.duration < 1 || meta.duration > 180) { try { fs.unlinkSync(file); } catch { /**/ } continue; }
-        const thumbFile = await makeThumb(file, path.join(uploads, `scout_${job.id}_${i}.jpg`));
-        // Refine quality now that we know real duration/resolution.
-        const inWindow = meta.duration >= minD && meta.duration <= maxD;
-        const hd = (meta.height ?? 0) >= 480;
-        const quality = (inWindow ? 0.6 : 0.25) + (hd ? 0.4 : 0.1);
-        const reasons = [...c.reasons, `${Math.round(meta.duration)}s`, `${meta.width ?? "?"}x${meta.height ?? "?"}`, meta.hasAudio ? "has audio" : "no audio"];
-        out.push({ ...c, localFile: file, durationSec: meta.duration, width: meta.width, height: meta.height, thumbFile, status: "candidate", scores: { ...c.scores, quality }, reasons });
-      } catch (e) {
-        logger.warn({ e, url: c.sourceUrl.slice(0, 80) }, "Scout clip download failed");
-        try { fs.existsSync(file) && fs.unlinkSync(file); } catch { /**/ }
-      }
-      job.candidates = out.slice(); // stream partial progress to the poller
-      job.progress = 35 + ((i + 1) / toDownload.length) * 60;
-    }
-
-    job.candidates = out;
+    job.candidates = rankCandidates(raw, plan.terms, job.options).slice(0, cap).map((c) => ({ ...c, status: "candidate" as const }));
     job.status = "ready";
     job.progress = 100;
-    if (out.length === 0) job.message = "Found posts but none downloaded (private/removed/geo-blocked). Try again or widen the search.";
+    if (job.candidates.length === 0) job.message = "No matching video clips found. Try a broader topic, add platforms, or check the platform cookies.";
   } catch (e) {
     job.status = "error";
     job.message = e instanceof Error ? e.message : String(e);
@@ -152,22 +118,36 @@ async function runScout(job: ScoutJob): Promise<void> {
   }
 }
 
-/** Build Match Story beats from the KEPT candidates of a finished scout job. */
-export function buildBeatsFromJob(jobId: string): { localFile: string; sourceType: "local"; startTime: string; endTime: string; headline: string; sourceChannel: string; narrationLine: string }[] {
+/** Download the KEPT candidates NOW (only what the user chose) and build Match Story beats.
+ * Runs at approve time; failed/too-long downloads are skipped. thumbUrl is the remote thumb for UI. */
+export async function buildBeatsFromJob(jobId: string): Promise<{ localFile: string; sourceType: "local"; startTime: string; endTime: string; headline: string; sourceChannel: string; narrationLine: string; thumbUrl: string | null }[]> {
   const job = jobs.get(jobId);
   if (!job) return [];
   const kept = job.candidates.filter((c) => c.status === "keep");
+  const uploads = getUploadsDir();
+  const cfg = readScoutConfig();
   const toHMS = (s: number) => {
     const t = Math.max(1, Math.round(s));
     return [Math.floor(t / 3600), Math.floor((t % 3600) / 60), t % 60].map((n) => String(n).padStart(2, "0")).join(":");
   };
-  return kept.map((c) => ({
-    localFile: c.localFile,
-    sourceType: "local" as const,
-    startTime: "00:00:00",
-    endTime: toHMS(c.durationSec),
-    headline: c.title.replace(/\s+/g, " ").slice(0, 80),
-    sourceChannel: c.author,
-    narrationLine: "",
-  }));
+  const beats: { localFile: string; sourceType: "local"; startTime: string; endTime: string; headline: string; sourceChannel: string; narrationLine: string; thumbUrl: string | null }[] = [];
+  for (let i = 0; i < kept.length; i++) {
+    const c = kept[i]!;
+    const file = path.join(uploads, `scout_${job.id}_${i}_${Date.now()}.mp4`);
+    try {
+      if (c.downloadKind === "hls" && c.downloadUrl) await downloadHlsClip(c.downloadUrl, file);
+      else await downloadSocialClip(c.downloadUrl || c.sourceUrl, file, cookieForPlatform(cfg, c.platform));
+      const meta = await probeMedia(file);
+      if (meta.duration < 1 || meta.duration > 180) { try { fs.unlinkSync(file); } catch { /**/ } continue; }
+      beats.push({
+        localFile: file, sourceType: "local", startTime: "00:00:00", endTime: toHMS(meta.duration),
+        headline: c.title.replace(/\s+/g, " ").slice(0, 80), sourceChannel: c.author, narrationLine: "",
+        thumbUrl: c.thumbnail ?? null,
+      });
+    } catch (e) {
+      logger.warn({ e, url: c.sourceUrl.slice(0, 80) }, "Scout clip download failed at approve");
+      try { fs.existsSync(file) && fs.unlinkSync(file); } catch { /**/ }
+    }
+  }
+  return beats;
 }

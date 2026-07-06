@@ -105,7 +105,7 @@ interface ScoutCandidate {
   author: string;
   sourceUrl: string;
   engagement: number;
-  durationSec: number;
+  durationSec: number | null;
   width: number | null;
   height: number | null;
   score: number;
@@ -1634,7 +1634,7 @@ OUTPUT — return EXACTLY one line per clip and nothing else:
     setMs2Candidates([]); setMs2Message(""); setMs2Status("searching"); setMs2Progress(2); setMs2JobId(null);
     try {
       const subs = ms2Subreddits.split(",").map((s) => s.trim()).filter(Boolean);
-      const r = await fetch(`${API_BASE}/api/scout`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ topic, platforms: ms2Platforms, subreddits: subs, maxDownload: 8 }) });
+      const r = await fetch(`${API_BASE}/api/scout`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ topic, platforms: ms2Platforms, subreddits: subs, maxCandidates: 40 }) });
       const j = await r.json();
       if (!r.ok) throw new Error(j.error ?? "Scout failed");
       setMs2JobId(j.id);
@@ -1660,16 +1660,13 @@ OUTPUT — return EXACTLY one line per clip and nothing else:
       const r = await fetch(`${API_BASE}/api/scout/${ms2JobId}/approve`, { method: "POST" });
       const j = await r.json();
       if (!r.ok) throw new Error(j.error ?? "Build failed");
-      const beats: MatchSeg[] = (j.beats ?? []).map((b: { localFile: string; startTime: string; endTime: string; headline: string; sourceChannel: string; narrationLine: string }, i: number) => {
-        const tu = kept[i]?.thumbUrl ?? undefined;
-        return {
-          youtubeUrl: "", startTime: b.startTime, endTime: b.endTime,
-          sourceChannel: b.sourceChannel ?? "", headline: b.headline ?? "", narrationLine: b.narrationLine ?? "",
-          localFile: b.localFile, sourceType: "local" as const,
-          thumbUrl: tu ? (tu.startsWith("http") ? tu : `${API_BASE}${tu}`) : undefined,
-          verify: null,
-        };
-      });
+      const beats: MatchSeg[] = (j.beats ?? []).map((b: { localFile: string; startTime: string; endTime: string; headline: string; sourceChannel: string; narrationLine: string; thumbUrl: string | null }) => ({
+        youtubeUrl: "", startTime: b.startTime, endTime: b.endTime,
+        sourceChannel: b.sourceChannel ?? "", headline: b.headline ?? "", narrationLine: b.narrationLine ?? "",
+        localFile: b.localFile, sourceType: "local" as const,
+        thumbUrl: b.thumbUrl ? (b.thumbUrl.startsWith("http") ? b.thumbUrl : `${API_BASE}${b.thumbUrl}`) : undefined,
+        verify: null,
+      }));
       setMs2Beats(beats);
       toast({ title: `${beats.length} clips ready`, description: "Add a narration line per beat (or use the Gemini prompt below), then Enqueue." });
     } catch (e) {
@@ -2916,7 +2913,7 @@ OUTPUT — return EXACTLY one line per clip and nothing else:
                               <div className="flex items-center gap-2">
                                 <span className="text-[10px] font-mono uppercase tracking-[0.1em] text-primary">{c.platform}</span>
                                 <span className="text-[10px] font-mono text-emerald-400">{c.score}%</span>
-                                <span className="text-[10px] text-muted-foreground">{Math.round(c.durationSec)}s · {c.height ? c.height + "p" : "?"}</span>
+                                {c.durationSec ? <span className="text-[10px] text-muted-foreground">{Math.round(c.durationSec)}s</span> : null}
                               </div>
                               <p className="text-[12px] text-foreground leading-snug line-clamp-2 mt-0.5">{c.title}</p>
                               <p className="text-[10px] text-muted-foreground truncate">{c.author}</p>
