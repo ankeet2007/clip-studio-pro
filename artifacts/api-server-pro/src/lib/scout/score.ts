@@ -55,7 +55,9 @@ export function rankCandidates(cands: RawCandidate[], terms: string[], opts: Sco
   const scored: ScoredCandidate[] = [];
   for (let i = 0; i < cands.length; i++) {
     const c = cands[i]!;
-    const relevance = relevanceScore(c.title, terms);
+    // Facebook has no search — its candidates are URLs the user explicitly pasted, so they're
+    // relevant by definition and skip the topic-relevance floor.
+    const relevance = c.platform === "facebook" ? 1 : relevanceScore(c.title, terms);
     if (relevance < RELEVANCE_FLOOR) continue; // hard filter
     const engagement = engPct(c.engagement || 0);
     const recency = recencyScore(c.createdAt);

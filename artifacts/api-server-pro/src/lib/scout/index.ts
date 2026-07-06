@@ -10,6 +10,9 @@ import { promisify } from "util";
 import { getUploadsDir, downloadSocialClip, downloadHlsClip } from "../clipProcessor";
 import { logger } from "../logger";
 import { redditAdapter } from "./reddit";
+import { xAdapter } from "./x";
+import { instagramAdapter } from "./instagram";
+import { facebookAdapter } from "./facebook";
 import { buildQueryPlan } from "./query";
 import { rankCandidates } from "./score";
 import { readScoutConfig, cookieFileFor, type ScoutConfig } from "./config";
@@ -19,7 +22,7 @@ const execFileAsync = promisify(execFile);
 
 // Registry — Reddit ships in Phase A; x/instagram/facebook adapters slot in behind the same
 // interface in later phases without touching this file's logic.
-const ADAPTERS: ScoutAdapter[] = [redditAdapter];
+const ADAPTERS: ScoutAdapter[] = [redditAdapter, xAdapter, instagramAdapter, facebookAdapter];
 
 const jobs = new Map<string, ScoutJob>();
 
@@ -129,7 +132,7 @@ async function runScout(job: ScoutJob): Promise<void> {
         const hd = (meta.height ?? 0) >= 480;
         const quality = (inWindow ? 0.6 : 0.25) + (hd ? 0.4 : 0.1);
         const reasons = [...c.reasons, `${Math.round(meta.duration)}s`, `${meta.width ?? "?"}x${meta.height ?? "?"}`, meta.hasAudio ? "has audio" : "no audio"];
-        out.push({ ...c, localFile: file, durationSec: meta.duration, width: meta.width, height: meta.height, thumbFile, status: "keep", scores: { ...c.scores, quality }, reasons });
+        out.push({ ...c, localFile: file, durationSec: meta.duration, width: meta.width, height: meta.height, thumbFile, status: "candidate", scores: { ...c.scores, quality }, reasons });
       } catch (e) {
         logger.warn({ e, url: c.sourceUrl.slice(0, 80) }, "Scout clip download failed");
         try { fs.existsSync(file) && fs.unlinkSync(file); } catch { /**/ }

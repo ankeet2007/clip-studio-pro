@@ -677,6 +677,10 @@ export default function Home() {
   const [ms2Adapters, setMs2Adapters] = useState<{ platform: string; configured: boolean }[]>([]);
   const [ms2Building, setMs2Building] = useState(false);
   const ms2Poll = useRef<ReturnType<typeof setInterval> | null>(null);
+  // MS 2.0's OWN beats (isolated from the Match Story tab) + its narration paste + submit state.
+  const [ms2Beats, setMs2Beats] = useState<MatchSeg[]>([]);
+  const [ms2NarrPaste, setMs2NarrPaste] = useState("");
+  const [ms2Submitting, setMs2Submitting] = useState(false);
 
   // ----- Shared AI voice + pace (applies to whichever job you create) -----
   // voVoice "" = let the server pick the best deep voice per mode; voSpeed = Piper length_scale.
@@ -1528,6 +1532,79 @@ ${blocks}`;
   }
 
   // ---------- Match Story 2.0 (clip-scout) ----------
+  // Hook-first narration prompt for the SCOUTED beats (clips already exist + are in order, so
+  // Gemini only writes the voiceover arc). Self-contained to MS 2.0.
+  async function copyMs2NarrationPrompt() {
+    if (ms2Beats.length < 2) { toast({ title: "Build at least 2 beats first", variant: "destructive" }); return; }
+    const topic = ms2Topic.trim() || "<the topic of this montage>";
+    const list = ms2Beats.map((s, i) => `${i + 1} | ${s.headline || "(clip)"} — ${s.sourceChannel || "?"}, ${fmtDuration(s.startTime, s.endTime)}`).join("\n");
+    const prompt =
+`ROLE: You are a viral short-form sports editor writing the VOICEOVER for a fast vertical montage titled "${topic}". I ALREADY have these clips, in THIS order. Write ONE punchy commentator line per clip so that together they tell a HOOK-FIRST story arc (hook → escalation → payoff) that holds viewers to the very end.
+
+RULES:
+- Clip 1's line is the HOOK — a curiosity-gap opener that makes people NOT scroll.
+- Each line 6-16 words, present tense, hype commentator tone; ADVANCE the story, don't just describe what's on screen.
+- Don't reference other clips, the montage, or timestamps.
+
+CLIPS (in order):
+${list}
+
+OUTPUT — return EXACTLY one line per clip and nothing else:
+1 | <narration for clip 1>
+2 | <narration for clip 2>
+...`;
+    const ok = await copyTextToClipboard(prompt);
+    toast(ok
+      ? { title: "Narration prompt copied", description: "Run it in Gemini, then paste its numbered lines back below." }
+      : { title: "Copy failed", variant: "destructive" });
+  }
+
+  function applyMs2NarrationPaste() {
+    const text = ms2NarrPaste.replace(/[​‌‍﻿⁠]/g, "");
+    const map = new Map<number, string>();
+    for (const line of text.split(/\r?\n/)) {
+      const m = line.trim().match(/^(\d{1,2})\s*[|.):\-]\s*(.+)$/);
+      if (!m) continue;
+      const n = Number(m[1]);
+      if (n) map.set(n, m[2].trim().slice(0, 200));
+    }
+    if (map.size === 0) { toast({ title: "Couldn't read the lines", description: "Paste numbered lines like  1 | Ninety-third minute…", variant: "destructive" }); return; }
+    setMs2Beats((prev) => prev.map((s, i) => (map.has(i + 1) ? { ...s, narrationLine: map.get(i + 1)! } : s)));
+    setMs2NarrPaste("");
+    toast({ title: `Narration filled for ${map.size} beats`, description: "Review the lines, then Enqueue." });
+  }
+
+  function updateMs2Beat(i: number, patch: Partial<MatchSeg>) {
+    setMs2Beats((prev) => prev.map((s, idx) => (idx === i ? { ...s, ...patch } : s)));
+  }
+
+  async function submitMs2() {
+    const beats = ms2Beats.filter((s) => s.localFile);
+    if (beats.length < 2) { toast({ title: "Need at least 2 clips", variant: "destructive" }); return; }
+    setMs2Submitting(true);
+    try {
+      const r = await fetch(`${API_BASE}/api/clips/matchstory`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: ms2Topic, frameStyle: wFrame, sourceChannel: msCreator,
+          captionsEnabled: msCaptions, outroEnabled: msOutro, captionColor: "#FFF400",
+          transitionsEnabled: msTransitions, titleCardEnabled: msTitleCard,
+          voiceoverVoice: voVoice, voiceoverSpeed: voSpeed,
+          segments: beats.slice(0, 8).map((s) => ({ sourceType: "local", localFile: s.localFile, startTime: s.startTime, endTime: s.endTime, headline: s.headline, sourceChannel: s.sourceChannel, narrationLine: s.narrationLine })),
+        }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error ?? "Failed to enqueue");
+      queryClient.invalidateQueries({ queryKey: getListClipsQueryKey() });
+      queryClient.invalidateQueries({ queryKey: getGetClipStatsQueryKey() });
+      toast({ title: "Match Story 2.0 job enqueued", description: "It stitches your scouted clips, narrates, then renders — watch the Timeline." });
+      setMs2Beats([]); setMs2Candidates([]); setMs2JobId(null); setMs2Status("");
+    } catch (e) {
+      toast({ title: e instanceof Error ? e.message : "Failed", variant: "destructive" });
+    } finally { setMs2Submitting(false); }
+  }
+
+
   useEffect(() => {
     if (sourceTab === "matchstory2" && ms2Adapters.length === 0) {
       fetch(`${API_BASE}/api/scout/adapters`).then((r) => r.json()).then((d) => setMs2Adapters(d.adapters ?? [])).catch(() => {});
@@ -1593,10 +1670,8 @@ ${blocks}`;
           verify: null,
         };
       });
-      setMsSegments(beats);
-      if (!msTopic.trim() && ms2Topic.trim()) setMsTopic(ms2Topic.trim());
-      setSourceTab("matchstory");
-      toast({ title: `${beats.length} clips loaded into Match Story`, description: "Add a narration line per beat (or use the Gemini prompt), then Enqueue." });
+      setMs2Beats(beats);
+      toast({ title: `${beats.length} clips ready`, description: "Add a narration line per beat (or use the Gemini prompt below), then Enqueue." });
     } catch (e) {
       toast({ title: e instanceof Error ? e.message : "Build failed", variant: "destructive" });
     } finally { setMs2Building(false); }
@@ -2835,7 +2910,7 @@ ${blocks}`;
                       <FieldLabel>Candidates <span className="text-muted-foreground/50">({ms2Candidates.filter((c) => c.status === "keep").length} kept / {ms2Candidates.length})</span></FieldLabel>
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                         {ms2Candidates.map((c) => (
-                          <div key={c.id} className={`rounded-xl border p-3 flex gap-3 ${c.status === "drop" ? "border-border opacity-50" : "border-primary/25 bg-primary/[0.03]"}`}>
+                          <div key={c.id} className={`rounded-xl border p-3 flex gap-3 transition-colors ${c.status === "keep" ? "border-emerald-500/40 bg-emerald-500/[0.06]" : c.status === "drop" ? "border-border opacity-40" : "border-border"}`}>
                             {c.thumbUrl ? <img src={c.thumbUrl.startsWith("http") ? c.thumbUrl : `${API_BASE}${c.thumbUrl}`} alt="" className="w-20 h-20 object-cover rounded-md border border-border shrink-0" /> : <div className="w-20 h-20 rounded-md bg-muted grid place-items-center shrink-0"><Film className="w-5 h-5 text-muted-foreground" /></div>}
                             <div className="min-w-0 flex-1">
                               <div className="flex items-center gap-2">
@@ -2855,9 +2930,56 @@ ${blocks}`;
                       </div>
                       {ms2Status === "ready" && (
                         <Button type="button" onClick={buildScoutBeats} disabled={ms2Building || ms2Candidates.filter((c) => c.status === "keep").length < 2} className="w-full font-mono uppercase tracking-[0.13em] text-xs h-11">
-                          {ms2Building ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Building…</> : <>Build {ms2Candidates.filter((c) => c.status === "keep").length} beats → Match Story</>}
+                          {ms2Building ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />Building…</> : <>Build montage from {ms2Candidates.filter((c) => c.status === "keep").length} clips</>}
                         </Button>
                       )}
+                    </div>
+                  )}
+
+                  {ms2Beats.length > 0 && (
+                    <div className="space-y-4 pt-3 border-t border-border">
+                      <FieldLabel>Your montage <span className="text-muted-foreground/50">({ms2Beats.length} clips · in order)</span></FieldLabel>
+                      {ms2Beats.map((b, i) => (
+                        <div key={i} className="rounded-xl border border-border bg-background/40 p-3 space-y-2.5">
+                          <div className="flex items-center gap-3">
+                            <span className="font-mono text-[13px] text-primary bg-primary/[0.08] border border-primary/20 min-w-[2.6rem] h-7 px-2 rounded-md grid place-items-center font-bold tabular-nums">#{i + 1}</span>
+                            {b.thumbUrl ? <img src={b.thumbUrl} alt="" className="w-12 h-12 object-cover rounded-md border border-border" /> : <div className="w-12 h-12 rounded-md bg-muted grid place-items-center"><Film className="w-4 h-4 text-muted-foreground" /></div>}
+                            <span className="text-[11px] text-muted-foreground truncate flex-1">{fmtDuration(b.startTime, b.endTime)} · {b.sourceChannel || "—"}</span>
+                            {ms2Beats.length > 2 && <button type="button" onClick={() => setMs2Beats((p) => p.filter((_, idx) => idx !== i))} className="w-7 h-7 grid place-items-center rounded-md border border-border text-muted-foreground hover:text-destructive hover:border-destructive/40 transition-colors"><Trash2 className="w-3.5 h-3.5" /></button>}
+                          </div>
+                          <div>
+                            <FieldLabel>Headline</FieldLabel>
+                            <Input value={b.headline} onChange={(e) => updateMs2Beat(i, { headline: e.target.value })} className="text-sm bg-background" placeholder="On-screen title…" />
+                          </div>
+                          <div>
+                            <FieldLabel>Narration <span className="text-muted-foreground/40 normal-case">(spoken over this clip)</span></FieldLabel>
+                            <Textarea value={b.narrationLine} onChange={(e) => updateMs2Beat(i, { narrationLine: e.target.value })} className="text-sm bg-background min-h-[52px]" placeholder="One punchy hook-first line…" />
+                          </div>
+                        </div>
+                      ))}
+
+                      <div className="rounded-xl border border-primary/20 bg-primary/[0.03] p-4 space-y-2.5">
+                        <div className="flex items-center gap-1.5"><Sparkles className="w-3.5 h-3.5 text-primary" /><span className="text-[10.5px] font-mono uppercase tracking-[0.1em] text-primary">Narrate with Gemini (hook-first)</span></div>
+                        <p className="text-[11px] text-muted-foreground">Copy a prompt listing your clips → run it in Gemini → paste the numbered lines back to fill each beat's narration.</p>
+                        <button type="button" onClick={copyMs2NarrationPrompt} className="text-[11px] font-mono uppercase tracking-[0.08em] px-3 h-8 rounded-md bg-primary/15 border border-primary/30 text-primary hover:bg-primary/25 transition-colors inline-flex items-center gap-1.5"><SendHorizonal className="w-3 h-3" /> Copy narration prompt</button>
+                        <Textarea value={ms2NarrPaste} onChange={(e) => setMs2NarrPaste(e.target.value)} placeholder={"Paste Gemini's reply:\n1 | Ninety-third minute — one chance left.\n2 | The wall goes up, and Messi stands over it."} className="text-sm bg-background font-mono min-h-[90px]" />
+                        <button type="button" onClick={applyMs2NarrationPaste} disabled={!ms2NarrPaste.trim()} className="text-[11px] font-mono uppercase tracking-[0.08em] px-3 h-8 rounded-md border border-border text-foreground hover:border-primary/40 disabled:opacity-40 transition-colors">Apply narration</button>
+                      </div>
+
+                      <div className="rounded-xl border border-[#9b7bff]/30 bg-gradient-to-b from-[#9b7bff]/[0.08] to-[#9b7bff]/[0.02] p-4">
+                        <div className="flex items-center gap-1.5"><Mic className="w-3.5 h-3.5 text-[#9b7bff]" /><span className="text-[10.5px] font-mono uppercase tracking-[0.1em] text-[#c9b8ff]">Commentary voiceover</span></div>
+                        <VoicePicker voice={voVoice} speed={voSpeed} onVoice={setVoVoice} onSpeed={setVoSpeed} autoVoice="en_GB-alan-medium" />
+                      </div>
+
+                      <div className="flex flex-wrap gap-2">
+                        <ToggleChip label="Captions" checked={msCaptions} onChange={setMsCaptions} />
+                        <ToggleChip label="Outro card" checked={msOutro} onChange={setMsOutro} />
+                        <ToggleChip label="Title card" checked={msTitleCard} onChange={setMsTitleCard} />
+                        <ToggleChip label="Crossfades" checked={msTransitions} onChange={setMsTransitions} />
+                      </div>
+                      <Button type="button" disabled={ms2Submitting} onClick={submitMs2} className="w-full font-mono uppercase tracking-[0.13em] text-xs h-12">
+                        {ms2Submitting ? <><Loader2 className="mr-2 h-4 w-4 animate-spin" />DISPATCHING…</> : <><Zap className="mr-2 h-4 w-4" />ENQUEUE MATCH STORY 2.0</>}
+                      </Button>
                     </div>
                   )}
                 </div>
