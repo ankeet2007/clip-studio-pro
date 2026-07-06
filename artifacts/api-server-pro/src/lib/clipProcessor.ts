@@ -2090,7 +2090,16 @@ async function mixNarrationOnFile(
       if (narrHasAudio && smoothDuck) {
         // Smooth sidechain duck: sum the voice into one key, compress the footage by it
         // (attack/release act as fades), then mix the voice back over the ducked footage.
-        parts.push(`${narrLabels.join("")}amix=inputs=${narrLabels.length}:duration=first:normalize=0[narrsum]`);
+        // NB: duration=LONGEST — with duration=first the sum would be truncated to the first
+        // (earliest, ~3s) line and every later line would be cut off. Then apad to the FULL
+        // footage length: sidechaincompress ends when its key ends, so a short key would clip
+        // the footage-audio tail after the last line. amix needs >=2 inputs, so a single line
+        // is padded directly.
+        if (narrLabels.length === 1) {
+          parts.push(`${narrLabels[0]}apad=whole_dur=${duration}[narrsum]`);
+        } else {
+          parts.push(`${narrLabels.join("")}amix=inputs=${narrLabels.length}:duration=longest:normalize=0,apad=whole_dur=${duration}[narrsum]`);
+        }
         parts.push(`[narrsum]asplit=2[nkey][nmix]`);
         parts.push(`[0:a]aresample=48000,aformat=channel_layouts=stereo[foot]`);
         parts.push(`[foot][nkey]sidechaincompress=threshold=0.02:ratio=20:attack=5:release=260:makeup=1[duckfoot]`);
