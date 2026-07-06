@@ -186,6 +186,7 @@ function sanitizeMatchSegments(raw: unknown): StorySegment[] {
       endTime: toHMS(en),
       headline: String(seg.headline ?? "").slice(0, 120),
       sourceChannel: String(seg.sourceChannel ?? "").slice(0, 80),
+      narrationLine: String(seg.narrationLine ?? "").slice(0, 200),
       zoomMoments: typeof seg.zoomMoments === "string" ? seg.zoomMoments : "",
       punchInEnabled: seg.punchInEnabled === true,
     });
@@ -264,7 +265,10 @@ function dispatchMatchStoryJob(
   narrationScript: string,
   segments: StorySegment[],
   voiceoverVoice = "",
-  voiceoverSpeed = ""
+  voiceoverSpeed = "",
+  title = "",
+  transitionsEnabled = true,
+  titleCardEnabled = true
 ) {
   const { channelHandle } = readSettings();
   enqueueClipJob(async () => {
@@ -273,7 +277,7 @@ function dispatchMatchStoryJob(
     } catch (err: unknown) {
       logger.error({ err, clipId }, "Failed to mark Match Story as processing");
     }
-    await processMatchStory(outputFilename, channelHandle, clipId, frameStyle, sourceChannel, captionsEnabled, outroEnabled, captionColor, narrationScript, segments, { voice: voiceoverVoice, speed: voiceoverSpeed })
+    await processMatchStory(outputFilename, channelHandle, clipId, frameStyle, sourceChannel, captionsEnabled, outroEnabled, captionColor, narrationScript, segments, { voice: voiceoverVoice, speed: voiceoverSpeed }, title, transitionsEnabled, titleCardEnabled)
       .then(async () => {
         await db.update(clipsTable).set({ status: "done", progress: 100, outputFilename }).where(eq(clipsTable.id, clipId));
       })
@@ -296,6 +300,7 @@ router.post("/clips/matchstory", async (req, res): Promise<void> => {
     captionsEnabled?: boolean; outroEnabled?: boolean; captionColor?: string;
     narrationScript?: string; segments?: unknown;
     voiceoverVoice?: string; voiceoverSpeed?: string;
+    transitionsEnabled?: boolean; titleCardEnabled?: boolean;
   };
 
   const segments = sanitizeMatchSegments(body.segments);
@@ -303,6 +308,8 @@ router.post("/clips/matchstory", async (req, res): Promise<void> => {
     res.status(400).json({ error: "A Match Story needs at least 2 valid beats (each with a source URL and a start/end time)." });
     return;
   }
+  const transitionsEnabled = body.transitionsEnabled ?? true;
+  const titleCardEnabled = body.titleCardEnabled ?? true;
 
   const frameStyle = (body.frameStyle === "standard" ? "standard" : "immersive") as "standard" | "immersive";
   const sourceChannel = body.sourceChannel ?? "";
@@ -333,7 +340,47 @@ router.post("/clips/matchstory", async (req, res): Promise<void> => {
   res.status(201).json(GetClipResponse.parse(clip));
 
   const outputFilename = `clip_${clip.id}_${Date.now()}.mp4`;
-  dispatchMatchStoryJob(clip.id, outputFilename, frameStyle, sourceChannel, captionsEnabled, outroEnabled, captionColor, narrationScript, segments, voiceoverVoice, voiceoverSpeed);
+  dispatchMatchStoryJob(clip.id, outputFilename, frameStyle, sourceChannel, captionsEnabled, outroEnabled, captionColor, narrationScript, segments, voiceoverVoice, voiceoverSpeed, headline, transitionsEnabled, titleCardEnabled);
+});
+
+/**
+ * POST /clips/matchstory/verify — check each beat's timestamp actually exists in its source
+ * video (Gemini's timestamps are guesses). Mirrors /clips/top5/verify but beats have no rank,
+ * so results are keyed by array `index`. Read-only; sequential to stay light on the phone.
+ */
+router.post("/clips/matchstory/verify", async (req, res): Promise<void> => {
+  const body = req.body as { segments?: unknown };
+  const raw = Array.isArray(body.segments) ? body.segments : [];
+  if (raw.length === 0) { res.status(400).json({ error: "No beats to verify." }); return; }
+  const timeRe = /^\d{1,2}:\d{2}(:\d{2})?$/;
+  const toHMS = (t: string) => { const p = t.split(":"); while (p.length < 3) p.unshift("00"); return p.slice(-3).map((x) => x.padStart(2, "0")).join(":"); };
+  type Suggestion = { startTime: string; endTime: string; confidence: number; evidence: string };
+  const results: { index: number; ok: boolean; reason: string | null; message: string | null; videoDuration: number | null; suggested: Suggestion | null }[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const s = (raw[i] ?? {}) as Record<string, unknown>;
+    const url = String(s.youtubeUrl ?? "").trim();
+    const st = String(s.startTime ?? "").trim();
+    const en = String(s.endTime ?? "").trim();
+    if (!url || !timeRe.test(st) || !timeRe.test(en)) {
+      results.push({ index: i, ok: false, reason: "invalid", message: "Add a source URL and valid start/end times.", videoDuration: null, suggested: null });
+      continue;
+    }
+    const startTime = toHMS(st), endTime = toHMS(en), normUrl = normalizeYoutubeUrl(url);
+    try {
+      const r = await validateSegmentWithinVideo(normUrl, startTime, endTime);
+      let suggested: Suggestion | null = null;
+      if (!r.ok && r.videoDuration && r.videoDuration > 0) {
+        // Out of range — try to auto-locate the real timestamp from the transcript (no AI call).
+        const cues = await fetchTranscriptCues(normUrl);
+        const reqDur = Math.max(6, timeToSeconds(endTime) - timeToSeconds(startTime));
+        suggested = locateMomentInTranscript(cues, String(s.headline ?? ""), String(s.narrationLine ?? ""), reqDur, r.videoDuration);
+      }
+      results.push({ index: i, ok: r.ok, reason: r.reason ?? null, message: r.message ?? null, videoDuration: r.videoDuration ?? null, suggested });
+    } catch {
+      results.push({ index: i, ok: true, reason: null, message: null, videoDuration: null, suggested: null });
+    }
+  }
+  res.json({ results });
 });
 
 /**
@@ -766,6 +813,7 @@ router.post("/clips/:id/retry", async (req, res): Promise<void> => {
       (clip.segments ?? []) as StorySegment[],
       clip.voiceoverVoice ?? "",
       clip.voiceoverSpeed ?? "",
+      clip.headline ?? "",
     );
     return;
   }

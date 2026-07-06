@@ -1907,6 +1907,9 @@ export interface StorySegment {
   // Classic single-source Story leaves these blank and uses the job-level URL.
   youtubeUrl?: string;
   sourceChannel?: string;
+  // Match Story only: this beat's own AI narration line. When present the beat is paced to
+  // its voiceover and the line is placed at the beat's start (no flat timeline-guess script).
+  narrationLine?: string;
 }
 
 // Pro-only: one ranked moment of a TOP 5 countdown (jobType "top5"). Superset of
@@ -1931,7 +1934,14 @@ async function burnCaptionsOnFile(
   filePath: string,
   duration: number,
   outroEnabled: boolean,
-  captionColor: string
+  captionColor: string,
+  // Whisper transcribes THIS file instead of filePath when supplied. Match Story passes
+  // an isolated AI-narration track so the captions read the voiceover, not the (muted)
+  // source-clip commentary — captions still burn onto filePath.
+  captionSourceOverride = "",
+  // Match Story passes the EXACT spoken narration text here; the karaoke step re-spells
+  // whisper's words to it (timing kept) so captions never carry an ASR typo.
+  knownCaptionText = ""
 ): Promise<void> {
   const outputDir = getOutputDir();
   try {
@@ -1940,9 +1950,10 @@ async function burnCaptionsOnFile(
     const captionScript = path.join(os.homedir(), "myapp/scripts/generate_captions_pro.sh");
     const captionedPath = path.join(outputDir, `clip_${clipId}_captioned.mp4`);
     if (!fs.existsSync(captionScript)) return;
+    const whisperInput = captionSourceOverride && fs.existsSync(captionSourceOverride) ? captionSourceOverride : filePath;
 
     const capResult = await new Promise<{ code: number | null; out: string }>((resolve) => {
-      const cap = spawn("bash", [captionScript, filePath, srtPath, transcriptPath], { timeout: 3_600_000 });
+      const cap = spawn("bash", [captionScript, whisperInput, srtPath, transcriptPath], { timeout: 3_600_000 });
       let out = "";
       cap.stdout?.on("data", (d) => { out += d.toString(); });
       cap.on("close", (code) => resolve({ code, out }));
@@ -1964,12 +1975,21 @@ async function burnCaptionsOnFile(
       const assPath = path.join(outputDir, `clip_${clipId}_captions.ass`);
       const dtwJsonPath = srtPath.replace(/\.srt$/, ".json");
       const karaokeScript = path.join(os.homedir(), "myapp/scripts/karaoke_captions_pro.py");
+      // Match Story: hand the exact spoken script to the karaoke step so it re-spells
+      // whisper's words (timing untouched) — zero ASR typos on screen.
+      let knownTextPath = "";
+      if (knownCaptionText && knownCaptionText.trim()) {
+        knownTextPath = path.join(outputDir, `clip_${clipId}_known.txt`);
+        try { fs.writeFileSync(knownTextPath, knownCaptionText); } catch { knownTextPath = ""; }
+      }
       let subFilter = `subtitles=${srtPath}:fontsdir=${FONTS_DIR}:force_style='FontName=DejaVu Sans,FontSize=12,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=1,Bold=1,Alignment=2,MarginV=95'`;
       let haveAss = false;
       if (fs.existsSync(karaokeScript) && fs.existsSync(dtwJsonPath)) {
         try {
           const captionEnd = outroEnabled ? Math.max(0, duration - 2) : duration;
-          await execFileAsync(findPython(), [karaokeScript, dtwJsonPath, assPath, String(captionEnd), captionColor || ""], { timeout: 30000 });
+          const karaokeArgs = [karaokeScript, dtwJsonPath, assPath, String(captionEnd), captionColor || ""];
+          if (knownTextPath) karaokeArgs.push(knownTextPath);
+          await execFileAsync(findPython(), karaokeArgs, { timeout: 30000 });
           if (fs.existsSync(assPath) && fs.readFileSync(assPath, "utf8").includes("Dialogue:")) {
             subFilter = `subtitles=${assPath}:fontsdir=${FONTS_DIR}`;
             haveAss = true;
@@ -1995,6 +2015,7 @@ async function burnCaptionsOnFile(
       fs.existsSync(srtPath) && fs.unlinkSync(srtPath);
       fs.existsSync(assPath) && fs.unlinkSync(assPath);
       fs.existsSync(dtwJsonPath) && fs.unlinkSync(dtwJsonPath);
+      if (knownTextPath) { try { fs.existsSync(knownTextPath) && fs.unlinkSync(knownTextPath); } catch { /* ignore */ } }
     }
   } catch (capErr) {
     logger.warn({ capErr }, "Story caption generation failed (non-fatal)");
@@ -2015,12 +2036,20 @@ async function mixNarrationOnFile(
   voice: string,
   speed: string,
   // How far to duck the original footage WHILE a narration line plays (0-1). Outside the
-  // spoken windows the footage returns to full volume. Top 5 passes a near-silent 0.05 so
-  // the countdown voice is crystal-clear; Story keeps the gentler 0.22 default.
+  // spoken windows the footage returns to full volume. Match Story passes 0 (full mute) so
+  // the AI voice is the ONLY voice; Top 5 uses a near-silent 0.05; Story keeps the gentler
+  // 0.22 default so the crowd/commentary stays audible under it.
   duckVolume = 0.22,
   // Max narration lines to keep. Story/Top 5 use the default 8; Match Story raises it for
   // dense play-by-play. Threaded into parseNarrationLines' cap.
-  maxLines = 8
+  maxLines = 8,
+  // When set, also write an isolated narration-only WAV here (the AI voice at its real
+  // timeline positions, silence elsewhere) so captions can be transcribed from the voice.
+  emitNarrationTrackPath = "",
+  // Match Story: duck the footage with a sidechain COMPRESSOR keyed by the voice (attack/
+  // release give smooth fades) instead of the hard volume gate, so there's no abrupt jump
+  // in/out of each line. Ignored when the footage has no audio.
+  smoothDuck = false
 ): Promise<void> {
   const outputDir = getOutputDir();
   try {
@@ -2048,20 +2077,33 @@ async function mixNarrationOnFile(
       const anullIdx = 1 + wavPaths.length;
       if (!narrHasAudio) ffInputs.push("-f", "lavfi", "-t", String(duration), "-i", "anullsrc=r=48000:cl=stereo");
       const parts: string[] = [];
-      if (narrHasAudio) {
-        const enableExpr = spoken.map((s) => `between(t,${s.start.toFixed(2)},${s.end.toFixed(2)})`).join("+");
-        parts.push(`[0:a]volume=enable='${enableExpr}':volume=${duckVolume},aresample=48000,aformat=channel_layouts=stereo[base]`);
-      } else {
-        parts.push(`[${anullIdx}:a]aresample=48000,aformat=channel_layouts=stereo[base]`);
-      }
-      const mixLabels: string[] = ["[base]"];
+      // Delayed narration inputs [n1..nK] — shared by every ducking path.
+      const narrLabels: string[] = [];
       wavPaths.forEach((_w, i) => {
         const inIdx = i + 1;
         const delayMs = Math.round(spoken[i]!.start * 1000);
         parts.push(`[${inIdx}:a]adelay=${delayMs}:all=1,aresample=48000,aformat=channel_layouts=stereo[n${inIdx}]`);
-        mixLabels.push(`[n${inIdx}]`);
+        narrLabels.push(`[n${inIdx}]`);
       });
-      parts.push(`${mixLabels.join("")}amix=inputs=${mixLabels.length}:duration=first:normalize=0,loudnorm=I=-14:TP=-1.5:LRA=11[aout]`);
+      if (narrHasAudio && smoothDuck) {
+        // Smooth sidechain duck: sum the voice into one key, compress the footage by it
+        // (attack/release act as fades), then mix the voice back over the ducked footage.
+        parts.push(`${narrLabels.join("")}amix=inputs=${narrLabels.length}:duration=first:normalize=0[narrsum]`);
+        parts.push(`[narrsum]asplit=2[nkey][nmix]`);
+        parts.push(`[0:a]aresample=48000,aformat=channel_layouts=stereo[foot]`);
+        parts.push(`[foot][nkey]sidechaincompress=threshold=0.02:ratio=20:attack=5:release=260:makeup=1[duckfoot]`);
+        parts.push(`[duckfoot][nmix]amix=inputs=2:duration=first:normalize=0,loudnorm=I=-14:TP=-1.5:LRA=11[aout]`);
+      } else {
+        // Hard-gate duck (Story / Top 5): footage drops to duckVolume only inside each window.
+        if (narrHasAudio) {
+          const enableExpr = spoken.map((s) => `between(t,${s.start.toFixed(2)},${s.end.toFixed(2)})`).join("+");
+          parts.push(`[0:a]volume=enable='${enableExpr}':volume=${duckVolume},aresample=48000,aformat=channel_layouts=stereo[base]`);
+        } else {
+          parts.push(`[${anullIdx}:a]aresample=48000,aformat=channel_layouts=stereo[base]`);
+        }
+        const mixLabels: string[] = ["[base]", ...narrLabels];
+        parts.push(`${mixLabels.join("")}amix=inputs=${mixLabels.length}:duration=first:normalize=0,loudnorm=I=-14:TP=-1.5:LRA=11[aout]`);
+      }
       const narratedPath = path.join(outputDir, `clip_${clipId}_snarrated.mp4`);
       await spawnProcess("ffmpeg", [
         ...ffInputs, "-filter_complex", parts.join(";"),
@@ -2072,6 +2114,27 @@ async function mixNarrationOnFile(
       if (fs.existsSync(narratedPath)) {
         fs.renameSync(narratedPath, filePath);
         logger.info({ filePath, lines: spoken.length }, "Story bridging narration mixed in");
+      }
+
+      // Optional: an isolated narration-only track for caption transcription. Same delays
+      // as the mix above but over pure silence (no footage audio), so whisper reads only
+      // the AI voice and DTW word onsets line up with the spoken timeline.
+      if (emitNarrationTrackPath) {
+        const ntInputs: string[] = ["-y", "-f", "lavfi", "-t", String(duration), "-i", "anullsrc=r=48000:cl=stereo"];
+        for (const w of wavPaths) ntInputs.push("-i", w);
+        const ntParts: string[] = [];
+        const ntLabels: string[] = ["[0:a]"];
+        wavPaths.forEach((_w, i) => {
+          const inIdx = i + 1;
+          const delayMs = Math.round(spoken[i]!.start * 1000);
+          ntParts.push(`[${inIdx}:a]adelay=${delayMs}:all=1,aresample=48000,aformat=channel_layouts=stereo[m${inIdx}]`);
+          ntLabels.push(`[m${inIdx}]`);
+        });
+        ntParts.push(`${ntLabels.join("")}amix=inputs=${ntLabels.length}:duration=first:normalize=0[na]`);
+        await spawnProcess("ffmpeg", [
+          ...ntInputs, "-filter_complex", ntParts.join(";"),
+          "-map", "[na]", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", emitNarrationTrackPath,
+        ], 300_000, () => {});
       }
     } else {
       logger.warn({ clipId }, "No story narration lines produced — skipping");
@@ -2204,13 +2267,84 @@ async function canonicalizePart(inPath: string, outPath: string): Promise<void> 
 }
 
 /**
+ * Match Story intro card: a black 1080x1920 canvas with the job title wrapped + centered,
+ * encoded to the SAME canonical params as the beats so it concats / crossfades cleanly.
+ * Silent audio track (anullsrc) so the timeline has a stream to crossfade against.
+ */
+async function renderMatchTitleCard(title: string, outPath: string, dur: number): Promise<void> {
+  const canvasW = 1080, canvasH = 1920, fps = 30;
+  const font = findFont();
+  const lines = wrapText(title.toUpperCase(), 16).slice(0, 4);
+  const startY = Math.round(canvasH / 2 - (lines.length * 118) / 2 - 30);
+  const draw = lines
+    .map((ln, i) => `drawtext=fontfile='${font}':text='${escapeDrawtext(ln)}':fontsize=96:fontcolor=white:borderw=7:bordercolor=black:x=(w-text_w)/2:y=${startY + i * 118}`)
+    .join(",");
+  await spawnProcess("ffmpeg", [
+    "-y",
+    "-f", "lavfi", "-i", `color=c=black:s=${canvasW}x${canvasH}:d=${dur}:r=${fps}`,
+    "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+    "-vf", draw, "-t", String(dur),
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p", "-r", String(fps),
+    "-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-ac", "2",
+    "-movflags", "+faststart", outPath,
+  ], 120_000, () => {}, RENDER_STALL_MS, "render");
+}
+
+/**
+ * Stitches the ordered parts with a short crossfade (xfade video + acrossfade audio) at each
+ * seam. `partDurs` are each part's exact durations (same order) — needed to place every xfade
+ * `offset`. Total output = sum(durs) - (n-1)*fade. Returns false (and cleans up) on any failure
+ * so the caller can fall back to a plain stream-copy concat. One re-encode pass at the end.
+ */
+async function stitchWithTransitions(parts: string[], partDurs: number[], fade: number, outPath: string): Promise<boolean> {
+  try {
+    if (parts.length < 2) return false;
+    const inputs: string[] = ["-y"];
+    for (const p of parts) inputs.push("-i", p);
+    const vfilters: string[] = [];
+    const afilters: string[] = [];
+    let vprev = "0:v";
+    let aprev = "0:a";
+    let cum = partDurs[0] ?? 0;
+    for (let k = 1; k < parts.length; k++) {
+      const offset = Math.max(0, cum - fade);
+      const last = k === parts.length - 1;
+      const vlabel = last ? "vout" : `vx${k}`;
+      const alabel = last ? "aout" : `ax${k}`;
+      vfilters.push(`[${vprev}][${k}:v]xfade=transition=fade:duration=${fade}:offset=${offset.toFixed(3)}[${vlabel}]`);
+      afilters.push(`[${aprev}][${k}:a]acrossfade=d=${fade}[${alabel}]`);
+      vprev = vlabel;
+      aprev = alabel;
+      cum += (partDurs[k] ?? 0) - fade;
+    }
+    await spawnProcess("ffmpeg", [
+      ...inputs, "-filter_complex", [...vfilters, ...afilters].join(";"),
+      "-map", "[vout]", "-map", "[aout]",
+      "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p", "-r", "30",
+      "-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-ac", "2",
+      "-movflags", "+faststart", outPath,
+    ], 600_000, () => {}, RENDER_STALL_MS, "render");
+    return fs.existsSync(outPath) && ((await probeContentDuration(outPath)) || 0) > 0;
+  } catch (e) {
+    logger.warn({ e }, "Match Story crossfade stitch failed — falling back to plain concat");
+    try { fs.existsSync(outPath) && fs.unlinkSync(outPath); } catch { /* ignore */ }
+    return false;
+  }
+}
+
+/**
  * Renders a MATCH STORY (jobType "matchstory"): a research-driven, MULTI-SOURCE narrated
  * montage. Each beat is a StorySegment carrying its OWN youtubeUrl (different broadcast /
- * fan-cam / club angles). Structure mirrors processStory (memory-safe sequential compositing
- * → concat → captions → narration) but, like Top 5, normalizes every part to identical encode
- * params so cross-source stream-copy concat is clean. Unlike Top 5 there is no title card and
- * no rank badges — it opens straight on the action — and the narration is the user's free-form
- * DENSE play-by-play on the stitched timeline (up to 16 lines instead of the usual 8).
+ * fan-cam / club angles) and — in the modern per-beat mode — its OWN `narrationLine`.
+ *
+ * Per-beat mode (the default now): each beat is PACED to its voiceover (the beat lasts as
+ * long as its line so the voice always matches what's on screen), the montage opens on a
+ * title card, seams are crossfaded, and the footage is smooth-ducked to silence under the
+ * voice. The line is placed at the beat's real start on the stitched timeline — no guessed
+ * timestamps. The legacy flat `narrationScript` path (no per-beat lines) still works and
+ * keeps the old plain concat with no title/transitions so its hand-authored timestamps stay
+ * valid. Like Top 5, every part is normalized to identical encode params so cross-source
+ * stitching is clean.
  */
 export async function processMatchStory(
   outputFilename: string,
@@ -2223,7 +2357,10 @@ export async function processMatchStory(
   captionColor: string,
   narrationScript: string,
   segments: StorySegment[],
-  voiceOpts: VoiceOpts = {}
+  voiceOpts: VoiceOpts = {},
+  title = "",
+  transitionsEnabled = true,
+  titleCardEnabled = true
 ): Promise<void> {
   const outputDir = getOutputDir();
   const finalOutputPath = path.join(outputDir, outputFilename);
@@ -2249,21 +2386,65 @@ export async function processMatchStory(
     if (!check.ok) throw new Error(`Beat #${i + 1}: ${check.message}`);
   }
 
+  // Per-beat mode = any beat carries its own line. Gates pacing, the title card, and the
+  // crossfades; legacy flat-script jobs stay on plain concat so their timestamps hold.
+  const perBeat = segs.some((s) => (s.narrationLine ?? "").trim().length > 0);
+  const wantTitle = titleCardEnabled && perBeat && !!title.trim();
+  const fade = transitionsEnabled && perBeat ? 0.3 : 0;
+  const TITLE_DUR = 2.6;
+
   const parts: string[] = [];
+  const partDurs: number[] = [];
+  // Per-beat voiceover captured during pacing (index-aligned to segs); reused for placement.
+  const beatVo: ({ text: string; wav: string; dur: number } | null)[] = segs.map(() => null);
+
   try {
     await updateProgress(2, true);
 
-    // 1) Composite each beat from its OWN source (processClip, composite-only: captions/
-    //    thumb/voiceover off — those run once at the end), then normalize the encode so
-    //    parts from different sources concat cleanly. Outro rides the LAST beat.
+    // 0) Intro/title card (per-beat mode only) — becomes parts[0].
+    if (wantTitle) {
+      const titleCard = path.join(outputDir, `match_${clipId}_title_${tmpId}.mp4`);
+      try {
+        await renderMatchTitleCard(title.trim(), titleCard, TITLE_DUR);
+        if (fs.existsSync(titleCard)) {
+          parts.push(titleCard);
+          partDurs.push((await probeContentDuration(titleCard)) || TITLE_DUR);
+        }
+      } catch (tErr) {
+        logger.warn({ tErr }, "Match Story title card failed (non-fatal) — skipping");
+      }
+    }
+
+    // 1) Composite each beat from its OWN source (processClip, composite-only). In per-beat
+    //    mode we first synthesize the beat's voiceover, measure it, and stretch the beat's
+    //    window to cover it (+lead/tail, +2s on the outro beat) so the voice never bleeds
+    //    into the next beat. Then normalize the encode so cross-source parts stitch cleanly.
     for (let i = 0; i < segs.length; i++) {
       const seg = segs[i]!;
       const isLast = i === segs.length - 1;
+      let endTime = seg.endTime;
+
+      if (perBeat) {
+        const line = (seg.narrationLine ?? "").trim();
+        let voDur = 0;
+        if (line) {
+          const wav = path.join(outputDir, `match_${clipId}_vo_${i}_${tmpId}.wav`);
+          if (await generateNarrationWav(line, wav, msVoice, msSpeed)) {
+            voDur = (await probeContentDuration(wav)) || 0;
+            beatVo[i] = { text: line, wav, dur: voDur };
+          }
+        }
+        const reqLen = Math.max(0, timeToSeconds(seg.endTime) - timeToSeconds(seg.startTime));
+        const pad = 0.3 + 0.9 + (isLast && outroEnabled ? 2 : 0);
+        const targetLen = Math.min(24, Math.max(reqLen, voDur > 0 ? voDur + pad : reqLen));
+        if (targetLen > reqLen + 0.05) endTime = secondsToHMS(timeToSeconds(seg.startTime) + targetLen);
+      }
+
       const rawFile = `match_${clipId}_seg_${i}_${tmpId}.mp4`;
       logger.info({ clipId, beat: i + 1, of: segs.length }, "Rendering Match Story beat");
       try {
         await processClip(
-          seg.youtubeUrl!, seg.startTime, seg.endTime, seg.headline ?? "",
+          seg.youtubeUrl!, seg.startTime, endTime, seg.headline ?? "",
           rawFile, "edited", channelHandle, 0, undefined, frameStyle, seg.sourceChannel || sourceChannel,
           false, isLast && outroEnabled, false, "",
           seg.punchInEnabled ?? false, seg.zoomMoments ?? "", "", "hook", ""
@@ -2279,23 +2460,30 @@ export async function processMatchStory(
       try { fs.existsSync(rawPath) && fs.unlinkSync(rawPath); } catch { /* ignore */ }
       if (!fs.existsSync(canonPath)) throw new Error(`Match Story: normalize pass failed for beat #${i + 1}`);
       parts.push(canonPath);
-      await updateProgress(5 + ((i + 1) / segs.length) * 60, true);
+      partDurs.push((await probeContentDuration(canonPath)) || 0);
+      await updateProgress(5 + ((i + 1) / segs.length) * 58, true);
     }
 
-    // 2) Concat — every part shares identical encode params, so stream-copy is safe.
-    const listPath = path.join(outputDir, `match_${clipId}_list_${tmpId}.txt`);
-    fs.writeFileSync(listPath, parts.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join("\n") + "\n");
+    // 2) Stitch. Per-beat mode crossfades the seams (falls back to concat on any failure);
+    //    legacy mode always plain-concats. usedFade feeds the narration offset math below.
+    let usedFade = 0;
     const stitchedPath = path.join(outputDir, `match_${clipId}_stitched_${tmpId}.mp4`);
-    await spawnProcess("ffmpeg", [
-      "-y", "-f", "concat", "-safe", "0", "-i", listPath,
-      "-c", "copy", "-movflags", "+faststart", stitchedPath,
-    ], 300_000, () => {}, RENDER_STALL_MS, "render");
-    if (!fs.existsSync(stitchedPath)) throw new Error("Match Story concat produced no output");
+    if (fade > 0 && (await stitchWithTransitions(parts, partDurs, fade, stitchedPath))) {
+      usedFade = fade;
+    } else {
+      const listPath = path.join(outputDir, `match_${clipId}_list_${tmpId}.txt`);
+      fs.writeFileSync(listPath, parts.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join("\n") + "\n");
+      await spawnProcess("ffmpeg", [
+        "-y", "-f", "concat", "-safe", "0", "-i", listPath,
+        "-c", "copy", "-movflags", "+faststart", stitchedPath,
+      ], 300_000, () => {}, RENDER_STALL_MS, "render");
+    }
+    if (!fs.existsSync(stitchedPath)) throw new Error("Match Story stitch produced no output");
     fs.renameSync(stitchedPath, finalOutputPath);
     await updateProgress(72, true);
 
     const totalDuration = (await probeContentDuration(finalOutputPath)) || 0;
-    logger.info({ clipId, totalDuration, beats: segs.length }, "Match Story stitched");
+    logger.info({ clipId, totalDuration, beats: segs.length, perBeat, usedFade }, "Match Story stitched");
 
     // 3) Thumbnail (non-fatal)
     try {
@@ -2305,17 +2493,43 @@ export async function processMatchStory(
       logger.warn({ thumbErr }, "Match Story thumbnail failed (non-fatal)");
     }
 
-    // 4) Captions over the whole stitched montage
-    if (captionsEnabled && totalDuration > 0) {
-      await burnCaptionsOnFile(clipId, finalOutputPath, totalDuration, outroEnabled, captionColor);
+    // 4) Narration. Per-beat mode builds the "sec | line" script from each beat's real START
+    //    on the stitched (crossfade-shortened) timeline, so the voice lands on its own beat.
+    //    Footage is smooth-ducked with a sidechain compressor (only the AI voice is heard).
+    let effectiveNarration = narrationScript;
+    if (perBeat) {
+      const beatPartOffset = parts.length > segs.length ? 1 : 0; // title card occupies parts[0]
+      const lines: string[] = [];
+      for (let i = 0; i < segs.length; i++) {
+        const vo = beatVo[i];
+        if (!vo || !vo.text) continue;
+        const partIdx = beatPartOffset + i;
+        let startFinal = 0;
+        for (let k = 0; k < partIdx; k++) startFinal += partDurs[k] ?? 0;
+        startFinal -= partIdx * usedFade;
+        // Land the line just after the beat is fully on screen (past the incoming crossfade).
+        const sec = Math.max(0.3, startFinal + (partIdx > 0 ? usedFade : 0) + 0.3);
+        lines.push(`${sec.toFixed(1)} | ${vo.text}`);
+      }
+      effectiveNarration = lines.join("\n");
     }
-    await updateProgress(90, true);
 
-    // 5) Dense play-by-play narration across the stitched timeline (up to 16 lines,
-    //    gentle 0.22 duck like Story so the crowd/commentary stays audible under it).
-    if (narrationScript && narrationScript.trim() && totalDuration > 0) {
-      await mixNarrationOnFile(clipId, finalOutputPath, totalDuration, outroEnabled, narrationScript, msVoice, msSpeed, 0.22, 16);
+    let narrTrackPath = "";
+    if (effectiveNarration && effectiveNarration.trim() && totalDuration > 0) {
+      narrTrackPath = path.join(outputDir, `match_${clipId}_narrtrack_${tmpId}.wav`);
+      await mixNarrationOnFile(clipId, finalOutputPath, totalDuration, outroEnabled, effectiveNarration, msVoice, msSpeed, 0, 16, narrTrackPath, true);
+      if (!fs.existsSync(narrTrackPath)) narrTrackPath = "";
     }
+    await updateProgress(88, true);
+
+    // 5) Captions transcribed from the AI narration track (not the muted footage), so
+    //    every caption word matches the voice and lands on its onset via DTW karaoke. In
+    //    per-beat mode we also hand over the exact script so captions carry zero ASR typos.
+    if (captionsEnabled && totalDuration > 0) {
+      const knownCaptionText = perBeat ? beatVo.filter((v) => v && v.text).map((v) => v!.text).join(" ") : "";
+      await burnCaptionsOnFile(clipId, finalOutputPath, totalDuration, outroEnabled, captionColor, narrTrackPath, knownCaptionText);
+    }
+    try { narrTrackPath && fs.existsSync(narrTrackPath) && fs.unlinkSync(narrTrackPath); } catch { /* ignore */ }
     await updateProgress(99, true);
     logger.info({ finalOutputPath }, "Match Story processing complete");
   } finally {

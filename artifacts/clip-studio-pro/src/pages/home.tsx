@@ -133,14 +133,16 @@ function defaultTop5(): Top5Seg[] {
 }
 
 // One beat of a MATCH STORY: a research-driven MULTI-SOURCE narrated montage (jobType
-// "matchstory"). Like a Top 5 moment but with no rank and no per-beat narration — the
-// narration is ONE job-level dense play-by-play script. Each beat is its own source video.
+// "matchstory"). Like a Top 5 moment but with no rank. Each beat carries its OWN source
+// video AND its own narration line — the beat is paced to that line so the voice always
+// matches what's on screen (no guessed timeline timestamps).
 interface MatchSeg {
   youtubeUrl: string;
   startTime: string;
   endTime: string;
   sourceChannel: string;
   headline: string;
+  narrationLine: string;
   verify: {
     ok: boolean;
     message: string | null;
@@ -152,7 +154,7 @@ interface MatchSeg {
 function defaultMatchStory(): MatchSeg[] {
   return Array.from({ length: 4 }, () => ({
     youtubeUrl: "", startTime: "00:00:00", endTime: "00:00:10",
-    sourceChannel: "", headline: "", verify: null,
+    sourceChannel: "", headline: "", narrationLine: "", verify: null,
   }));
 }
 
@@ -635,6 +637,8 @@ export default function Home() {
   const [msPaste, setMsPaste] = useState("");
   const [msCaptions, setMsCaptions] = useState(true);
   const [msOutro, setMsOutro] = useState(true);
+  const [msTransitions, setMsTransitions] = useState(true);
+  const [msTitleCard, setMsTitleCard] = useState(true);
   const [msVerifying, setMsVerifying] = useState(false);
   const [msSubmitting, setMsSubmitting] = useState(false);
 
@@ -1283,34 +1287,29 @@ SELECT 4-8 beats that, IN ORDER, tell that one sequence:
 - For EACH beat find a REAL, PUBLIC YouTube video that clearly shows it — DIFFERENT videos / camera angles are encouraged (broadcast, fan cam, club upload). NEVER invent a URL; if unsure a video is real & public, drop it and pick another.
 - Timestamp = best estimate, ABSOLUTE HH:MM:SS - HH:MM:SS, tight on the action. CHECK each video's real length first and keep BOTH times inside it (I verify & fine-tune every one — close is fine, wild guesses are not). Prefer moments a commentator names on-camera so a wrong time can be auto-recovered from the transcript.
 
-THEN write DENSE play-by-play NARRATION on the FINAL stitched timeline (0 = start of the stitched video, NOT any source). Hype commentator tone, ONE short line every 3-5 seconds, building tension to the payoff — advance the story, don't just describe what's on screen.
+For EACH beat, write ONE punchy commentator line (6-16 words) that narrates THAT beat and advances the story — hype tone, curiosity/tension building to the payoff. It's spoken OVER that beat and the beat is auto-timed to it, so don't reference other beats or absolute timestamps.
 
 OUTPUT — return EXACTLY this and nothing else (fields separated by " | "):
 TITLE: <4-7 word title>
-SEGMENTS:
-<youtube url> | HH:MM:SS - HH:MM:SS | <channel> | <headline>
-...
-NARRATION:
-SS | line
+BEATS:
+<youtube url> | HH:MM:SS - HH:MM:SS | <channel> | <headline> | <one narration line for this beat>
 ...
 
 Example:
 TITLE: Messi's Free Kick Masterclass
-SEGMENTS:
-https://youtu.be/abcd | 00:12:04 - 00:12:12 | FIFA | The Wall Sets Up
-https://youtu.be/efgh | 00:00:31 - 00:00:41 | ESPN | He Curls It In
-NARRATION:
-0 | Ninety-third minute. One chance left.
-5 | The wall goes up — Messi stands over it.
-11 | And what he does next... is unreal.`;
+BEATS:
+https://youtu.be/abcd | 00:12:04 - 00:12:12 | FIFA | The Wall Sets Up | Ninety-third minute — one last chance, and Messi stands over it.
+https://youtu.be/efgh | 00:00:31 - 00:00:41 | ESPN | He Curls It In | He whips it up and over the wall — the keeper never even moved.`;
     const ok = await copyTextToClipboard(prompt);
     toast(ok
       ? { title: "Research prompt copied", description: "Run it in Gemini 2.5 Pro · Deep Research, then paste its reply below." }
       : { title: "Copy failed", description: "Couldn't access the clipboard.", variant: "destructive" });
   }
 
-  // Parses Gemini's reply: TITLE + a SEGMENTS block (URL + time located by shape, not
-  // position) + a NARRATION block. Strips the zero-width chars Gemini injects on headers.
+  // Parses Gemini's reply: TITLE + a BEATS block where each line is
+  //   <url> | HH:MM:SS - HH:MM:SS | <channel> | <headline> | <narration line>
+  // (fields located by shape, not position). Still honors a legacy separate NARRATION
+  // block if the older prompt was used. Strips the zero-width chars Gemini injects.
   function applyMatchStoryPaste() {
     const text = msPaste.replace(/[​‌‍﻿⁠]/g, "");
     const titleMatch = text.match(/^\s*TITLE\s*:\s*(.+)$/im);
@@ -1320,7 +1319,7 @@ NARRATION:
     const nIdx = text.search(/narration\s*:/i);
     let segBlock = nIdx >= 0 ? text.slice(0, nIdx) : text;
     const narrBlock = nIdx >= 0 ? text.slice(nIdx).replace(/^[^\n]*\n?/, "") : "";
-    segBlock = segBlock.replace(/segments\s*:/i, "").replace(/^\s*TITLE\s*:.*$/im, "");
+    segBlock = segBlock.replace(/(?:beats|segments)\s*:/i, "").replace(/^\s*TITLE\s*:.*$/im, "");
 
     const timeRe = /(\d{1,2}:\d{1,2}(?::\d{1,2})?)\s*(?:-|–|—|to|→)\s*(\d{1,2}:\d{1,2}(?::\d{1,2})?)/;
     const segs: MatchSeg[] = [];
@@ -1339,12 +1338,13 @@ NARRATION:
         endTime: padHMS(tm[2]),
         sourceChannel: (rest[0] ?? "").slice(0, 80),
         headline: (rest[1] ?? "").slice(0, 120),
+        narrationLine: (rest[2] ?? "").replace(/\s*\|?\s*why\s*:.*$/i, "").trim().slice(0, 200),
         verify: null,
       });
       if (segs.length >= 8) break;
     }
     if (segs.length < 2) {
-      toast({ title: "Couldn't read the beats", description: "Paste SEGMENTS lines like  https://youtu.be/… | 00:01:12 - 00:01:24 | Channel | Headline", variant: "destructive" });
+      toast({ title: "Couldn't read the beats", description: "Paste BEATS lines like  https://youtu.be/… | 00:01:12 - 00:01:24 | Channel | Headline | Narration line", variant: "destructive" });
       return;
     }
     const narration = narrBlock
@@ -1355,7 +1355,8 @@ NARRATION:
     setMsSegments(segs);
     if (narration) setMsNarration(narration);
     setMsPaste("");
-    toast({ title: `${segs.length} beats loaded`, description: narration ? "Beats + narration filled. Verify, then Enqueue." : "Beats filled. Add narration, then Enqueue." });
+    const withNarr = segs.filter((s) => s.narrationLine).length;
+    toast({ title: `${segs.length} beats loaded`, description: withNarr ? `${withNarr} with narration. Verify timestamps, then Enqueue.` : "Beats filled. Add a line per beat, then Enqueue." });
   }
 
   function updateMsSeg(i: number, patch: Partial<MatchSeg>) {
@@ -1368,30 +1369,28 @@ NARRATION:
     }));
   }
 
-  // Reuses the Top 5 verify endpoint (timestamp-in-video check + transcript auto-locate).
-  // We tag each beat with rank = its index+1 so the shared endpoint accepts it, then map
-  // the per-rank results back onto the beats by that same index.
+  // Match Story verify: send every beat (in order) to the dedicated /matchstory/verify
+  // endpoint — timestamp-in-video check + transcript auto-locate (using the beat's headline
+  // AND narration line for a better match). Results come back keyed by array index.
   async function verifyMatchStory() {
-    const indexed = msSegments
-      .map((s, i) => ({ s, rank: i + 1 }))
-      .filter(({ s }) => /^\d{2}:\d{2}:\d{2}$/.test(s.startTime) && /^\d{2}:\d{2}:\d{2}$/.test(s.endTime) && /(youtube\.com|youtu\.be)/.test(s.youtubeUrl));
-    if (indexed.length === 0) {
+    const ok = msSegments.some((s) => /^\d{2}:\d{2}:\d{2}$/.test(s.startTime) && /^\d{2}:\d{2}:\d{2}$/.test(s.endTime) && /(youtube\.com|youtu\.be)/.test(s.youtubeUrl));
+    if (!ok) {
       toast({ title: "Nothing to verify", description: "Add a source URL + valid in/out on each beat first.", variant: "destructive" });
       return;
     }
-    const payload = indexed.map(({ s, rank }) => ({ rank, youtubeUrl: s.youtubeUrl, startTime: s.startTime, endTime: s.endTime, headline: s.headline, narrationLine: "" }));
+    const payload = msSegments.map((s) => ({ youtubeUrl: s.youtubeUrl, startTime: s.startTime, endTime: s.endTime, headline: s.headline, narrationLine: s.narrationLine }));
     setMsVerifying(true);
     try {
-      const r = await fetch(`${API_BASE}/api/clips/top5/verify`, {
+      const r = await fetch(`${API_BASE}/api/clips/matchstory/verify`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ youtubeUrl: "", segments: payload }),
+        body: JSON.stringify({ segments: payload }),
       });
-      const data = (await r.json()) as { results?: { rank: number; ok: boolean; message: string | null; videoDuration?: number | null; suggested?: { startTime: string; endTime: string; confidence: number; evidence: string } | null }[]; error?: string };
+      const data = (await r.json()) as { results?: { index: number; ok: boolean; message: string | null; videoDuration?: number | null; suggested?: { startTime: string; endTime: string; confidence: number; evidence: string } | null }[]; error?: string };
       if (!r.ok) throw new Error(data.error ?? "Verify failed");
-      const byRank = new Map((data.results ?? []).map((x) => [x.rank, x]));
+      const byIndex = new Map((data.results ?? []).map((x) => [x.index, x]));
       setMsSegments((prev) => prev.map((s, i) => {
-        const v = byRank.get(i + 1);
+        const v = byIndex.get(i);
         return v ? { ...s, verify: { ok: v.ok, message: v.message, videoDuration: v.videoDuration ?? null, suggested: v.suggested ?? null } } : s;
       }));
       const bad = (data.results ?? []).filter((x) => !x.ok).length;
@@ -1419,11 +1418,11 @@ NARRATION:
       const len = s.verify?.videoDuration
         ? `${Math.floor(s.verify.videoDuration / 60)}:${String(Math.round(s.verify.videoDuration % 60)).padStart(2, "0")}`
         : "its real length";
-      return `Beat #${n} — ${s.headline || "(this beat)"}\n  video: ${url}\n  This video is only ${len} long, but you gave ${s.startTime}–${s.endTime} (out of range). WATCH it and reply with a corrected timestamp WITHIN ${len}. If the moment isn't actually in this video, replace it with a real public YouTube video that clearly shows it, and give that video's URL + timestamp.`;
+      return `Beat #${n} — ${s.headline || "(this beat)"}\n  video: ${url}\n  narration: ${s.narrationLine || "(write one punchy line)"}\n  This video is only ${len} long, but you gave ${s.startTime}–${s.endTime} (out of range). WATCH it and reply with a corrected timestamp WITHIN ${len}. If the moment isn't actually in this video, replace it with a real public YouTube video that clearly shows it, and give that video's URL + timestamp.`;
     }).join("\n\n");
     const prompt =
-`These Match Story beats have out-of-range timestamps. Fix ONLY these — verify each video's real length first, then reply with corrected lines in this exact format (one per beat):
-<youtube url> | HH:MM:SS - HH:MM:SS | <channel> | <headline>
+`These Match Story beats have out-of-range timestamps. Fix ONLY these — verify each video's real length first, then reply with corrected lines in this exact format (one per beat), keeping the same headline + narration:
+<youtube url> | HH:MM:SS - HH:MM:SS | <channel> | <headline> | <narration line>
 
 ${blocks}`;
     const ok = await copyTextToClipboard(prompt);
@@ -1460,6 +1459,8 @@ ${blocks}`;
           outroEnabled: msOutro,
           captionColor: "#FFF400",
           narrationScript: msNarration,
+          transitionsEnabled: msTransitions,
+          titleCardEnabled: msTitleCard,
           voiceoverVoice: voVoice,
           voiceoverSpeed: voSpeed,
           segments: valid.slice(0, 8).map((s) => ({
@@ -1468,6 +1469,7 @@ ${blocks}`;
             endTime: s.endTime,
             headline: s.headline,
             sourceChannel: s.sourceChannel,
+            narrationLine: s.narrationLine,
           })),
         }),
       });
@@ -2867,13 +2869,23 @@ ${blocks}`;
                               />
                             </div>
                           </div>
+
+                          <div>
+                            <FieldLabel>Narration <span className="text-muted-foreground/40 normal-case">(spoken over this beat — the beat is timed to it)</span></FieldLabel>
+                            <Textarea
+                              placeholder="One punchy commentator line for this beat…"
+                              className="text-sm bg-background min-h-[52px]"
+                              value={seg.narrationLine}
+                              onChange={(e) => updateMsSeg(index, { narrationLine: e.target.value })}
+                            />
+                          </div>
                         </div>
                       );
                     })}
 
                     <button
                       type="button"
-                      onClick={() => msSegments.length < 8 && setMsSegments((p) => [...p, { youtubeUrl: "", startTime: "00:00:00", endTime: "00:00:10", sourceChannel: "", headline: "", verify: null }])}
+                      onClick={() => msSegments.length < 8 && setMsSegments((p) => [...p, { youtubeUrl: "", startTime: "00:00:00", endTime: "00:00:10", sourceChannel: "", headline: "", narrationLine: "", verify: null }])}
                       disabled={msSegments.length >= 8}
                       className={`w-full flex items-center justify-center gap-2 rounded-xl border border-dashed py-3 font-mono text-[11px] uppercase tracking-[0.1em] transition-colors ${
                         msSegments.length >= 8
@@ -2886,16 +2898,19 @@ ${blocks}`;
                     </button>
                   </div>
 
-                  {/* Play-by-play narration (stitched timeline) */}
-                  <div>
-                    <FieldLabel>Play-by-play narration <span className="text-muted-foreground/40 normal-case">(SS | line — seconds on the stitched timeline, 0 = start)</span></FieldLabel>
+                  {/* Legacy flat narration — optional. Per-beat lines above are used by default;
+                      this is only read when NO beat has its own narration line. */}
+                  <details className="group">
+                    <summary className="cursor-pointer list-none">
+                      <FieldLabel>Legacy flat narration <span className="text-muted-foreground/40 normal-case">(optional — only used if no beat has its own line)</span></FieldLabel>
+                    </summary>
                     <Textarea
                       value={msNarration}
                       onChange={(e) => setMsNarration(e.target.value)}
                       placeholder={"0 | Ninety-third minute. One chance left.\n5 | The wall goes up — Messi stands over it.\n11 | And what he does next... is unreal."}
-                      className="text-sm bg-background font-mono min-h-[120px]"
+                      className="text-sm bg-background font-mono min-h-[100px] mt-2"
                     />
-                  </div>
+                  </details>
 
                   {/* Narration voice */}
                   <div className="rounded-xl border border-[#9b7bff]/30 bg-gradient-to-b from-[#9b7bff]/[0.08] to-[#9b7bff]/[0.02] p-4">
@@ -2911,6 +2926,8 @@ ${blocks}`;
                   <div className="flex flex-wrap gap-2">
                     <ToggleChip label="Captions" checked={msCaptions} onChange={setMsCaptions} />
                     <ToggleChip label="Outro card" checked={msOutro} onChange={setMsOutro} />
+                    <ToggleChip label="Title card" checked={msTitleCard} onChange={setMsTitleCard} />
+                    <ToggleChip label="Crossfades" checked={msTransitions} onChange={setMsTransitions} />
                   </div>
 
                   <div className="flex items-center justify-between gap-4 flex-wrap pt-1">
