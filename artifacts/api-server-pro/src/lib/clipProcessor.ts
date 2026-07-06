@@ -2276,16 +2276,28 @@ export async function processStory(
       logger.warn({ thumbErr }, "Story thumbnail failed (non-fatal)");
     }
 
-    // 4) Captions over the whole stitched story
-    if (captionsEnabled && storyDuration > 0) {
-      await burnCaptionsOnFile(clipId, finalOutputPath, storyDuration, outroEnabled, captionColor);
+    // 4) Bridging narration FIRST — mix the AI voice in and emit an ISOLATED voice-only
+    //    track so the captions can be transcribed from the voice (synced to it), not the
+    //    footage commentary. Footage stays audible under the voice (0.22 duck, unchanged).
+    let narrTrackPath = "";
+    const hasNarration = !!(narrationScript && narrationScript.trim());
+    if (hasNarration && storyDuration > 0) {
+      narrTrackPath = path.join(outputDir, `story_${clipId}_narrtrack_${tmpId}.wav`);
+      await mixNarrationOnFile(clipId, finalOutputPath, storyDuration, outroEnabled, narrationScript, storyVoice, storySpeed, 0.22, 8, narrTrackPath, false);
+      if (!fs.existsSync(narrTrackPath)) narrTrackPath = "";
     }
-    await updateProgress(90, true);
+    await updateProgress(88, true);
 
-    // 5) Bridging narration across the stitched timeline
-    if (narrationScript && narrationScript.trim() && storyDuration > 0) {
-      await mixNarrationOnFile(clipId, finalOutputPath, storyDuration, outroEnabled, narrationScript, storyVoice, storySpeed);
+    // 5) Captions. With narration, transcribe the AI-voice track so every caption word
+    //    matches the voice and lands on its onset (DTW karaoke); the known script kills ASR
+    //    typos. With no narration, fall back to captioning the footage audio (as before).
+    if (captionsEnabled && storyDuration > 0) {
+      const knownCaptionText = narrTrackPath
+        ? parseNarrationLines(narrationScript, storyDuration, outroEnabled, 8).map((l) => l.text).join(" ")
+        : "";
+      await burnCaptionsOnFile(clipId, finalOutputPath, storyDuration, outroEnabled, captionColor, narrTrackPath, knownCaptionText);
     }
+    try { narrTrackPath && fs.existsSync(narrTrackPath) && fs.unlinkSync(narrTrackPath); } catch { /* ignore */ }
     await updateProgress(99, true);
     logger.info({ finalOutputPath }, "Story processing complete");
   } finally {
