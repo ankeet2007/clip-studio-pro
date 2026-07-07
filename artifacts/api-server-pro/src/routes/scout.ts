@@ -3,7 +3,7 @@
 
 import { Router, type IRouter } from "express";
 import fs from "fs";
-import { startScout, getScoutJob, setCandidateStatus, buildBeatsFromJob, listAdapters } from "../lib/scout";
+import { startScout, getScoutJob, setCandidateStatus, buildBeatsFromJob, buildBeatsFromUrls, listAdapters } from "../lib/scout";
 import type { Platform, ScoutJob, ScoutOptions } from "../lib/scout/types";
 import { logger } from "../lib/logger";
 
@@ -79,6 +79,26 @@ router.post("/scout/:id/approve", async (req, res): Promise<void> => {
   const beats = await buildBeatsFromJob(req.params.id);
   if (beats.length < 2) { res.status(400).json({ error: "Keep at least 2 clips (that download successfully) before building." }); return; }
   res.json({ beats });
+});
+
+// POST /scout/fetch-urls — Match Story 2.0 (Claude-driven): download a pasted list of social clip
+// URLs (the beats Claude picked via the MCP connector) into local Match Story beats.
+router.post("/scout/fetch-urls", async (req, res): Promise<void> => {
+  const body = req.body as { items?: { url?: string; headline?: string; sourceChannel?: string }[] };
+  const items = (Array.isArray(body.items) ? body.items : [])
+    .filter((x) => x && typeof x.url === "string" && x.url.trim())
+    .map((x) => ({ url: String(x.url).trim(), headline: String(x.headline ?? ""), sourceChannel: String(x.sourceChannel ?? "") }))
+    .slice(0, 8);
+  if (items.length < 2) { res.status(400).json({ error: "Provide at least 2 clip URLs (Reddit / X / Instagram / Facebook)." }); return; }
+  try {
+    const beats = await buildBeatsFromUrls(items);
+    if (beats.length < 2) { res.status(400).json({ error: "Couldn't download at least 2 of those clips — the platform cookies may be missing/expired, or the links aren't downloadable videos." }); return; }
+    logger.info({ requested: items.length, got: beats.length }, "MS2 fetch-urls");
+    res.json({ beats });
+  } catch (e) {
+    logger.error({ e }, "MS2 fetch-urls failed");
+    res.status(500).json({ error: e instanceof Error ? e.message : "Failed to fetch clips." });
+  }
 });
 
 export default router;

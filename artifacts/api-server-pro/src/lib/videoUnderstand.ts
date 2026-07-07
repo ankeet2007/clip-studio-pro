@@ -44,7 +44,7 @@ export interface VideoUnderstanding {
   notes: string[];
 }
 
-function detectPlatform(url: string): UnderstandPlatform | null {
+export function detectPlatform(url: string): UnderstandPlatform | null {
   let host: string;
   try {
     const withProto = /^https?:\/\//i.test(url) ? url : `https://${url}`;
@@ -103,9 +103,15 @@ async function downloadReddit(url: string, out: string): Promise<void> {
   await downloadSocialClip(url, out, cookieFileFor("reddit"));
 }
 
-async function download(platform: UnderstandPlatform, url: string, out: string): Promise<void> {
-  if (platform === "reddit") return downloadReddit(url, out);
-  return void (await downloadSocialClip(url, out, cookieFileFor(platform)));
+/** Download a full reddit/x/ig/fb clip to `out`. Reddit resolves the v.redd.it HLS from the post
+ *  JSON (avoids yt-dlp's IP-blocked Reddit API); the others use yt-dlp + the platform cookie.
+ *  Shared by understand_video AND Match Story 2.0's paste-and-render (buildBeatsFromUrls). */
+export async function downloadSocialUrl(url: string, out: string): Promise<UnderstandPlatform> {
+  const platform = detectPlatform(url);
+  if (!platform) throw new Error("Unsupported URL. Provide a Reddit, X/Twitter, Instagram or Facebook video link.");
+  if (platform === "reddit") await downloadReddit(url, out);
+  else await downloadSocialClip(url, out, cookieFileFor(platform));
+  return platform;
 }
 
 async function extractFrames(file: string, duration: number, dir: string, n: number): Promise<{ dataBase64: string; mimeType: string }[]> {
@@ -151,7 +157,7 @@ export async function understandVideo(url: string, maxFrames = 5): Promise<Video
   const file = path.join(dir, "clip.mp4");
   const notes: string[] = [];
   try {
-    await withTimeout(download(platform, url, file), 40_000, "Download").catch((e) => {
+    await withTimeout(downloadSocialUrl(url, file), 40_000, "Download").catch((e) => {
       throw new Error(`Couldn't download the clip (${e instanceof Error ? e.message : e}). The platform cookie may be missing or expired.`);
     });
     const meta = await probe(file);

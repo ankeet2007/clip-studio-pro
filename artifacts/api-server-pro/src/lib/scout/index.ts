@@ -8,6 +8,7 @@ import path from "path";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import { getUploadsDir, downloadSocialClip, downloadHlsClip } from "../clipProcessor";
+import { downloadSocialUrl } from "../videoUnderstand";
 import { logger } from "../logger";
 import { redditAdapter } from "./reddit";
 import { xAdapter } from "./x";
@@ -146,6 +147,36 @@ export async function buildBeatsFromJob(jobId: string): Promise<{ localFile: str
       });
     } catch (e) {
       logger.warn({ e, url: c.sourceUrl.slice(0, 80) }, "Scout clip download failed at approve");
+      try { fs.existsSync(file) && fs.unlinkSync(file); } catch { /**/ }
+    }
+  }
+  return beats;
+}
+
+/** Match Story 2.0 (Claude-driven): download a PASTED list of reddit/x/ig/fb clip URLs (the beats
+ * Claude picked via the MCP connector) into local Match Story beats. Each whole clip is one beat;
+ * failed/too-long downloads are skipped. Mirrors buildBeatsFromJob but starts from bare URLs. */
+export async function buildBeatsFromUrls(items: { url: string; headline?: string; sourceChannel?: string }[]): Promise<{ localFile: string; sourceType: "local"; startTime: string; endTime: string; headline: string; sourceChannel: string; narrationLine: string; thumbUrl: string | null }[]> {
+  const uploads = getUploadsDir();
+  const toHMS = (s: number) => {
+    const t = Math.max(1, Math.round(s));
+    return [Math.floor(t / 3600), Math.floor((t % 3600) / 60), t % 60].map((n) => String(n).padStart(2, "0")).join(":");
+  };
+  const beats: { localFile: string; sourceType: "local"; startTime: string; endTime: string; headline: string; sourceChannel: string; narrationLine: string; thumbUrl: string | null }[] = [];
+  for (let i = 0; i < items.length && i < 8; i++) {
+    const it = items[i]!;
+    const file = path.join(uploads, `ms2url_${Date.now()}_${i}.mp4`);
+    try {
+      await downloadSocialUrl(it.url, file);
+      const meta = await probeMedia(file);
+      if (meta.duration < 1 || meta.duration > 300) { try { fs.unlinkSync(file); } catch { /**/ } continue; }
+      beats.push({
+        localFile: file, sourceType: "local", startTime: "00:00:00", endTime: toHMS(meta.duration),
+        headline: (it.headline ?? "").replace(/\s+/g, " ").slice(0, 80), sourceChannel: (it.sourceChannel ?? "").slice(0, 80),
+        narrationLine: "", thumbUrl: null,
+      });
+    } catch (e) {
+      logger.warn({ e, url: it.url.slice(0, 80) }, "MS2 pasted-URL download failed");
       try { fs.existsSync(file) && fs.unlinkSync(file); } catch { /**/ }
     }
   }
