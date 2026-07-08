@@ -84,10 +84,10 @@ router.post("/scout/:id/approve", async (req, res): Promise<void> => {
 // POST /scout/fetch-urls — Match Story 2.0 (Claude-driven): download a pasted list of social clip
 // URLs (the beats Claude picked via the MCP connector) into local Match Story beats.
 router.post("/scout/fetch-urls", async (req, res): Promise<void> => {
-  const body = req.body as { items?: { url?: string; headline?: string; sourceChannel?: string }[] };
+  const body = req.body as { items?: { url?: string; headline?: string; sourceChannel?: string; narrationLine?: string }[] };
   const items = (Array.isArray(body.items) ? body.items : [])
     .filter((x) => x && typeof x.url === "string" && x.url.trim())
-    .map((x) => ({ url: String(x.url).trim(), headline: String(x.headline ?? ""), sourceChannel: String(x.sourceChannel ?? "") }))
+    .map((x) => ({ url: String(x.url).trim(), headline: String(x.headline ?? ""), sourceChannel: String(x.sourceChannel ?? ""), narrationLine: String(x.narrationLine ?? "") }))
     .slice(0, 8);
   if (items.length < 2) { res.status(400).json({ error: "Provide at least 2 clip URLs (Reddit / X / Instagram / Facebook)." }); return; }
   try {

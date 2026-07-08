@@ -156,7 +156,7 @@ export async function buildBeatsFromJob(jobId: string): Promise<{ localFile: str
 /** Match Story 2.0 (Claude-driven): download a PASTED list of reddit/x/ig/fb clip URLs (the beats
  * Claude picked via the MCP connector) into local Match Story beats. Each whole clip is one beat;
  * failed/too-long downloads are skipped. Mirrors buildBeatsFromJob but starts from bare URLs. */
-export async function buildBeatsFromUrls(items: { url: string; headline?: string; sourceChannel?: string }[]): Promise<{ localFile: string; sourceType: "local"; startTime: string; endTime: string; headline: string; sourceChannel: string; narrationLine: string; thumbUrl: string | null }[]> {
+export async function buildBeatsFromUrls(items: { url: string; headline?: string; sourceChannel?: string; narrationLine?: string }[]): Promise<{ localFile: string; sourceType: "local"; startTime: string; endTime: string; headline: string; sourceChannel: string; narrationLine: string; thumbUrl: string | null }[]> {
   const uploads = getUploadsDir();
   const toHMS = (s: number) => {
     const t = Math.max(1, Math.round(s));
@@ -173,7 +173,7 @@ export async function buildBeatsFromUrls(items: { url: string; headline?: string
       beats.push({
         localFile: file, sourceType: "local", startTime: "00:00:00", endTime: toHMS(meta.duration),
         headline: (it.headline ?? "").replace(/\s+/g, " ").slice(0, 80), sourceChannel: (it.sourceChannel ?? "").slice(0, 80),
-        narrationLine: "", thumbUrl: null,
+        narrationLine: (it.narrationLine ?? "").replace(/\s+/g, " ").slice(0, 240), thumbUrl: null,
       });
     } catch (e) {
       logger.warn({ e, url: it.url.slice(0, 80) }, "MS2 pasted-URL download failed");

@@ -1593,46 +1593,43 @@ OUTPUT — return EXACTLY one line per clip and nothing else:
   async function copyMs2ClaudePrompt() {
     const topic = ms2Topic.trim() || "<the match / topic — e.g. France vs Uruguay, FIFA World Cup 2026>";
     const prompt =
-`ROLE: You are a world-class football short-form researcher + editor. Build ONE 60-90 second vertical "story" montage about the topic below, told as a single dramatic arc (hook → escalation → payoff) that holds viewers to the very end. The PICKS are everything — a great edit can't save weak moments — so base every choice on real evidence, not memory.
+`ROLE: You are a world-class football short-form researcher + STORY DIRECTOR. Build ONE 60-90 second vertical "story" montage about the topic below, told as a single dramatic arc (hook → escalation → payoff) that holds viewers to the very end. The PICKS are everything — a great edit can't save weak moments — so base every choice on real evidence, not memory.
 
 MATCH / TOPIC: ${topic}
 
-USE YOUR TOOLS: you have a "Clip Studio Scout" connector. Use search_clips to find the most viral, most-talked-about clips across Reddit, X (Twitter), Instagram and Facebook, and use understand_video on the strongest candidates to actually WATCH them (keyframes + transcript) before committing — pick only clips you've verified show the moment.
+USE YOUR TOOLS: you have a "Clip Studio Scout" connector. Use search_clips to find the most viral, most-talked-about clips across Reddit, X (Twitter), Instagram and Facebook, and use understand_video on the strongest candidates to actually WATCH them (keyframes + transcript) before committing.
 
-SELECT 4-8 beats that, IN ORDER, tell ONE sequence:
-- Beat 1 is the HOOK — the single most curiosity-grabbing moment.
-- Each following beat RAISES the stakes; save the biggest payoff for last.
-- Every beat is one self-contained clip with clear visual action (no dead air).
-- Use each clip's REAL source URL from search_clips (reddit.com / x.com / instagram.com / facebook.com). NEVER invent a URL — only use links search_clips actually returned and understand_video could open.
+METHOD:
+1. ANGLE — pick ONE throughline the whole video is about (a single question, claim or character, e.g. "the referee decided this match"). Every clip must serve that angle; drop anything off-topic.
+2. ARC — select 4-8 beats that, IN ORDER, build the story:
+   - Beat 1 = the HOOK: the single most curiosity-grabbing moment.
+   - Middle beats ESCALATE: each raises the stakes or adds a twist, cause before effect.
+   - Final beat = the PAYOFF: the biggest moment / the answer to the hook — never bury it.
+3. WHICH CLIP AT WHICH BEAT — each clip you pick must LITERALLY SHOW the moment its narration describes; verify with understand_video first. Reject blurry, zoomed-logo, static or ambiguous clips (a beat with no clear action is a dead beat). Use each clip's REAL source URL from search_clips — NEVER invent a URL.
 
-THEN write DENSE play-by-play NARRATION on the FINAL stitched timeline (0 = start of the stitched video). Hype commentator tone, ONE short line every 3-5 seconds, building tension to the payoff — advance the story, don't just describe what's on screen.
+NARRATION — for EACH beat write ONE short spoken line in a STORYTELLER voice: calm, specific (names + numbers), cause→effect, a little tension/humor, ending most beats on a curiosity gap that pulls into the next ("…but that wasn't even the strangest part"). The line is what's spoken WHILE that clip is on screen, so words and picture always match. NOT rapid hype play-by-play, and don't just describe what's on screen — advance the story. The clip's own audio is MUTED, so the narration alone carries the whole story.
 
-OUTPUT — return EXACTLY this and nothing else (fields separated by " | "):
+OUTPUT — return EXACTLY this and nothing else (one line per beat, IN PLAY ORDER, fields separated by " | "):
 TITLE: <4-7 word title>
 SEGMENTS:
-<clip url> | <channel/handle> | <headline>
-...
-NARRATION:
-SS | line
+<clip url> | <channel/handle> | <on-screen headline, 3-6 words> | <the narration line spoken over this clip>
 ...
 
 Example:
 TITLE: Messi's Free Kick Masterclass
 SEGMENTS:
-https://x.com/i/status/123 | @FanCam | The Wall Sets Up
-https://www.reddit.com/r/soccer/comments/abc/ | r/soccer | He Curls It In
-NARRATION:
-0 | Ninety-third minute. One chance left.
-5 | The wall goes up — Messi stands over it.
-11 | And what he does next... is unreal.`;
+https://x.com/i/status/123 | @FanCam | The Wall Sets Up | Ninety-third minute, one chance left — and Messi doesn't even wait for the whistle.
+https://www.reddit.com/r/soccer/comments/abc/ | r/soccer | He Curls It In | It bends over the wall and into the top corner — the keeper never moved.`;
     const ok = await copyTextToClipboard(prompt);
     toast(ok
       ? { title: "Claude prompt copied", description: "Run it in the Claude app (Clip Studio connector on), then paste its reply below." }
       : { title: "Copy failed", variant: "destructive" });
   }
 
-  // Parse Claude's reply (SEGMENTS with social URLs + a timeline NARRATION block), download each
-  // clip via /scout/fetch-urls, and fill the montage below with a timeline narration.
+  // Parse Claude's reply. Preferred format = SEGMENTS lines carrying their OWN narration as a 4th
+  // field (`url | channel | headline | narration line`) so each beat is paced to its own voice;
+  // a legacy separate `NARRATION:` timeline block (SS | line) is still honored as a fallback.
+  // Downloads each clip via /scout/fetch-urls, then fills the montage below.
   async function applyMs2ClaudePaste() {
     const text = ms2ClaudePaste.replace(/[​‌‍﻿⁠]/g, "");
     const titleMatch = text.match(/^\s*TITLE\s*:\s*(.+)$/im);
@@ -1642,20 +1639,28 @@ NARRATION:
     const narrBlock = nIdx >= 0 ? text.slice(nIdx).replace(/^[^\n]*\n?/, "") : "";
     segBlock = segBlock.replace(/(?:beats|segments)\s*:/i, "").replace(/^\s*TITLE\s*:.*$/im, "");
 
-    const items: { url: string; headline: string; sourceChannel: string }[] = [];
+    const items: { url: string; headline: string; sourceChannel: string; narrationLine: string }[] = [];
     for (const rawLine of segBlock.split(/\r?\n/)) {
       const urlM = rawLine.match(/https?:\/\/[^\s|]+/i);
       if (!urlM) continue;
       const rest = rawLine.split("|").map((f) => f.trim())
         .filter((f) => f.length > 0 && !/^https?:\/\//i.test(f) && !/\d{1,2}:\d{2}(?::\d{2})?\s*(?:-|–|—|to|→)/i.test(f));
-      items.push({ url: urlM[0], sourceChannel: (rest[0] ?? "").slice(0, 80), headline: (rest[1] ?? rest[0] ?? "").slice(0, 120) });
+      // Fields after the url, in order: channel, on-screen headline, spoken narration line.
+      items.push({
+        url: urlM[0],
+        sourceChannel: (rest[0] ?? "").slice(0, 80),
+        headline: (rest[1] ?? rest[0] ?? "").slice(0, 120),
+        narrationLine: rest.slice(2).join(" — ").slice(0, 240),
+      });
       if (items.length >= 8) break;
     }
     if (items.length < 2) {
-      toast({ title: "Couldn't read the clips", description: "Paste SEGMENTS lines like  https://x.com/i/status/… | @handle | Headline  then a NARRATION block (SS | line).", variant: "destructive" });
+      toast({ title: "Couldn't read the clips", description: "Paste SEGMENTS lines like  https://x.com/i/status/… | @handle | Headline | narration line", variant: "destructive" });
       return;
     }
-    const narration = narrBlock.split(/\r?\n/).map((l) => l.trim()).filter((l) => /^\d{1,2}(:\d{2})?\s*\|/.test(l)).join("\n");
+    // Per-beat narration is preferred; only fall back to the old timeline block if Claude gave none.
+    const hasPerBeat = items.some((it) => it.narrationLine.length > 0);
+    const timelineNarration = hasPerBeat ? "" : narrBlock.split(/\r?\n/).map((l) => l.trim()).filter((l) => /^\d{1,2}(:\d{2})?\s*\|/.test(l)).join("\n");
 
     setMs2Loading(true);
     try {
@@ -1667,12 +1672,13 @@ NARRATION:
       if (!r.ok) throw new Error(data.error ?? "Couldn't fetch the clips");
       const beats: MatchSeg[] = (data.beats ?? []).map((b: any) => ({
         youtubeUrl: "", startTime: b.startTime, endTime: b.endTime, sourceChannel: b.sourceChannel ?? "",
-        headline: b.headline ?? "", narrationLine: "", localFile: b.localFile, sourceType: "local", thumbUrl: b.thumbUrl ?? undefined, verify: null,
+        headline: b.headline ?? "", narrationLine: b.narrationLine ?? "", localFile: b.localFile, sourceType: "local", thumbUrl: b.thumbUrl ?? undefined, verify: null,
       }));
       setMs2Beats(beats);
-      setMs2Narration(narration);
+      setMs2Narration(timelineNarration);
       setMs2ClaudePaste("");
-      toast({ title: `${beats.length} clips downloaded`, description: "Review the montage + timeline narration below, then Enqueue." });
+      const voiced = beats.filter((b) => (b.narrationLine ?? "").trim().length > 0).length;
+      toast({ title: `${beats.length} clips downloaded`, description: voiced ? `${voiced} beats have their own narration line — review the montage below, then Enqueue.` : "Review the montage + timeline narration below, then Enqueue." });
     } catch (e) {
       toast({ title: e instanceof Error ? e.message : "Couldn't fetch the clips", variant: "destructive" });
     } finally {
