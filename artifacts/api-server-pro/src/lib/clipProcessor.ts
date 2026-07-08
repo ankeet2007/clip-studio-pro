@@ -50,6 +50,10 @@ const MAX_CONCURRENT = 1;
 // (filtergraph init, first-frame decode of a 1080p60 source, transient memory thrash). The
 // old 90s default was killing such renders prematurely. 15 min only trips on a truly dead
 // process. See spawnProcess / the composite render.
+// NOTE: every render-phase spawnProcess call passes timeoutMs=0 (no hard wall-clock cap) — a
+// phone render can legitimately run for hours, so RENDER_STALL_MS is the ONLY guard against a
+// genuinely dead process. Do NOT reintroduce a hard cap on a "render" call: it SIGKILLs slow-
+// but-healthy renders mid-way (this is what killed clip #56 at the 300s mark).
 const RENDER_STALL_MS = 900_000;
 let activeJobs = 0;
 const jobQueue: Array<() => void> = [];
@@ -1153,7 +1157,7 @@ async function normalizeSegmentTimestamps(file: string, tmpId: string): Promise<
   // Pass 1: genpts stream-copy remux (lossless) so the pts-less packets become decodable.
   await spawnProcess("ffmpeg", [
     "-y", "-fflags", "+genpts", "-i", file, "-c", "copy", remuxPath,
-  ], 300_000, undefined, RENDER_STALL_MS, "render");
+  ], 0, undefined, RENDER_STALL_MS, "render");
 
   // Pass 2: re-encode rebuilding pts from the frame/sample index → correct duration & pacing.
   const args = [
@@ -2079,10 +2083,11 @@ async function mixNarrationOnFile(
   narrationScript: string,
   voice: string,
   speed: string,
-  // How far to duck the original footage WHILE a narration line plays (0-1). Outside the
-  // spoken windows the footage returns to full volume. Match Story passes 0 (full mute) so
-  // the AI voice is the ONLY voice; Top 5 uses a near-silent 0.05; Story keeps the gentler
-  // 0.22 default so the crowd/commentary stays audible under it.
+  // How far to duck the original footage (0-1). In the hard-gate paths (Story / Top 5) this is
+  // the level WHILE a narration line plays; outside spoken windows the footage returns to full.
+  // In the smoothDuck path (Match Story) it is a CONSTANT floor the footage is held at across the
+  // whole video, so a clip's own loud commentary can never fight the AI voice — Match Story passes
+  // ~0.06 (a faint ambience bed), Top 5 uses 0.05, Story keeps the gentler 0.22 gate.
   duckVolume = 0.22,
   // Max narration lines to keep. Story/Top 5 use the default 8; Match Story raises it for
   // dense play-by-play. Threaded into parseNarrationLines' cap.
@@ -2143,7 +2148,9 @@ async function mixNarrationOnFile(
           parts.push(`${narrLabels.join("")}amix=inputs=${narrLabels.length}:duration=longest:normalize=0,apad=whole_dur=${duration}[narrsum]`);
         }
         parts.push(`[narrsum]asplit=2[nkey][nmix]`);
-        parts.push(`[0:a]aresample=48000,aformat=channel_layouts=stereo[foot]`);
+        // Hold the footage at a faint CONSTANT floor (duckVolume) so its own commentary never
+        // competes with the narration, THEN sidechain-duck it further under each spoken line.
+        parts.push(`[0:a]aresample=48000,aformat=channel_layouts=stereo,volume=${duckVolume}[foot]`);
         parts.push(`[foot][nkey]sidechaincompress=threshold=0.02:ratio=20:attack=5:release=260:makeup=1[duckfoot]`);
         parts.push(`[duckfoot][nmix]amix=inputs=2:duration=first:normalize=0,loudnorm=I=-14:TP=-1.5:LRA=11[aout]`);
       } else {
@@ -2260,7 +2267,7 @@ export async function processStory(
     await spawnProcess("ffmpeg", [
       "-y", "-f", "concat", "-safe", "0", "-i", listPath,
       "-c", "copy", "-movflags", "+faststart", stitchedPath,
-    ], 300_000, () => {}, RENDER_STALL_MS, "render");
+    ], 0, () => {}, RENDER_STALL_MS, "render");
     if (!fs.existsSync(stitchedPath)) throw new Error("Story concat produced no output");
     fs.renameSync(stitchedPath, finalOutputPath);
     await updateProgress(72, true);
@@ -2328,7 +2335,7 @@ async function canonicalizePart(inPath: string, outPath: string): Promise<void> 
     "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p", "-r", "30",
     "-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-ac", "2",
     "-movflags", "+faststart", outPath,
-  ], 300_000, () => {}, RENDER_STALL_MS, "render");
+  ], 0, () => {}, RENDER_STALL_MS, "render");
 }
 
 /**
@@ -2352,7 +2359,7 @@ async function renderMatchTitleCard(title: string, outPath: string, dur: number)
     "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p", "-r", String(fps),
     "-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-ac", "2",
     "-movflags", "+faststart", outPath,
-  ], 120_000, () => {}, RENDER_STALL_MS, "render");
+  ], 0, () => {}, RENDER_STALL_MS, "render");
 }
 
 /**
@@ -2388,7 +2395,7 @@ async function stitchWithTransitions(parts: string[], partDurs: number[], fade: 
       "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p", "-r", "30",
       "-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-ac", "2",
       "-movflags", "+faststart", outPath,
-    ], 600_000, () => {}, RENDER_STALL_MS, "render");
+    ], 0, () => {}, RENDER_STALL_MS, "render");
     return fs.existsSync(outPath) && ((await probeContentDuration(outPath)) || 0) > 0;
   } catch (e) {
     logger.warn({ e }, "Match Story crossfade stitch failed — falling back to plain concat");
@@ -2550,7 +2557,7 @@ export async function processMatchStory(
       await spawnProcess("ffmpeg", [
         "-y", "-f", "concat", "-safe", "0", "-i", listPath,
         "-c", "copy", "-movflags", "+faststart", stitchedPath,
-      ], 300_000, () => {}, RENDER_STALL_MS, "render");
+      ], 0, () => {}, RENDER_STALL_MS, "render");
     }
     if (!fs.existsSync(stitchedPath)) throw new Error("Match Story stitch produced no output");
     fs.renameSync(stitchedPath, finalOutputPath);
@@ -2591,7 +2598,7 @@ export async function processMatchStory(
     let narrTrackPath = "";
     if (effectiveNarration && effectiveNarration.trim() && totalDuration > 0) {
       narrTrackPath = path.join(outputDir, `match_${clipId}_narrtrack_${tmpId}.wav`);
-      await mixNarrationOnFile(clipId, finalOutputPath, totalDuration, outroEnabled, effectiveNarration, msVoice, msSpeed, 0, 16, narrTrackPath, true);
+      await mixNarrationOnFile(clipId, finalOutputPath, totalDuration, outroEnabled, effectiveNarration, msVoice, msSpeed, 0.06, 16, narrTrackPath, true);
       if (!fs.existsSync(narrTrackPath)) narrTrackPath = "";
     }
     await updateProgress(88, true);
@@ -2699,7 +2706,7 @@ export async function processTop5(
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "14", "-pix_fmt", "yuv420p", "-r", String(fps),
         "-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-ac", "2",
         "-movflags", "+faststart", titleCard,
-      ], 120_000, () => {}, RENDER_STALL_MS, "render");
+      ], 0, () => {}, RENDER_STALL_MS, "render");
       if (!fs.existsSync(titleCard)) throw new Error("Top 5: title card render failed");
       parts.push(titleCard);
     }
@@ -2734,7 +2741,7 @@ export async function processTop5(
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p", "-r", String(fps),
         "-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-ac", "2",
         "-movflags", "+faststart", badgedPath,
-      ], 300_000, () => {}, RENDER_STALL_MS, "render");
+      ], 0, () => {}, RENDER_STALL_MS, "render");
       try { fs.existsSync(rawPath) && fs.unlinkSync(rawPath); } catch { /* ignore */ }
       if (!fs.existsSync(badgedPath)) throw new Error(`Top 5: normalize pass failed for moment #${seg.rank}`);
       parts.push(badgedPath);
@@ -2748,7 +2755,7 @@ export async function processTop5(
     await spawnProcess("ffmpeg", [
       "-y", "-f", "concat", "-safe", "0", "-i", listPath,
       "-c", "copy", "-movflags", "+faststart", stitchedPath,
-    ], 300_000, () => {}, RENDER_STALL_MS, "render");
+    ], 0, () => {}, RENDER_STALL_MS, "render");
     if (!fs.existsSync(stitchedPath)) throw new Error("Top 5 concat produced no output");
     fs.renameSync(stitchedPath, finalOutputPath);
     await updateProgress(68, true);
