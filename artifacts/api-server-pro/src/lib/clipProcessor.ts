@@ -3,6 +3,8 @@ import { promisify } from "util";
 import path from "path";
 import fs from "fs";
 import os from "os";
+import http from "http";
+import https from "https";
 import { inArray, eq } from "drizzle-orm";
 import { db, clipsTable } from "@workspace/db-pro";
 import { logger } from "./logger";
@@ -1176,6 +1178,82 @@ async function normalizeSegmentTimestamps(file: string, tmpId: string): Promise<
   return cleanPath;
 }
 
+// ── Cloud render offload ──────────────────────────────────────────────────────
+// When CLOUD_RENDER_URL is set, the heavy composite/captions/voiceover can run on a
+// remote worker (fast box, no OOM — see the Codespace worker in src/worker.ts). The
+// phone still DOWNLOADS on its home IP (yt-dlp is never run on the cloud), then ships
+// the already-cut segment up. Any failure returns false → the caller renders locally.
+async function cloudHealthOk(base: string, timeoutMs = 3500): Promise<boolean> {
+  return new Promise((resolve) => {
+    try {
+      const u = new URL("/health", base);
+      const lib = u.protocol === "https:" ? https : http;
+      const req = lib.get(u, { timeout: timeoutMs }, (res) => {
+        res.resume();
+        resolve(res.statusCode === 200);
+      });
+      req.on("timeout", () => { req.destroy(); resolve(false); });
+      req.on("error", () => resolve(false));
+    } catch { resolve(false); }
+  });
+}
+
+async function offloadToCloud(
+  inputPath: string,
+  outPath: string,
+  params: Record<string, unknown>,
+): Promise<boolean> {
+  const base = process.env.CLOUD_RENDER_URL;
+  if (!base) return false;
+  // Fast reachability check first, so a stopped cloud box falls back to local in ~3s
+  // instead of hanging on a long connect timeout.
+  if (!(await cloudHealthOk(base))) return false;
+
+  return new Promise((resolve) => {
+    try {
+      const u = new URL("/worker/render", base);
+      const lib = u.protocol === "https:" ? https : http;
+      const size = fs.statSync(inputPath).size;
+      const req = lib.request(u, {
+        method: "POST",
+        timeout: 30 * 60 * 1000, // 30-min ceiling on the whole round-trip
+        headers: {
+          "content-type": "application/octet-stream",
+          "content-length": String(size),
+          "x-worker-secret": process.env.CLOUD_RENDER_SECRET || "",
+          "x-params": Buffer.from(JSON.stringify(params)).toString("base64"),
+        },
+      }, (res) => {
+        const ct = String(res.headers["content-type"] || "");
+        if (res.statusCode !== 200 || !ct.includes("video/mp4")) {
+          let body = "";
+          res.on("data", (d) => { if (body.length < 600) body += d.toString(); });
+          res.on("end", () => {
+            logger.warn({ status: res.statusCode, body }, "Cloud render did not return an MP4");
+            resolve(false);
+          });
+          res.on("error", () => resolve(false));
+          return;
+        }
+        const out = fs.createWriteStream(outPath);
+        res.pipe(out);
+        out.on("finish", () => {
+          const ok = fs.existsSync(outPath) && fs.statSync(outPath).size > 1000;
+          resolve(ok);
+        });
+        out.on("error", () => resolve(false));
+        res.on("error", () => resolve(false));
+      });
+      req.on("timeout", () => { req.destroy(); resolve(false); });
+      req.on("error", (e) => { logger.warn({ e }, "Cloud offload request error"); resolve(false); });
+      fs.createReadStream(inputPath).pipe(req);
+    } catch (e) {
+      logger.warn({ e }, "Cloud offload setup error");
+      resolve(false);
+    }
+  });
+}
+
 export async function processClip(
   youtubeUrl: string | null,
   startTime: string,
@@ -1295,6 +1373,29 @@ export async function processClip(
       }
       logger.info({ finalOutputPath }, "Raw clip saved (no compositing)");
       return;
+    }
+
+    // ── Cloud offload (optional, edited mode) ───────────────────────────────────
+    // If a cloud worker is configured AND reachable, render the heavy composite there
+    // and skip the local ffmpeg pipeline entirely. We only offload YouTube clips: by
+    // now tmpInputPath is a small pre-cut, 0-based segment, so startTime "00:00:00" +
+    // the (clamped) duration reproduce the exact same cut on the worker. Local uploads
+    // (potentially huge) always render locally. ANY failure falls through to local.
+    if (process.env.CLOUD_RENDER_URL && !isLocalFile && tmpInputPath) {
+      await updateProgress(48, true);
+      const ok = await offloadToCloud(tmpInputPath, finalOutputPath, {
+        headline, mode: "edited", channelHandle, frameStyle, sourceChannel,
+        captionsEnabled, outroEnabled, voiceoverEnabled, voiceoverHook,
+        punchInEnabled, zoomMoments, captionColor, voiceoverMode, narrationScript,
+        voiceoverVoice: jobVoice, voiceoverSpeed: jobSpeed,
+        startTime: "00:00:00", endTime: formatHMS(duration), topRank,
+      });
+      if (ok) {
+        logger.info({ finalOutputPath }, "Clip rendered on cloud worker (offloaded)");
+        await updateProgress(100, true);
+        return;
+      }
+      logger.warn("Cloud offload unavailable/failed — rendering locally");
     }
 
     logger.info({ tmpInputPath }, "Building filter graph for edited mode");
