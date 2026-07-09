@@ -2779,11 +2779,19 @@ export async function processMatchStory(
             beatVo[i] = { text: line, wav, dur: voDur };
           }
         }
-        // Local (scout) beats are a fixed-length downloaded file — never window-extend them
-        // (that would freeze-pad). YouTube beats stretch to cover their voiceover.
-        if (!isLocalBeat(seg)) {
+        const pad = 0.3 + 0.9 + (isLast && outroEnabled ? 2 : 0);
+        if (isLocalBeat(seg)) {
+          // Scout/local beats: TRIM the downloaded clip down to its narration line (B-roll cut to
+          // fit) so the story is NARRATION-DRIVEN and tight — not the full clip (playing whole scout
+          // clips made a 4-beat story run ~4 min). Capped at the real footage length (never
+          // freeze-pad past it) and ≤ 20s so no single beat dominates.
+          const clipLen = Math.max(1, timeToSeconds(seg.endTime) - timeToSeconds(seg.startTime));
+          const want = voDur > 0 ? voDur + pad : Math.min(clipLen, 8);
+          const targetLen = Math.min(clipLen, 20, want);
+          endTime = secondsToHMS(timeToSeconds(seg.startTime) + targetLen);
+        } else {
+          // YouTube beats: stretch the window to cover the voiceover (capped 24s).
           const reqLen = Math.max(0, timeToSeconds(seg.endTime) - timeToSeconds(seg.startTime));
-          const pad = 0.3 + 0.9 + (isLast && outroEnabled ? 2 : 0);
           const targetLen = Math.min(24, Math.max(reqLen, voDur > 0 ? voDur + pad : reqLen));
           if (targetLen > reqLen + 0.05) endTime = secondsToHMS(timeToSeconds(seg.startTime) + targetLen);
         }

@@ -22,7 +22,7 @@ Usage: python3 karaoke_captions_pro.py <whisper.json> <out.ass> [outro_start_sec
 `highlight_hex` (optional) is the spoken/active-word colour as "#RRGGBB" (or bare
 "RRGGBB"); blank/invalid falls back to the classic bright yellow.
 """
-import json, re, sys
+import json, os, re, sys
 
 # ---- style knobs (kept identical to karaoke_captions.py for a consistent look)
 FONT          = "DejaVu Sans"
@@ -57,7 +57,7 @@ MIN_WORD_DUR  = 0.12     # floor so a highlight is never zero-length
 TAIL_DUR      = 0.50     # how long the very last word of the clip lingers
 MAX_TAIL      = 1.40     # cap on how long a line lingers across a pause before the next
 EPS           = 0.03     # tiny gap between display lines so libass never stacks two
-LEAD          = 0.0      # global nudge (s); DTW is accurate, leave at 0, tune if needed
+LEAD          = float(os.environ.get("CAPTION_LEAD_SEC", "0") or "0")  # global nudge (s): NEGATIVE = captions earlier (env-tunable, e.g. -0.15 to lead the voice)
 
 
 def ass_time(s):
