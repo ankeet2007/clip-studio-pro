@@ -26,5 +26,7 @@ SECRET=$(echo "$OUT" | sed -n 's/^SECRET=//p' | head -1)
 printf 'export CLOUD_RENDER_URL="%s"\nexport CLOUD_RENDER_SECRET="%s"\n' "$URL" "$SECRET" \
   | ssh -F /root/.ssh/config phone 'cat > ~/myapp/cloud_render.env && chmod 600 ~/myapp/cloud_render.env'
 ssh -F /root/.ssh/config phone 'bash ~/deploy_pro.sh >/dev/null 2>&1 || true'
+# Log the ON time for the `usage` command (idempotent: an open session already covers a re-run).
+printf 'on %s\n' "$(date +%s)" >> "$HOME/cloud-usage.log"
 echo "[cloud-on] CLOUD ON — your phone now renders on the cloud."
 echo "[cloud-on] ($URL)"
