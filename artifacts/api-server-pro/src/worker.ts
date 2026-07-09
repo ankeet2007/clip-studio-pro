@@ -57,6 +57,9 @@ const SECRET = process.env.WORKER_SECRET || "";
 type JobRec = { status: "rendering" | "done" | "error"; outPath?: string; error?: string; mode?: string; seconds?: number };
 const jobs = new Map<string, JobRec>();
 
+// Async transcribe jobs (understand_video's cloud path, medium.en). Kept separate from render jobs.
+const trJobs = new Map<string, { status: "running" | "done" | "error"; transcript?: string; error?: string }>();
+
 function decodeParams(h: string | string[] | undefined): Record<string, unknown> {
   try { return JSON.parse(Buffer.from(String(h || ""), "base64").toString("utf8") || "{}"); }
   catch { return {}; }
@@ -200,6 +203,64 @@ const server = http.createServer((req, res) => {
         try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { /* */ }
       }
     });
+    return;
+  }
+
+  // POST /worker/transcribe-job -> body = raw 16kHz-mono WAV ; returns { jobId } immediately and runs
+  // whisper medium.en in the BACKGROUND (far sharper than the phone's tiny.en). ASYNC on purpose: a
+  // full minute of audio on medium.en can take minutes, which would blow a proxy's ~100s response
+  // timeout — so the phone submits then polls, and longer clips are NEVER rejected on a timeout.
+  if (req.method === "POST" && url === "/worker/transcribe-job") {
+    if (!SECRET || req.headers["x-worker-secret"] !== SECRET) {
+      res.writeHead(401, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "unauthorized" }));
+      req.resume();
+      return;
+    }
+    const wavPath = path.join(os.tmpdir(), `wk_tr_${Date.now()}_${Math.random().toString(36).slice(2)}.wav`);
+    const ws = fs.createWriteStream(wavPath);
+    req.pipe(ws);
+    ws.on("error", () => { try { res.writeHead(500); res.end("upload error"); } catch { /* */ } });
+    ws.on("finish", () => {
+      const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      trJobs.set(jobId, { status: "running" });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ jobId }));
+      const bin = process.env.WORKER_WHISPER_BIN || path.join(os.homedir(), "whisper.cpp/build/bin/whisper-cli");
+      const model = process.env.WORKER_WHISPER_MODEL || path.join(os.homedir(), "whisper.cpp/models/ggml-medium.en.bin");
+      const ofPrefix = wavPath.replace(/\.wav$/, "");
+      const started = Date.now();
+      // Generous ceiling (a few minutes) so even a long clip's medium.en pass completes; the phone's
+      // poll deadline is longer still, so the timeout never rejects a legitimately long transcription.
+      execFile(bin, ["-m", model, "-f", wavPath, "-nt", "-np", "-otxt", "-of", ofPrefix, "-t", "4"],
+        { timeout: 280_000, maxBuffer: 8 * 1024 * 1024, env: { ...process.env, LD_LIBRARY_PATH: `${path.dirname(bin)}:${process.env.LD_LIBRARY_PATH || ""}` } },
+        (err) => {
+          let transcript = "";
+          try { transcript = fs.readFileSync(`${ofPrefix}.txt`, "utf8").replace(/\s+/g, " ").trim(); } catch { /* */ }
+          try { fs.unlinkSync(wavPath); } catch { /* */ }
+          try { fs.unlinkSync(`${ofPrefix}.txt`); } catch { /* */ }
+          const rec = trJobs.get(jobId);
+          if (rec) {
+            if (err && !transcript) { rec.status = "error"; rec.error = String(err.message || err); }
+            else { rec.status = "done"; rec.transcript = transcript; }
+          }
+          console.log(`[worker] transcribe ${jobId} ${err && !transcript ? "failed" : "done"} in ${((Date.now() - started) / 1000).toFixed(1)}s (${transcript.length} chars)`);
+          setTimeout(() => trJobs.delete(jobId), 120_000);
+        });
+    });
+    return;
+  }
+
+  // GET /worker/transcribe-job/<id> -> { status, transcript?, error? }
+  if (req.method === "GET" && url.startsWith("/worker/transcribe-job/")) {
+    if (!SECRET || req.headers["x-worker-secret"] !== SECRET) {
+      res.writeHead(401, { "content-type": "application/json" }); res.end(JSON.stringify({ error: "unauthorized" })); return;
+    }
+    const jobId = url.slice("/worker/transcribe-job/".length);
+    const rec = trJobs.get(jobId);
+    if (!rec) { res.writeHead(404, { "content-type": "application/json" }); res.end(JSON.stringify({ error: "unknown job" })); return; }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ status: rec.status, transcript: rec.transcript, error: rec.error }));
     return;
   }
 

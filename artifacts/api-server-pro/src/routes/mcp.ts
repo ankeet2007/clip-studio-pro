@@ -108,9 +108,10 @@ const TOOLS = [
     description:
       "Search Reddit, X (Twitter), Instagram and Facebook for the best video clips about a topic, " +
       "ranked by relevance + engagement + recency + quality. Returns candidate clips with title, " +
-      "platform, author, score, engagement, duration, source URL and thumbnail. Read-only: it does " +
-      "NOT download anything. If the search is still running when it returns, call get_scout_results " +
-      "with the returned jobId for the rest.",
+      "platform, author, score, engagement, duration, source URL — PLUS a real THUMBNAIL IMAGE for " +
+      "the top candidates so you can pre-filter visually before spending understand_video on each. " +
+      "Read-only: it does NOT download anything. If the search is still running when it returns, " +
+      "call get_scout_results with the returned jobId for the rest.",
     inputSchema: {
       type: "object",
       properties: {
@@ -146,8 +147,9 @@ const TOOLS = [
       "(scene changes — the goal, tackle, celebration, not just even time steps) plus a transcript " +
       "of the spoken audio/commentary and a motion note — look at the frames and read the transcript " +
       "to describe what actually happens. ALWAYS understand a clip before assigning it to a story " +
-      "beat. Pairs with search_clips: find a link, then understand it. May take up to ~50s; on long " +
-      "clips only the first 60s of audio is transcribed.",
+      "beat. Pairs with search_clips: find a link, then understand it. Usually ~50s, but can take a " +
+      "few minutes when the render cloud is on (it transcribes with the far more accurate medium.en " +
+      "then); only the first 60s of audio is transcribed.",
     inputSchema: {
       type: "object",
       properties: {
@@ -190,7 +192,7 @@ async function runListPlatforms(): Promise<string> {
   return parts.join(" ");
 }
 
-async function runSearchClips(args: any): Promise<string> {
+async function runSearchClips(args: any): Promise<ToolResult> {
   const topic = String(args?.topic ?? "").trim();
   if (topic.length < 2) throw new Error("Provide a topic to search for (at least 2 characters).");
   const platforms = Array.isArray(args?.platforms)
@@ -216,20 +218,59 @@ async function runSearchClips(args: any): Promise<string> {
     cur = await apiFetch(`/scout/${encodeURIComponent(jobId)}`);
   }
   logger.info({ jobId, topic, status: cur.status, count: cur.candidates?.length ?? 0 }, "MCP search_clips");
-  return renderJob(cur);
+  return renderJobResult(cur);
 }
 
-async function runGetResults(args: any): Promise<string> {
+async function runGetResults(args: any): Promise<ToolResult> {
   const jobId = String(args?.jobId ?? "").trim();
   if (!jobId) throw new Error("Provide the jobId returned by search_clips.");
   const job = await apiFetch(`/scout/${encodeURIComponent(jobId)}`);
-  return renderJob(job);
+  return renderJobResult(job);
 }
 
 type ContentBlock = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 interface ToolResult { content: ContentBlock[]; isError?: boolean }
 
 const textResult = (text: string): ToolResult => ({ content: [{ type: "text", text }] });
+
+// Fetch a candidate's remote thumbnail as an MCP image block, bounded in time + size so a slow or
+// huge CDN image can never stall or bloat the tool result. Non-image / oversize / slow → null.
+async function fetchThumb(url: string): Promise<ContentBlock | null> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 4000);
+  try {
+    const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" }, signal: ctrl.signal });
+    if (!res.ok) return null;
+    const mime = (res.headers.get("content-type") || "").split(";")[0]!.trim();
+    if (!mime.startsWith("image/")) return null;
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length < 200 || buf.length > 250_000) return null; // skip broken/oversize to bound payload
+    return { type: "image", data: buf.toString("base64"), mimeType: mime };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Render a scout job as the text list PLUS real thumbnail images for the top candidates, so Claude
+// can pre-filter visually before spending a full understand_video on each. Thumbnails are best-effort
+// (parallel, capped in count + size); the text list always carries EVERY candidate regardless.
+async function renderJobResult(job: any): Promise<ToolResult> {
+  const content: ContentBlock[] = [{ type: "text", text: renderJob(job) }];
+  const cands: any[] = Array.isArray(job?.candidates) ? job.candidates : [];
+  const top = cands.filter((c) => typeof c.thumbUrl === "string" && c.thumbUrl).slice(0, 8);
+  if (top.length) {
+    const imgs = await Promise.all(top.map((c) => fetchThumb(c.thumbUrl)));
+    top.forEach((c, idx) => {
+      const img = imgs[idx];
+      if (!img) return;
+      content.push({ type: "text", text: `Thumbnail — clip #${cands.indexOf(c) + 1} [${c.platform}] ${(c.title || "").slice(0, 60)}` });
+      content.push(img);
+    });
+  }
+  return { content };
+}
 
 async function runUnderstandVideo(args: any): Promise<ToolResult> {
   const url = String(args?.url ?? "").trim();
@@ -249,8 +290,8 @@ async function runUnderstandVideo(args: any): Promise<ToolResult> {
 async function callTool(name: string, args: any): Promise<ToolResult> {
   switch (name) {
     case "list_platforms": return textResult(await runListPlatforms());
-    case "search_clips": return textResult(await runSearchClips(args));
-    case "get_scout_results": return textResult(await runGetResults(args));
+    case "search_clips": return runSearchClips(args);
+    case "get_scout_results": return runGetResults(args);
     case "understand_video": return runUnderstandVideo(args);
     default: throw new Error(`Unknown tool: ${name}`);
   }

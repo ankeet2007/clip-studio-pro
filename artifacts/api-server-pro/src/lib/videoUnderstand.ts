@@ -173,17 +173,66 @@ async function extractFramesAt(file: string, times: number[], dir: string): Prom
   return frames;
 }
 
-async function transcribe(file: string, dir: string, budgetMs: number): Promise<string> {
+// Pull the first TRANSCRIBE_CAP_SEC of audio as 16kHz mono wav — the shared input for whichever
+// transcriber (cloud medium.en or local tiny.en) runs.
+async function extractWav(file: string, dir: string): Promise<string> {
   const wav = path.join(dir, "audio.wav");
   await execFileAsync("ffmpeg", ["-y", "-t", String(TRANSCRIBE_CAP_SEC), "-i", file, "-ar", "16000", "-ac", "1", "-vn", wav], { timeout: 20_000 });
+  return wav;
+}
+
+async function localTranscribe(wav: string, dir: string, budgetMs: number): Promise<string> {
   const ofPrefix = path.join(dir, "tr");
   await execFileAsync(WHISPER_BIN, ["-m", WHISPER_MODEL, "-f", wav, "-nt", "-np", "-otxt", "-of", ofPrefix, "-t", "4"], {
     timeout: budgetMs,
     env: { ...process.env, LD_LIBRARY_PATH: `${WHISPER_LIB}:${process.env["LD_LIBRARY_PATH"] ?? ""}` },
     maxBuffer: 8 * 1024 * 1024,
   });
-  const txt = fs.readFileSync(`${ofPrefix}.txt`, "utf8").replace(/\s+/g, " ").trim();
-  return txt;
+  return fs.readFileSync(`${ofPrefix}.txt`, "utf8").replace(/\s+/g, " ").trim();
+}
+
+// When the render cloud is ON, transcribe on the worker's medium.en (much sharper on names / scores
+// / minute-marks than the phone's tiny.en). ASYNC submit→poll (each request short, so the cloud's
+// ~100s tunnel timeout never cuts a long medium.en pass) with a generous overall deadline, so LONGER
+// clips are never rejected. Health-gated; ANY problem (cloud off/unreachable/error/deadline) returns
+// null so the caller falls back to the phone's local tiny.en. Reuses CLOUD_RENDER_URL/SECRET.
+async function cloudTranscribe(wav: string): Promise<string | null> {
+  const base = process.env["CLOUD_RENDER_URL"];
+  if (!base) return null;
+  const secret = process.env["CLOUD_RENDER_SECRET"] || "";
+  const fetchT = async (u: URL, init: RequestInit, ms: number): Promise<Response | null> => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), ms);
+    try { return await fetch(u, { ...init, signal: ctrl.signal }); }
+    catch { return null; }
+    finally { clearTimeout(timer); }
+  };
+  try {
+    // Fast health gate → cloud off/unreachable ⇒ null ⇒ caller uses local tiny.en in ~3.5s.
+    const health = await fetchT(new URL("/health", base), {}, 3500);
+    if (!health || !health.ok) return null;
+    // Submit the wav; the worker runs medium.en in the background and hands back a jobId.
+    const submit = await fetchT(new URL("/worker/transcribe-job", base), {
+      method: "POST", headers: { "content-type": "audio/wav", "x-worker-secret": secret }, body: fs.readFileSync(wav),
+    }, 30_000);
+    if (!submit || !submit.ok) return null;
+    const { jobId } = (await submit.json()) as { jobId?: string };
+    if (!jobId) return null;
+    // Poll (short requests) until done. Generous 5-min deadline so a long clip is never rejected.
+    const statusUrl = new URL(`/worker/transcribe-job/${encodeURIComponent(jobId)}`, base);
+    const deadline = Date.now() + 300_000;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 4000));
+      const st = await fetchT(statusUrl, { headers: { "x-worker-secret": secret } }, 15_000);
+      if (!st || !st.ok) continue;
+      const j = (await st.json()) as { status?: string; transcript?: string };
+      if (j.status === "done") return (j.transcript ?? "").replace(/\s+/g, " ").trim() || null;
+      if (j.status === "error") return null;
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 export async function understandVideo(url: string, maxFrames = 5): Promise<VideoUnderstanding> {
@@ -218,21 +267,28 @@ export async function understandVideo(url: string, maxFrames = 5): Promise<Video
     let transcript: string | null = null;
     let transcriptTruncated = false;
     if (meta.hasAudio) {
-      const remaining = OVERALL_BUDGET_MS - (Date.now() - started) - 3000;
-      const budget = Math.min(30_000, remaining);
-      if (budget >= 8000 && fs.existsSync(WHISPER_BIN) && fs.existsSync(WHISPER_MODEL)) {
-        try {
-          transcript = await transcribe(file, dir, budget);
-          transcriptTruncated = meta.duration > TRANSCRIBE_CAP_SEC;
-          if (!transcript) transcript = null;
-        } catch (e) {
-          notes.push("audio transcript unavailable (transcription timed out or failed)");
-          logger.warn({ e }, "understand: transcription failed");
+      try {
+        const wav = await extractWav(file, dir);
+        transcriptTruncated = meta.duration > TRANSCRIBE_CAP_SEC;
+        // Prefer the cloud worker's medium.en when the render cloud is on; else local tiny.en.
+        const cloud = await cloudTranscribe(wav);
+        if (cloud) {
+          transcript = cloud;
+          notes.push("transcript via cloud medium.en (sharper names/numbers)");
+        } else {
+          const remaining = OVERALL_BUDGET_MS - (Date.now() - started) - 2000;
+          const budget = Math.min(30_000, remaining);
+          if (budget >= 8000 && fs.existsSync(WHISPER_BIN) && fs.existsSync(WHISPER_MODEL)) {
+            transcript = (await localTranscribe(wav, dir, budget)) || null;
+          } else if (budget < 8000) {
+            notes.push("skipped transcript (download left too little time budget)");
+          } else {
+            notes.push("transcript unavailable (whisper not found on server)");
+          }
         }
-      } else if (budget < 8000) {
-        notes.push("skipped transcript (download left too little time budget)");
-      } else {
-        notes.push("transcript unavailable (whisper not found on server)");
+      } catch (e) {
+        notes.push("audio transcript unavailable (transcription timed out or failed)");
+        logger.warn({ e }, "understand: transcription failed");
       }
     }
 
