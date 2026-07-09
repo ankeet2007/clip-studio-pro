@@ -1593,7 +1593,9 @@ OUTPUT — return EXACTLY one line per clip and nothing else:
   async function copyMs2ClaudePrompt() {
     const topic = ms2Topic.trim() || "<the match / topic — e.g. France vs Uruguay, FIFA World Cup 2026>";
     const prompt =
-`ROLE: You are a world-class football short-form researcher + STORY DIRECTOR. Build ONE 60-90 second vertical "story" montage about the topic below, told as a single dramatic arc (hook → escalation → payoff) that holds viewers to the very end. The PICKS are everything — a great edit can't save weak moments — so base every choice on real evidence, not memory.
+`ROLE: You are a world-class football short-form researcher + STORY DIRECTOR. Build ONE vertical "story" montage about the topic below, told as a single dramatic arc (hook → escalation → payoff) that holds viewers to the very end. The PICKS are everything — a great edit can't save weak moments — so base every choice on real evidence, not memory.
+
+LENGTH — HARD RULE: the finished video MUST run between 60 and 90 seconds — never under 60, never over 90. Each clip is muted and cut to fit its narration line, so the TOTAL length = the sum of all your narration lines. Budget ~150-220 spoken words across ALL beats (≈150 words = 60s, ≈220 words = 90s): write enough detail to clear 60s, but trim to stay under 90s.
 
 MATCH / TOPIC: ${topic}
 

@@ -28,7 +28,7 @@ const INSTRUCTIONS = [
   "`list_platforms` shows usable platforms; `get_scout_results` re-polls a running search. Read-only",
   "-- nothing is downloaded/rendered here; you hand the user a plan they paste into Clip Studio.",
   "",
-  "GOAL: ONE tight vertical Short, 60-80 SECONDS (never over ~1:20), where the AI VOICEOVER tells the",
+  "GOAL: ONE tight vertical Short, 60-90 SECONDS (minimum 60, never over 90), where the AI VOICEOVER tells the",
   "FULL story of what happened -- in detail, start to finish -- and the clips play UNDER it as short",
   "background B-roll (auto-cut to the narration; clip audio is muted). The narration is the STAR; the",
   "clips just show what is being described. Length = the narration length, so the narration must carry it.",
@@ -42,7 +42,8 @@ const INSTRUCTIONS = [
   "2. WRITE THE FULL NARRATION. Write ONE continuous narration that TELLS THE WHOLE STORY in detail --",
   "   setup -> key moments in order -> turning point -> payoff. Storyteller voice: specific, names +",
   "   numbers, cause->effect, a little tension. It must stand on its own (clips are muted). TARGET",
-  "   ~150-190 words TOTAL ~= 60-80 seconds spoken. This total IS the video length, so keep it tight --",
+  "   ~150-220 words TOTAL ~= 60-90 seconds spoken (never under 60s, never over 90s). This total IS the",
+  "   video length, so budget it deliberately -- enough detail to clear 60s, trimmed to stay under 90s --",
   "   detailed but zero filler/hype padding.",
   "3. SPLIT INTO BEATS + MATCH EACH TO A CLIP THAT ACTUALLY SHOWS IT. Break the narration into 5-8",
   "   beats (one or two sentences each, in story order). For EACH beat you MUST call `understand_video`",
@@ -61,7 +62,7 @@ const INSTRUCTIONS = [
   "...",
   "",
   "Only use URLs that `search_clips` returned and `understand_video` could open -- never invent a link.",
-  "Keep the TOTAL narration ~60-80s (the clips are cut to fit it). Example beat line:",
+  "Keep the TOTAL narration 60-90s (minimum 60, max 90 — the clips are cut to fit it). Example beat line:",
   "https://www.reddit.com/r/soccer/comments/abc/ | r/soccer | Egypt Break The Deadlock | Twenty-three minutes in, Egypt catch them cold: a quick counter, one-nil, and the underdogs are suddenly dreaming.",
 ].join("\n");
 
