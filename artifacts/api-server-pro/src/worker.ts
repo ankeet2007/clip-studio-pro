@@ -112,58 +112,39 @@ const server = http.createServer((req, res) => {
     req.pipe(ws);
     ws.on("error", () => { try { res.writeHead(500); res.end("upload error"); } catch { /* */ } });
 
-    ws.on("finish", async () => {
+    ws.on("finish", () => {
+      const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      const outName = `worker_${jobId}.mp4`;
       const clipId = Math.floor(Math.random() * 1_000_000) + 1; // truthy -> captions + voiceover run
-      const outName = `worker_${clipId}.mp4`;
+      jobs.set(jobId, { status: "rendering", mode: "edited" });
+      // Respond IMMEDIATELY with the jobId; render in the background (async, beats proxy timeouts
+      // so long 3-5 min single clips render on the cloud instead of falling back to local).
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ jobId }));
       const started = Date.now();
-      try {
-        await processClip(
-          p.youtubeUrl || "",
-          p.startTime || "00:00:00",
-          p.endTime || "00:00:00",
-          p.headline || "",
-          outName,
-          p.mode || "edited",
-          p.channelHandle || "",
-          clipId,
-          tmpIn,                               // localFilePath -> skips download
-          p.frameStyle || "immersive",
-          p.sourceChannel || "",
-          p.captionsEnabled !== false,
-          !!p.outroEnabled,
-          !!p.voiceoverEnabled,
-          p.voiceoverHook || "",
-          !!p.punchInEnabled,
-          p.zoomMoments || "",
-          p.captionColor || "",
-          p.voiceoverMode || "hook",
-          p.narrationScript || "",
-          { voice: p.voiceoverVoice || "en_US-lessac-medium", speed: p.voiceoverSpeed || "1.0" },
-        );
-        const outPath = path.join(getOutputDir(), outName);
-        if (!fs.existsSync(outPath)) {
-          res.writeHead(500, { "content-type": "application/json" });
-          res.end(JSON.stringify({ error: "render produced no output" }));
-          try { fs.unlinkSync(tmpIn); } catch { /* */ }
-          return;
-        }
-        const size = fs.statSync(outPath).size;
-        console.log(`[worker] rendered ${outName} (${(size / 1e6).toFixed(1)}MB) in ${((Date.now() - started) / 1000).toFixed(1)}s`);
-        res.writeHead(200, {
-          "content-type": "video/mp4",
-          "content-length": String(size),
-          "x-render-seconds": String(((Date.now() - started) / 1000).toFixed(1)),
-          "content-disposition": `attachment; filename="${outName}"`,
-        });
-        const rs = fs.createReadStream(outPath);
-        rs.pipe(res);
-        rs.on("close", () => { try { fs.unlinkSync(outPath); } catch { /* */ } try { fs.unlinkSync(tmpIn); } catch { /* */ } });
-      } catch (e: any) {
-        try { fs.unlinkSync(tmpIn); } catch { /* */ }
-        console.error("[worker] render failed:", e?.message || e);
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: String(e?.message || e) }));
-      }
+      processClip(
+        p.youtubeUrl || "", p.startTime || "00:00:00", p.endTime || "00:00:00", p.headline || "",
+        outName, p.mode || "edited", p.channelHandle || "", clipId, tmpIn, p.frameStyle || "immersive",
+        p.sourceChannel || "", p.captionsEnabled !== false, !!p.outroEnabled, !!p.voiceoverEnabled,
+        p.voiceoverHook || "", !!p.punchInEnabled, p.zoomMoments || "", p.captionColor || "",
+        p.voiceoverMode || "hook", p.narrationScript || "",
+        { voice: p.voiceoverVoice || "en_US-lessac-medium", speed: p.voiceoverSpeed || "1.0" },
+      )
+        .then(() => {
+          const outPath = path.join(getOutputDir(), outName);
+          const rec = jobs.get(jobId);
+          if (!rec) return;
+          if (fs.existsSync(outPath)) {
+            rec.status = "done"; rec.outPath = outPath; rec.seconds = (Date.now() - started) / 1000;
+            console.log(`[worker] render ${jobId} done in ${rec.seconds.toFixed(1)}s`);
+          } else { rec.status = "error"; rec.error = "render produced no output"; }
+        })
+        .catch((e: any) => {
+          const rec = jobs.get(jobId);
+          if (rec) { rec.status = "error"; rec.error = String(e?.message || e); }
+          console.error(`[worker] render ${jobId} failed:`, e?.message || e);
+        })
+        .finally(() => { try { fs.unlinkSync(tmpIn); } catch { /* */ } });
     });
     return;
   }

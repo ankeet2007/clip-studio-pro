@@ -1205,53 +1205,24 @@ async function offloadToCloud(
 ): Promise<boolean> {
   const base = process.env.CLOUD_RENDER_URL;
   if (!base) return false;
-  // Fast reachability check first, so a stopped cloud box falls back to local in ~3s
-  // instead of hanging on a long connect timeout.
+  // Fast reachability check first, so a stopped cloud box falls back to local in ~3s.
   if (!(await cloudHealthOk(base))) return false;
-
-  return new Promise((resolve) => {
-    try {
-      const u = new URL("/worker/render", base);
-      const lib = u.protocol === "https:" ? https : http;
-      const size = fs.statSync(inputPath).size;
-      const req = lib.request(u, {
-        method: "POST",
-        timeout: 30 * 60 * 1000, // 30-min ceiling on the whole round-trip
-        headers: {
-          "content-type": "application/octet-stream",
-          "content-length": String(size),
-          "x-worker-secret": process.env.CLOUD_RENDER_SECRET || "",
-          "x-params": Buffer.from(JSON.stringify(params)).toString("base64"),
-        },
-      }, (res) => {
-        const ct = String(res.headers["content-type"] || "");
-        if (res.statusCode !== 200 || !ct.includes("video/mp4")) {
-          let body = "";
-          res.on("data", (d) => { if (body.length < 600) body += d.toString(); });
-          res.on("end", () => {
-            logger.warn({ status: res.statusCode, body }, "Cloud render did not return an MP4");
-            resolve(false);
-          });
-          res.on("error", () => resolve(false));
-          return;
-        }
-        const out = fs.createWriteStream(outPath);
-        res.pipe(out);
-        out.on("finish", () => {
-          const ok = fs.existsSync(outPath) && fs.statSync(outPath).size > 1000;
-          resolve(ok);
-        });
-        out.on("error", () => resolve(false));
-        res.on("error", () => resolve(false));
-      });
-      req.on("timeout", () => { req.destroy(); resolve(false); });
-      req.on("error", (e) => { logger.warn({ e }, "Cloud offload request error"); resolve(false); });
-      fs.createReadStream(inputPath).pipe(req);
-    } catch (e) {
-      logger.warn({ e }, "Cloud offload setup error");
-      resolve(false);
-    }
+  // Async submit → poll → download (short requests), so a proxy's ~100s response-timeout never
+  // kills a long single-clip render — e.g. a 3-5 min clip whose composite + captions run > 100s.
+  const sub = await postFileExpectJson(new URL("/worker/render", base), inputPath, {
+    "x-params": Buffer.from(JSON.stringify(params)).toString("base64"),
   });
+  if (!sub || !sub.jobId) return false;
+  const statusUrl = new URL(`/worker/job/${sub.jobId}`, base);
+  const deadline = Date.now() + 45 * 60 * 1000;
+  while (Date.now() < deadline) {
+    await httpSleep(5000);
+    const st = await getJson(statusUrl);
+    if (!st) continue; // transient — keep polling
+    if (st.status === "done") return await getFileTo(new URL(`/worker/job/${sub.jobId}/result`, base), outPath);
+    if (st.status === "error") { logger.warn({ error: st.error }, "Cloud job errored"); return false; }
+  }
+  return false;
 }
 
 // POST a file as the raw body and stream back an MP4 to outPath. Shared by the single-clip
@@ -1299,14 +1270,14 @@ async function postFileExpectMp4(
 function httpSleep(ms: number): Promise<void> { return new Promise((r) => setTimeout(r, ms)); }
 
 // POST a file and parse a small JSON response (submit an async job → { jobId }).
-async function postFileExpectJson(u: URL, filePath: string): Promise<any | null> {
+async function postFileExpectJson(u: URL, filePath: string, extraHeaders: Record<string, string> = {}): Promise<any | null> {
   return new Promise((resolve) => {
     try {
       const lib = u.protocol === "https:" ? https : http;
       const size = fs.statSync(filePath).size;
       const req = lib.request(u, {
         method: "POST", timeout: 10 * 60 * 1000,
-        headers: { "content-type": "application/octet-stream", "content-length": String(size), "x-worker-secret": process.env.CLOUD_RENDER_SECRET || "" },
+        headers: { "content-type": "application/octet-stream", "content-length": String(size), "x-worker-secret": process.env.CLOUD_RENDER_SECRET || "", ...extraHeaders },
       }, (res) => {
         let body = ""; res.on("data", (d) => { body += d.toString(); });
         res.on("end", () => { try { resolve(res.statusCode === 200 ? JSON.parse(body) : null); } catch { resolve(null); } });
