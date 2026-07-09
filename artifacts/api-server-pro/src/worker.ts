@@ -17,7 +17,36 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { processClip, getOutputDir } from "./lib/clipProcessor";
+import { execFile } from "node:child_process";
+import { processClip, processStory, processTop5, processMatchStory, getOutputDir } from "./lib/clipProcessor";
+
+function extractTar(tarPath: string, destDir: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    execFile("tar", ["-xf", tarPath, "-C", destDir], (err) => (err ? reject(err) : resolve()));
+  });
+}
+
+// Run a bundled multi-segment job (story / top5 / matchstory) whose segment.localFile paths
+// have already been rewritten to absolute extracted files.
+async function runBundledJob(mode: string, j: any, segments: any[], outName: string): Promise<void> {
+  const clipId = Math.floor(Math.random() * 1_000_000) + 1; // truthy → captions/narration run
+  if (mode === "story") {
+    await processStory(j.youtubeUrl || "", outName, j.channelHandle || "", clipId, j.frameStyle || "immersive",
+      j.sourceChannel || "", j.captionsEnabled !== false, !!j.outroEnabled, j.captionColor || "",
+      j.narrationScript || "", segments, j.voiceOpts || {});
+  } else if (mode === "top5") {
+    await processTop5(outName, j.title || "", j.channelHandle || "", clipId, j.frameStyle || "immersive",
+      j.sourceChannel || "", j.captionsEnabled !== false, !!j.outroEnabled, j.captionColor || "",
+      j.order === "1to5" ? "1to5" : "5to1", segments, j.voiceOpts || {});
+  } else if (mode === "matchstory") {
+    await processMatchStory(outName, j.channelHandle || "", clipId, j.frameStyle || "immersive",
+      j.sourceChannel || "", j.captionsEnabled !== false, !!j.outroEnabled, j.captionColor || "",
+      j.narrationScript || "", segments, j.voiceOpts || {}, j.title || "",
+      j.transitionsEnabled !== false, j.titleCardEnabled !== false);
+  } else {
+    throw new Error(`unknown mode: ${mode}`);
+  }
+}
 
 const PORT = Number(process.env.PORT || 7860);
 const SECRET = process.env.WORKER_SECRET || "";
@@ -101,6 +130,60 @@ const server = http.createServer((req, res) => {
         console.error("[worker] render failed:", e?.message || e);
         res.writeHead(500, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: String(e?.message || e) }));
+      }
+    });
+    return;
+  }
+
+  if (req.method === "POST" && url === "/worker/render-job") {
+    if (!SECRET || req.headers["x-worker-secret"] !== SECRET) {
+      res.writeHead(401, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "unauthorized" }));
+      req.resume();
+      return;
+    }
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "wkjob_"));
+    const tarPath = path.join(workDir, "bundle.tar");
+    const ws = fs.createWriteStream(tarPath);
+    req.pipe(ws);
+    ws.on("error", () => { try { res.writeHead(500); res.end("upload error"); } catch { /* */ } });
+    ws.on("finish", async () => {
+      const started = Date.now();
+      const extractDir = path.join(workDir, "x");
+      const outName = `job_${Date.now()}_${Math.random().toString(36).slice(2)}.mp4`;
+      let cleaned = false;
+      const cleanup = () => { if (cleaned) return; cleaned = true; try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { /* */ } };
+      try {
+        fs.mkdirSync(extractDir, { recursive: true });
+        await extractTar(tarPath, extractDir);
+        const job = JSON.parse(fs.readFileSync(path.join(extractDir, "job.json"), "utf8"));
+        const segments = (job.segments || []).map((s: any) => ({
+          ...s,
+          localFile: s.localFile ? path.join(extractDir, path.basename(s.localFile)) : undefined,
+        }));
+        await runBundledJob(job.mode, job.jobSpec || {}, segments, outName);
+        const outPath = path.join(getOutputDir(), outName);
+        if (!fs.existsSync(outPath)) {
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "job produced no output" }));
+          cleanup();
+          return;
+        }
+        const size = fs.statSync(outPath).size;
+        console.log(`[worker] rendered ${job.mode} ${outName} (${(size / 1e6).toFixed(1)}MB) in ${((Date.now() - started) / 1000).toFixed(1)}s`);
+        res.writeHead(200, {
+          "content-type": "video/mp4",
+          "content-length": String(size),
+          "x-render-seconds": String(((Date.now() - started) / 1000).toFixed(1)),
+          "content-disposition": `attachment; filename="${outName}"`,
+        });
+        const rs = fs.createReadStream(outPath);
+        rs.pipe(res);
+        rs.on("close", () => { try { fs.unlinkSync(outPath); } catch { /* */ } cleanup(); });
+      } catch (e: any) {
+        console.error("[worker] job failed:", e?.message || e);
+        try { res.writeHead(500, { "content-type": "application/json" }); res.end(JSON.stringify({ error: String(e?.message || e) })); } catch { /* */ }
+        cleanup();
       }
     });
     return;

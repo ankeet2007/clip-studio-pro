@@ -1254,6 +1254,101 @@ async function offloadToCloud(
   });
 }
 
+// POST a file as the raw body and stream back an MP4 to outPath. Shared by the single-clip
+// (/worker/render) and multi-segment (/worker/render-job) offload paths.
+async function postFileExpectMp4(
+  u: URL,
+  filePath: string,
+  extraHeaders: Record<string, string>,
+  outPath: string,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    try {
+      const lib = u.protocol === "https:" ? https : http;
+      const size = fs.statSync(filePath).size;
+      const req = lib.request(u, {
+        method: "POST",
+        timeout: 45 * 60 * 1000,
+        headers: {
+          "content-type": "application/octet-stream",
+          "content-length": String(size),
+          "x-worker-secret": process.env.CLOUD_RENDER_SECRET || "",
+          ...extraHeaders,
+        },
+      }, (res) => {
+        const ct = String(res.headers["content-type"] || "");
+        if (res.statusCode !== 200 || !ct.includes("video/mp4")) {
+          let body = ""; res.on("data", (d) => { if (body.length < 600) body += d.toString(); });
+          res.on("end", () => { logger.warn({ status: res.statusCode, body }, "Cloud render did not return an MP4"); resolve(false); });
+          res.on("error", () => resolve(false));
+          return;
+        }
+        const out = fs.createWriteStream(outPath);
+        res.pipe(out);
+        out.on("finish", () => resolve(fs.existsSync(outPath) && fs.statSync(outPath).size > 1000));
+        out.on("error", () => resolve(false));
+        res.on("error", () => resolve(false));
+      });
+      req.on("timeout", () => { req.destroy(); resolve(false); });
+      req.on("error", (e) => { logger.warn({ e }, "Cloud offload request error"); resolve(false); });
+      fs.createReadStream(filePath).pipe(req);
+    } catch (e) { logger.warn({ e }, "Cloud offload setup error"); resolve(false); }
+  });
+}
+
+// Multi-segment cloud offload (Story / Top 5 / Match Story). The phone downloads every
+// segment locally (home IP), bundles them + a job.json into a tar, and POSTs it to
+// /worker/render-job; the worker runs the whole mode on the local files and returns the MP4.
+// segs are NOT mutated → local fallback re-downloads cleanly. Returns false on any failure.
+async function tryCloudMultiSegment(
+  mode: "story" | "top5" | "matchstory",
+  clipId: number,
+  outPath: string,
+  jobSpec: Record<string, unknown>,
+  segs: StorySegment[],
+  jobYoutubeUrl: string | null,
+  onProgress: (p: number) => void,
+): Promise<boolean> {
+  const base = process.env.CLOUD_RENDER_URL;
+  if (!base) return false;
+  if (!(await cloudHealthOk(base))) return false;
+  let bundleDir = "";
+  let tarPath = "";
+  try {
+    const ytDlp = findYtDlp();
+    bundleDir = fs.mkdtempSync(path.join(os.tmpdir(), `cloudjob_${clipId}_`));
+    const outSegs: Record<string, unknown>[] = [];
+    for (let i = 0; i < segs.length; i++) {
+      const s = segs[i]!;
+      const name = `seg_${i}.mp4`;
+      const dest = path.join(bundleDir, name);
+      if (s.localFile && fs.existsSync(s.localFile)) {
+        fs.copyFileSync(s.localFile, dest);
+        outSegs.push({ ...s, localFile: name, youtubeUrl: "", sourceType: "local" });
+      } else {
+        const url = (s.youtubeUrl && s.youtubeUrl.trim()) ? s.youtubeUrl : jobYoutubeUrl;
+        if (!url) throw new Error(`Segment ${i + 1} has no source`);
+        const tmp = await downloadSegment(ytDlp, url, s.startTime, s.endTime, `${clipId}_${i}`, () => {});
+        fs.renameSync(tmp, dest);
+        // the downloaded cut is 0-based on disk → the worker must seek from 0 for its real length
+        const dur = Math.max(1, timeToSeconds(s.endTime) - timeToSeconds(s.startTime));
+        outSegs.push({ ...s, localFile: name, youtubeUrl: "", sourceType: "local", startTime: "00:00:00", endTime: formatHMS(dur) });
+      }
+      onProgress(2 + ((i + 1) / segs.length) * 25);
+    }
+    fs.writeFileSync(path.join(bundleDir, "job.json"), JSON.stringify({ mode, jobSpec, segments: outSegs }));
+    tarPath = path.join(os.tmpdir(), `cloudjob_${clipId}_${Date.now()}.tar`);
+    await execFileAsync("tar", ["-cf", tarPath, "-C", bundleDir, "."]);
+    return await postFileExpectMp4(new URL("/worker/render-job", base), tarPath, {}, outPath);
+  } catch (e) {
+    logger.warn({ e }, "Cloud multi-segment offload failed — rendering locally");
+    return false;
+  } finally {
+    try { if (bundleDir) fs.rmSync(bundleDir, { recursive: true, force: true }); } catch { /* */ }
+    try { if (tarPath && fs.existsSync(tarPath)) fs.unlinkSync(tarPath); } catch { /* */ }
+  }
+}
+
 export async function processClip(
   youtubeUrl: string | null,
   startTime: string,
@@ -2335,6 +2430,20 @@ export async function processStory(
   const segs = (segments ?? []).slice(0, 10);
   if (segs.length < 2) throw new Error("A story needs at least 2 segments.");
 
+  // Cloud offload: download every segment locally (home IP) then render the whole story on
+  // the cloud worker. Falls through to local rendering on any failure.
+  if (process.env.CLOUD_RENDER_URL && process.env.CLOUD_RENDER_MULTISEG) {
+    const ok = await tryCloudMultiSegment("story", clipId, finalOutputPath, {
+      youtubeUrl, channelHandle, frameStyle, sourceChannel, captionsEnabled, outroEnabled,
+      captionColor, narrationScript, voiceOpts: { voice: storyVoice, speed: storySpeed },
+    }, segs, youtubeUrl, (p) => { void updateProgress(p); });
+    if (ok) {
+      logger.info({ finalOutputPath }, "Story rendered on cloud worker (offloaded)");
+      await updateProgress(100, true);
+      return;
+    }
+  }
+
   const segFiles: string[] = [];
   try {
     await updateProgress(2, true);
@@ -2349,8 +2458,8 @@ export async function processStory(
       const segFilename = `story_${clipId}_seg_${i}_${tmpId}.mp4`;
       logger.info({ clipId, segment: i + 1, of: segs.length }, "Rendering story segment");
       await processClip(
-        youtubeUrl, seg.startTime, seg.endTime, seg.headline ?? "",
-        segFilename, "edited", channelHandle, 0, undefined, frameStyle, sourceChannel,
+        seg.localFile ? null : youtubeUrl, seg.startTime, seg.endTime, seg.headline ?? "",
+        segFilename, "edited", channelHandle, 0, seg.localFile || undefined, frameStyle, sourceChannel,
         false, isLast && outroEnabled, false, "",
         seg.punchInEnabled ?? false, seg.zoomMoments ?? "", "", "hook", ""
       );
@@ -2544,6 +2653,22 @@ export async function processMatchStory(
 
   const segs = (segments ?? []).slice(0, 8);
   if (segs.length < 2) throw new Error("A Match Story needs at least 2 beats.");
+
+  // Cloud offload: bundle every beat (local scout clips are copied as-is; YouTube beats are
+  // downloaded on the home IP) and render the whole Match Story on the cloud. Falls through
+  // to local on any failure.
+  if (process.env.CLOUD_RENDER_URL && process.env.CLOUD_RENDER_MULTISEG) {
+    const ok = await tryCloudMultiSegment("matchstory", clipId, finalOutputPath, {
+      channelHandle, frameStyle, sourceChannel, captionsEnabled, outroEnabled, captionColor,
+      narrationScript, voiceOpts: { voice: msVoice, speed: msSpeed }, title, transitionsEnabled, titleCardEnabled,
+    }, segs, null, (p) => { void updateProgress(p); });
+    if (ok) {
+      logger.info({ finalOutputPath }, "Match Story rendered on cloud worker (offloaded)");
+      await updateProgress(100, true);
+      return;
+    }
+  }
+
   const isLocalBeat = (s: StorySegment) => !!(s.localFile && s.localFile.trim());
   for (let i = 0; i < segs.length; i++) {
     const s = segs[i]!;
@@ -2764,8 +2889,23 @@ export async function processTop5(
     order === "1to5" ? a.rank - b.rank : b.rank - a.rank
   );
   if (ordered.length < 2) throw new Error("A Top 5 needs at least 2 moments.");
+
+  // Cloud offload: download every moment locally (home IP) then render the whole Top 5 on the
+  // cloud worker. Falls through to local rendering on any failure.
+  if (process.env.CLOUD_RENDER_URL && process.env.CLOUD_RENDER_MULTISEG) {
+    const ok = await tryCloudMultiSegment("top5", clipId, finalOutputPath, {
+      title, channelHandle, frameStyle, sourceChannel, captionsEnabled, outroEnabled,
+      captionColor, order, voiceOpts: { voice: top5Voice, speed: top5Speed },
+    }, ordered, null, (p) => { void updateProgress(p); });
+    if (ok) {
+      logger.info({ finalOutputPath }, "Top 5 rendered on cloud worker (offloaded)");
+      await updateProgress(100, true);
+      return;
+    }
+  }
+
   for (const s of ordered) {
-    if (!s.youtubeUrl || !s.youtubeUrl.trim()) {
+    if (!s.localFile && (!s.youtubeUrl || !s.youtubeUrl.trim())) {
       throw new Error(`Moment #${s.rank} is missing a source video URL.`);
     }
   }
@@ -2774,6 +2914,7 @@ export async function processTop5(
   // timestamp then fails in seconds (durations are cached from the verify step) instead of
   // after ~15 min of composites, and the message names the exact moment so a Retry is targeted.
   for (const s of ordered) {
+    if (s.localFile) continue;
     const check = await validateSegmentWithinVideo(s.youtubeUrl!, s.startTime, s.endTime);
     if (!check.ok) throw new Error(`Moment #${s.rank}: ${check.message}`);
   }
@@ -2824,8 +2965,8 @@ export async function processTop5(
       logger.info({ clipId, moment: i + 1, of: ordered.length, rank: seg.rank }, "Rendering Top 5 moment");
       try {
         await processClip(
-          seg.youtubeUrl!, seg.startTime, seg.endTime, seg.headline ?? "",
-          rawFile, "edited", channelHandle, 0, undefined, frameStyle, seg.sourceChannel || sourceChannel,
+          seg.localFile ? null : seg.youtubeUrl!, seg.startTime, seg.endTime, seg.headline ?? "",
+          rawFile, "edited", channelHandle, 0, seg.localFile || undefined, frameStyle, seg.sourceChannel || sourceChannel,
           false, isLast && outroEnabled, false, "",
           seg.punchInEnabled ?? false, seg.zoomMoments ?? "", "", "hook", "", {}, seg.rank
         );
