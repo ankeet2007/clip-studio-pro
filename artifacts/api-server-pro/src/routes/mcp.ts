@@ -44,10 +44,14 @@ const INSTRUCTIONS = [
   "   numbers, cause->effect, a little tension. It must stand on its own (clips are muted). TARGET",
   "   ~150-190 words TOTAL ~= 60-80 seconds spoken. This total IS the video length, so keep it tight --",
   "   detailed but zero filler/hype padding.",
-  "3. SPLIT INTO BEATS + PICK B-ROLL. Break the narration into 5-8 beats (about one or two sentences",
-  "   each). For EACH beat pick a clip (confirmed via `understand_video`) that VISUALLY MATCHES what",
-  "   that beat describes -- it plays as short background B-roll cut to that beat's narration length, so",
-  "   it only needs to show the right action clearly. Reject blurry/zoomed-logo/static/ambiguous clips.",
+  "3. SPLIT INTO BEATS + MATCH EACH TO A CLIP THAT ACTUALLY SHOWS IT. Break the narration into 5-8",
+  "   beats (one or two sentences each, in story order). For EACH beat you MUST call `understand_video`",
+  "   on your candidate and keep it ONLY IF its keyframes visibly show the exact action that beat",
+  "   describes (that specific goal / tackle / save / celebration). If the frames don't clearly show",
+  "   it, REJECT that clip and try another candidate -- never assign a clip you have not visually",
+  "   verified. Judge with the keyframes + the motion note + the transcript together; drop",
+  "   blurry / zoomed-logo / static / talking-head / ambiguous clips (the motion note flags these).",
+  "   Use a DIFFERENT clip per beat (no repeats) so the montage has variety and moves the story forward.",
   "",
   "OUTPUT -- when the user asks you to build it, return EXACTLY this and nothing else (fields separated",
   "by ' | ', one line per beat, in story order):",
@@ -137,15 +141,17 @@ const TOOLS = [
     name: "understand_video",
     description:
       "Watch/understand a single video from a Reddit, X (Twitter), Instagram or Facebook URL. " +
-      "Downloads the clip and returns evenly-spaced KEYFRAME IMAGES plus a transcript of the " +
-      "spoken audio/commentary — look at the frames and read the transcript to describe what " +
-      "actually happens in the clip. Pairs with search_clips: find a link, then understand it. " +
-      "May take up to ~50s; on long clips only the first 60s of audio is transcribed.",
+      "Downloads the clip and returns KEYFRAME IMAGES sampled at the clip's key ACTION moments " +
+      "(scene changes — the goal, tackle, celebration, not just even time steps) plus a transcript " +
+      "of the spoken audio/commentary and a motion note — look at the frames and read the transcript " +
+      "to describe what actually happens. ALWAYS understand a clip before assigning it to a story " +
+      "beat. Pairs with search_clips: find a link, then understand it. May take up to ~50s; on long " +
+      "clips only the first 60s of audio is transcribed.",
     inputSchema: {
       type: "object",
       properties: {
         url: { type: "string", description: "The video URL (reddit.com/redd.it, x.com/twitter.com, instagram.com, or facebook.com)." },
-        frames: { type: "number", description: "How many keyframes to return (1-8, default 5)." },
+        frames: { type: "number", description: "How many keyframes to return (1-8, default 6)." },
       },
       required: ["url"],
       additionalProperties: false,
@@ -227,13 +233,13 @@ const textResult = (text: string): ToolResult => ({ content: [{ type: "text", te
 async function runUnderstandVideo(args: any): Promise<ToolResult> {
   const url = String(args?.url ?? "").trim();
   if (!url) throw new Error("Provide a video URL (Reddit, X, Instagram or Facebook).");
-  const u = await understandVideo(url, Number(args?.frames) || 5);
+  const u = await understandVideo(url, Number(args?.frames) || 6);
   const res = u.width ? ` · ${u.width}x${u.height}` : "";
   const lines = [`Video from ${u.platform} · ${Math.round(u.durationSec)}s${res}.`];
   if (u.transcript) lines.push(`\nSpoken/commentary transcript${u.transcriptTruncated ? " (first 60s)" : ""}:\n${u.transcript}`);
   else lines.push("\nNo speech transcript (the clip is silent or transcription was unavailable).");
   if (u.notes.length) lines.push(`\nNotes: ${u.notes.join("; ")}`);
-  lines.push(`\n[${u.frames.length} keyframe image(s) attached below, evenly spaced across the clip — read them to see what happens.]`);
+  lines.push(`\n[${u.frames.length} keyframe image(s) attached below, sampled at the clip's key action moments — read them to see exactly what happens.]`);
   const content: ContentBlock[] = [{ type: "text", text: lines.join("\n") }];
   for (const f of u.frames) content.push({ type: "image", data: f.dataBase64, mimeType: f.mimeType });
   return { content };

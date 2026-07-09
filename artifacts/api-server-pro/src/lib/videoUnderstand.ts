@@ -114,16 +114,54 @@ export async function downloadSocialUrl(url: string, out: string): Promise<Under
   return platform;
 }
 
-async function extractFrames(file: string, duration: number, dir: string, n: number): Promise<{ dataBase64: string; mimeType: string }[]> {
+// Detect scene-change timestamps with ONE fast, low-res, time-capped decode pass. Scaling to a
+// tiny size makes the decode cheap on the weak phone CPU, and the pts_time is the SOURCE timestamp
+// so downscaling doesn't move it. Best-effort — any failure/timeout yields [] (→ evenly-spaced).
+async function sceneTimestamps(file: string, duration: number, budgetMs: number): Promise<number[]> {
+  try {
+    const { stderr } = await execFileAsync("ffmpeg", [
+      "-t", String(Math.min(45, Math.max(1, Math.ceil(duration) || 45))), "-i", file, "-an",
+      "-vf", "scale=192:-2,select='gt(scene,0.30)',showinfo", "-f", "null", "-",
+    ], { timeout: budgetMs, maxBuffer: 16 * 1024 * 1024 });
+    const ts: number[] = [];
+    const re = /pts_time:([0-9.]+)/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(stderr)) !== null) {
+      const t = parseFloat(m[1]!);
+      if (Number.isFinite(t) && t >= 0 && t <= duration) ts.push(t);
+    }
+    return ts;
+  } catch {
+    return [];
+  }
+}
+
+// Choose n frame timestamps spread across the clip but biased to real action: split the clip into
+// n equal windows and, per window, take the scene-cut nearest its centre when there is one, else
+// the window centre. Guarantees coverage of the setup (first window) and the result (last window)
+// while landing frames on the moments where something actually changes on screen.
+function pickFrameTimes(scenes: number[], duration: number, n: number): number[] {
+  if (duration <= 0) return [0];
+  const times: number[] = [];
+  for (let i = 0; i < n; i++) {
+    const lo = (i / n) * duration;
+    const hi = ((i + 1) / n) * duration;
+    const mid = (lo + hi) / 2;
+    const inWin = scenes.filter((t) => t >= lo && t < hi).sort((a, b) => Math.abs(a - mid) - Math.abs(b - mid));
+    times.push(inWin.length ? inWin[0]! : mid);
+  }
+  return times;
+}
+
+async function extractFramesAt(file: string, times: number[], dir: string): Promise<{ dataBase64: string; mimeType: string }[]> {
   const frames: { dataBase64: string; mimeType: string }[] = [];
-  const count = duration >= 2 ? n : 1;
-  for (let i = 0; i < count; i++) {
-    const ts = duration > 0 ? duration * ((i + 0.5) / count) : 0;
+  for (let i = 0; i < times.length; i++) {
+    const ts = Math.max(0, times[i]!);
     const out = path.join(dir, `frame_${i}.jpg`);
     try {
-      // Input-seek (-ss before -i) is fast; scale to 480px wide (even height) and moderate JPEG
-      // quality to keep the base64 payload small enough for the tool result.
-      await execFileAsync("ffmpeg", ["-y", "-ss", ts.toFixed(2), "-i", file, "-frames:v", "1", "-vf", "scale=480:-2", "-q:v", "6", out], { timeout: 15_000 });
+      // Input-seek (-ss before -i) is fast; scale to 512px wide (even height) at moderate JPEG
+      // quality — big enough to read shirt numbers / the scoreboard, small enough for the payload.
+      await execFileAsync("ffmpeg", ["-y", "-ss", ts.toFixed(2), "-i", file, "-frames:v", "1", "-vf", "scale=512:-2", "-q:v", "5", out], { timeout: 15_000 });
       if (fs.existsSync(out)) {
         frames.push({ dataBase64: fs.readFileSync(out).toString("base64"), mimeType: "image/jpeg" });
         fs.unlinkSync(out);
@@ -162,7 +200,20 @@ export async function understandVideo(url: string, maxFrames = 5): Promise<Video
     });
     const meta = await probe(file);
 
-    const frames = await extractFrames(file, meta.duration, dir, Math.min(8, Math.max(1, maxFrames)));
+    const n = Math.min(8, Math.max(1, maxFrames));
+    // Find the action moments (scene cuts) with a fast, bounded pass — but only if enough of the
+    // overall budget remains to still leave room for the transcript; otherwise fall back cleanly to
+    // evenly-spaced frames (scenes = []).
+    let scenes: number[] = [];
+    if (meta.duration >= 3) {
+      const sceneBudget = Math.min(15_000, OVERALL_BUDGET_MS - (Date.now() - started) - 22_000);
+      if (sceneBudget >= 5000) scenes = await sceneTimestamps(file, meta.duration, sceneBudget);
+    }
+    const frames = meta.duration >= 2
+      ? await extractFramesAt(file, pickFrameTimes(scenes, meta.duration, n), dir)
+      : await extractFramesAt(file, [Math.max(0, meta.duration / 2)], dir);
+    if (scenes.length >= 5) notes.push(`action-heavy: ${scenes.length} scene changes detected — the keyframes target those moments`);
+    else if (meta.duration > 6 && scenes.length <= 1) notes.push("low visual motion (few/no scene changes) — likely static, a talking-head, or a graphic; verify it shows real action before using");
 
     let transcript: string | null = null;
     let transcriptTruncated = false;
