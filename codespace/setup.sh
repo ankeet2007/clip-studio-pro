@@ -25,14 +25,26 @@ mkdir -p "$HOME/whisper.cpp/models"; cd "$HOME/whisper.cpp/models"
 [ -s ggml-small.en.bin ]      || wget -q -O ggml-small.en.bin  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin
 [ -s ggml-silero-v5.1.2.bin ] || bash "$HOME/whisper.cpp/models/download-vad-model.sh" silero-v5.1.2 >/dev/null 2>&1 || true
 
-log "3/6 piper TTS + lessac voice"
+log "3/6 piper TTS + ALL voices (must match the phone's ~/piper/*.onnx set)"
 if [ ! -x "$HOME/piper/piper" ]; then
   cd "$HOME"; wget -q -O piper.tgz https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz; tar xzf piper.tgz; rm -f piper.tgz
 fi
 mkdir -p "$HOME/piper/voices"
-[ -s "$HOME/piper/voices/en_US-lessac-medium.onnx" ] || {
-  wget -q -O "$HOME/piper/voices/en_US-lessac-medium.onnx"      https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx
-  wget -q -O "$HOME/piper/voices/en_US-lessac-medium.onnx.json" https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json; }
+PV_BASE="https://huggingface.co/rhasspy/piper-voices/resolve/main"
+# voice-name  ->  HF subpath. Keep in sync with the phone's installed voices.
+for pair in \
+  "en_US-lessac-medium:en/en_US/lessac/medium" \
+  "en_US-joe-medium:en/en_US/joe/medium" \
+  "en_US-ryan-medium:en/en_US/ryan/medium" \
+  "en_US-norman-medium:en/en_US/norman/medium" \
+  "en_US-hfc_male-medium:en/en_US/hfc_male/medium" \
+  "en_GB-alan-medium:en/en_GB/alan/medium" \
+  "en_GB-northern_english_male-medium:en/en_GB/northern_english_male/medium"; do
+  vname="${pair%%:*}"; vpath="${pair#*:}"
+  [ -s "$HOME/piper/voices/$vname.onnx" ] && continue
+  wget -q -O "$HOME/piper/voices/$vname.onnx"      "$PV_BASE/$vpath/$vname.onnx"
+  wget -q -O "$HOME/piper/voices/$vname.onnx.json" "$PV_BASE/$vpath/$vname.onnx.json"
+done
 
 log "4/6 python deps (Pillow + pilmoji for render_headline.py)"
 pip install --user --quiet Pillow pilmoji emoji >/dev/null 2>&1 || true
