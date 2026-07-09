@@ -51,6 +51,12 @@ async function runBundledJob(mode: string, j: any, segments: any[], outName: str
 const PORT = Number(process.env.PORT || 7860);
 const SECRET = process.env.WORKER_SECRET || "";
 
+// In-flight async multi-segment jobs. The submit request returns a jobId immediately and the
+// render runs in the BACKGROUND, so a proxy's response-timeout (cloudflared ~100s) never kills
+// a long render — the phone polls status then downloads the result (all short requests).
+type JobRec = { status: "rendering" | "done" | "error"; outPath?: string; error?: string; mode?: string; seconds?: number };
+const jobs = new Map<string, JobRec>();
+
 function decodeParams(h: string | string[] | undefined): Record<string, unknown> {
   try { return JSON.parse(Buffer.from(String(h || ""), "base64").toString("utf8") || "{}"); }
   catch { return {}; }
@@ -62,6 +68,33 @@ const server = http.createServer((req, res) => {
   if (req.method === "GET" && (url === "/health" || url === "/")) {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, worker: "clip-render" }));
+    return;
+  }
+
+  // GET /worker/job/<id>  -> status JSON ;  GET /worker/job/<id>/result -> the finished MP4
+  if (req.method === "GET" && url.startsWith("/worker/job/")) {
+    if (!SECRET || req.headers["x-worker-secret"] !== SECRET) {
+      res.writeHead(401, { "content-type": "application/json" }); res.end(JSON.stringify({ error: "unauthorized" })); return;
+    }
+    const rest = url.slice("/worker/job/".length);
+    const wantResult = rest.endsWith("/result");
+    const jobId = wantResult ? rest.slice(0, -"/result".length) : rest;
+    const job = jobs.get(jobId);
+    if (!job) { res.writeHead(404, { "content-type": "application/json" }); res.end(JSON.stringify({ error: "unknown job" })); return; }
+    if (!wantResult) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ status: job.status, error: job.error, seconds: job.seconds, mode: job.mode }));
+      return;
+    }
+    if (job.status !== "done" || !job.outPath || !fs.existsSync(job.outPath)) {
+      res.writeHead(409, { "content-type": "application/json" }); res.end(JSON.stringify({ error: "not ready", status: job.status }));
+      return;
+    }
+    const size = fs.statSync(job.outPath).size;
+    res.writeHead(200, { "content-type": "video/mp4", "content-length": String(size), "content-disposition": `attachment; filename="${jobId}.mp4"` });
+    const rs = fs.createReadStream(job.outPath);
+    rs.pipe(res);
+    rs.on("close", () => { try { fs.unlinkSync(job.outPath!); } catch { /* */ } jobs.delete(jobId); });
     return;
   }
 
@@ -148,11 +181,7 @@ const server = http.createServer((req, res) => {
     req.pipe(ws);
     ws.on("error", () => { try { res.writeHead(500); res.end("upload error"); } catch { /* */ } });
     ws.on("finish", async () => {
-      const started = Date.now();
       const extractDir = path.join(workDir, "x");
-      const outName = `job_${Date.now()}_${Math.random().toString(36).slice(2)}.mp4`;
-      let cleaned = false;
-      const cleanup = () => { if (cleaned) return; cleaned = true; try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { /* */ } };
       try {
         fs.mkdirSync(extractDir, { recursive: true });
         await extractTar(tarPath, extractDir);
@@ -161,29 +190,33 @@ const server = http.createServer((req, res) => {
           ...s,
           localFile: s.localFile ? path.join(extractDir, path.basename(s.localFile)) : undefined,
         }));
-        await runBundledJob(job.mode, job.jobSpec || {}, segments, outName);
-        const outPath = path.join(getOutputDir(), outName);
-        if (!fs.existsSync(outPath)) {
-          res.writeHead(500, { "content-type": "application/json" });
-          res.end(JSON.stringify({ error: "job produced no output" }));
-          cleanup();
-          return;
-        }
-        const size = fs.statSync(outPath).size;
-        console.log(`[worker] rendered ${job.mode} ${outName} (${(size / 1e6).toFixed(1)}MB) in ${((Date.now() - started) / 1000).toFixed(1)}s`);
-        res.writeHead(200, {
-          "content-type": "video/mp4",
-          "content-length": String(size),
-          "x-render-seconds": String(((Date.now() - started) / 1000).toFixed(1)),
-          "content-disposition": `attachment; filename="${outName}"`,
-        });
-        const rs = fs.createReadStream(outPath);
-        rs.pipe(res);
-        rs.on("close", () => { try { fs.unlinkSync(outPath); } catch { /* */ } cleanup(); });
+        const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+        const outName = `job_${jobId}.mp4`;
+        jobs.set(jobId, { status: "rendering", mode: job.mode });
+        // Respond IMMEDIATELY with the jobId; render in the background (beats proxy timeouts).
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ jobId }));
+        const started = Date.now();
+        runBundledJob(job.mode, job.jobSpec || {}, segments, outName)
+          .then(() => {
+            const outPath = path.join(getOutputDir(), outName);
+            const rec = jobs.get(jobId);
+            if (!rec) return;
+            if (fs.existsSync(outPath)) {
+              rec.status = "done"; rec.outPath = outPath; rec.seconds = (Date.now() - started) / 1000;
+              console.log(`[worker] job ${jobId} (${job.mode}) done in ${rec.seconds.toFixed(1)}s`);
+            } else { rec.status = "error"; rec.error = "job produced no output"; }
+          })
+          .catch((e: any) => {
+            const rec = jobs.get(jobId);
+            if (rec) { rec.status = "error"; rec.error = String(e?.message || e); }
+            console.error(`[worker] job ${jobId} failed:`, e?.message || e);
+          })
+          .finally(() => { try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { /* */ } });
       } catch (e: any) {
-        console.error("[worker] job failed:", e?.message || e);
+        console.error("[worker] job submit failed:", e?.message || e);
         try { res.writeHead(500, { "content-type": "application/json" }); res.end(JSON.stringify({ error: String(e?.message || e) })); } catch { /* */ }
-        cleanup();
+        try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { /* */ }
       }
     });
     return;

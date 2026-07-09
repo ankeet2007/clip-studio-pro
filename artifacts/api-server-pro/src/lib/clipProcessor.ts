@@ -1296,6 +1296,62 @@ async function postFileExpectMp4(
   });
 }
 
+function httpSleep(ms: number): Promise<void> { return new Promise((r) => setTimeout(r, ms)); }
+
+// POST a file and parse a small JSON response (submit an async job → { jobId }).
+async function postFileExpectJson(u: URL, filePath: string): Promise<any | null> {
+  return new Promise((resolve) => {
+    try {
+      const lib = u.protocol === "https:" ? https : http;
+      const size = fs.statSync(filePath).size;
+      const req = lib.request(u, {
+        method: "POST", timeout: 10 * 60 * 1000,
+        headers: { "content-type": "application/octet-stream", "content-length": String(size), "x-worker-secret": process.env.CLOUD_RENDER_SECRET || "" },
+      }, (res) => {
+        let body = ""; res.on("data", (d) => { body += d.toString(); });
+        res.on("end", () => { try { resolve(res.statusCode === 200 ? JSON.parse(body) : null); } catch { resolve(null); } });
+        res.on("error", () => resolve(null));
+      });
+      req.on("timeout", () => { req.destroy(); resolve(null); });
+      req.on("error", () => resolve(null));
+      fs.createReadStream(filePath).pipe(req);
+    } catch { resolve(null); }
+  });
+}
+
+async function getJson(u: URL): Promise<any | null> {
+  return new Promise((resolve) => {
+    try {
+      const lib = u.protocol === "https:" ? https : http;
+      const req = lib.get(u, { timeout: 20000, headers: { "x-worker-secret": process.env.CLOUD_RENDER_SECRET || "" } }, (res) => {
+        let body = ""; res.on("data", (d) => { body += d.toString(); });
+        res.on("end", () => { try { resolve(res.statusCode === 200 ? JSON.parse(body) : null); } catch { resolve(null); } });
+        res.on("error", () => resolve(null));
+      });
+      req.on("timeout", () => { req.destroy(); resolve(null); });
+      req.on("error", () => resolve(null));
+    } catch { resolve(null); }
+  });
+}
+
+async function getFileTo(u: URL, outPath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    try {
+      const lib = u.protocol === "https:" ? https : http;
+      const req = lib.get(u, { timeout: 30 * 60 * 1000, headers: { "x-worker-secret": process.env.CLOUD_RENDER_SECRET || "" } }, (res) => {
+        if (res.statusCode !== 200) { res.resume(); resolve(false); return; }
+        const out = fs.createWriteStream(outPath);
+        res.pipe(out);
+        out.on("finish", () => resolve(fs.existsSync(outPath) && fs.statSync(outPath).size > 1000));
+        out.on("error", () => resolve(false));
+        res.on("error", () => resolve(false));
+      });
+      req.on("timeout", () => { req.destroy(); resolve(false); });
+      req.on("error", () => resolve(false));
+    } catch { resolve(false); }
+  });
+}
+
 // Multi-segment cloud offload (Story / Top 5 / Match Story). The phone downloads every
 // segment locally (home IP), bundles them + a job.json into a tar, and POSTs it to
 // /worker/render-job; the worker runs the whole mode on the local files and returns the MP4.
@@ -1339,7 +1395,22 @@ async function tryCloudMultiSegment(
     fs.writeFileSync(path.join(bundleDir, "job.json"), JSON.stringify({ mode, jobSpec, segments: outSegs }));
     tarPath = path.join(os.tmpdir(), `cloudjob_${clipId}_${Date.now()}.tar`);
     await execFileAsync("tar", ["-cf", tarPath, "-C", bundleDir, "."]);
-    return await postFileExpectMp4(new URL("/worker/render-job", base), tarPath, {}, outPath);
+    // Async: submit the bundle (worker renders in the BACKGROUND and returns a jobId), then poll
+    // status + download the result — all short requests, so a proxy's response-timeout (e.g.
+    // cloudflared ~100s) never kills a long multi-segment render.
+    const sub = await postFileExpectJson(new URL("/worker/render-job", base), tarPath);
+    if (!sub || !sub.jobId) return false;
+    onProgress(30);
+    const statusUrl = new URL(`/worker/job/${sub.jobId}`, base);
+    const deadline = Date.now() + 45 * 60 * 1000;
+    while (Date.now() < deadline) {
+      await httpSleep(5000);
+      const st = await getJson(statusUrl);
+      if (!st) continue; // transient network blip — keep polling
+      if (st.status === "done") return await getFileTo(new URL(`/worker/job/${sub.jobId}/result`, base), outPath);
+      if (st.status === "error") { logger.warn({ error: st.error }, "Cloud job errored"); return false; }
+    }
+    return false;
   } catch (e) {
     logger.warn({ e }, "Cloud multi-segment offload failed — rendering locally");
     return false;
@@ -2432,7 +2503,7 @@ export async function processStory(
 
   // Cloud offload: download every segment locally (home IP) then render the whole story on
   // the cloud worker. Falls through to local rendering on any failure.
-  if (process.env.CLOUD_RENDER_URL && process.env.CLOUD_RENDER_MULTISEG) {
+  if (process.env.CLOUD_RENDER_URL) {
     const ok = await tryCloudMultiSegment("story", clipId, finalOutputPath, {
       youtubeUrl, channelHandle, frameStyle, sourceChannel, captionsEnabled, outroEnabled,
       captionColor, narrationScript, voiceOpts: { voice: storyVoice, speed: storySpeed },
@@ -2657,7 +2728,7 @@ export async function processMatchStory(
   // Cloud offload: bundle every beat (local scout clips are copied as-is; YouTube beats are
   // downloaded on the home IP) and render the whole Match Story on the cloud. Falls through
   // to local on any failure.
-  if (process.env.CLOUD_RENDER_URL && process.env.CLOUD_RENDER_MULTISEG) {
+  if (process.env.CLOUD_RENDER_URL) {
     const ok = await tryCloudMultiSegment("matchstory", clipId, finalOutputPath, {
       channelHandle, frameStyle, sourceChannel, captionsEnabled, outroEnabled, captionColor,
       narrationScript, voiceOpts: { voice: msVoice, speed: msSpeed }, title, transitionsEnabled, titleCardEnabled,
@@ -2892,7 +2963,7 @@ export async function processTop5(
 
   // Cloud offload: download every moment locally (home IP) then render the whole Top 5 on the
   // cloud worker. Falls through to local rendering on any failure.
-  if (process.env.CLOUD_RENDER_URL && process.env.CLOUD_RENDER_MULTISEG) {
+  if (process.env.CLOUD_RENDER_URL) {
     const ok = await tryCloudMultiSegment("top5", clipId, finalOutputPath, {
       title, channelHandle, frameStyle, sourceChannel, captionsEnabled, outroEnabled,
       captionColor, order, voiceOpts: { voice: top5Voice, speed: top5Speed },
