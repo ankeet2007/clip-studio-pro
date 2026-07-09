@@ -115,7 +115,7 @@ const TOOLS = [
           items: { type: "string", enum: [...PLATFORMS] },
           description: "Which platforms to search. Omit to search all configured platforms.",
         },
-        maxCandidates: { type: "number", description: "Max clips to return (10-80, default 30)." },
+        maxCandidates: { type: "number", description: "Max clips to return (10-200, default 200 — returns everything found)." },
       },
       required: ["topic"],
       additionalProperties: false,
@@ -189,7 +189,7 @@ async function runSearchClips(args: any): Promise<string> {
   const platforms = Array.isArray(args?.platforms)
     ? args.platforms.filter((p: unknown): p is string => (PLATFORMS as readonly string[]).includes(p as string))
     : undefined;
-  const maxCandidates = Math.min(80, Math.max(10, Number(args?.maxCandidates) || 30));
+  const maxCandidates = Math.min(200, Math.max(10, Number(args?.maxCandidates) || 200));
 
   const job = await apiFetch("/scout", {
     method: "POST",

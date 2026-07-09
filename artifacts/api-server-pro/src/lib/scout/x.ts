@@ -67,7 +67,7 @@ export const xAdapter: ScoutAdapter = {
   async search(topic: string, opts: ScoutOptions): Promise<RawCandidate[]> {
     const cookie = cookieFileFor("x");
     if (!cookie) return [];
-    const limit = Math.min(50, opts.maxPerPlatform ?? 40);
+    const limit = Math.min(100, opts.maxPerPlatform ?? 100);
     const q = encodeURIComponent(`${topic} filter:native_video`);
     const url = `https://x.com/search?q=${q}&f=top`;
     const gdl = findGalleryDl();
