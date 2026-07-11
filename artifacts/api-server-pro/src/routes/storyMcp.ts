@@ -6,7 +6,18 @@
 // JSON-RPC (zero deps, stateless), mirroring routes/mcp.ts. Proxies the app's own HTTP API over loopback.
 
 import { Router, type IRouter, type Request, type Response } from "express";
+import fs from "node:fs";
+import path from "node:path";
 import { logger } from "../lib/logger";
+import { getUploadsDir, getOutputFilePath } from "../lib/clipProcessor";
+
+// HH:MM:SS (or seconds) -> seconds.
+const hmsToSec = (t: unknown): number => {
+  const p = String(t ?? "").split(":").map(Number);
+  if (p.length === 3) return (p[0] || 0) * 3600 + (p[1] || 0) * 60 + (p[2] || 0);
+  if (p.length === 2) return (p[0] || 0) * 60 + (p[1] || 0);
+  return Number(t) || 0;
+};
 
 const SERVER_INFO = { name: "clip-studio-story", version: "1.0.0" };
 const SUPPORTED_PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -32,6 +43,10 @@ const INSTRUCTIONS = [
   "",
   "VOICE: leave voice unset for the default warm British narrator (en_GB-alan-medium) at natural pace, or",
   "pass voice/pace to override.",
+  "",
+  "HARD NAMES: if a name would be mispronounced by the TTS, spell the beat's `narration` PHONETICALLY",
+  "(e.g. 'day-KETT-el-ah-reh') and put the correctly-spelled version in `caption` (same word count) — the",
+  "voice then says it right while the on-screen captions stay correct.",
 ].join("\n");
 
 // ---- Loopback client to this same app's HTTP API ----
@@ -71,7 +86,8 @@ const SEGMENT_SCHEMA = {
   type: "object",
   properties: {
     url: { type: "string", description: "The beat's source: a real clip URL from Scout (reddit/x/instagram/facebook/youtube) OR an uploads path from Scout's download_clip / extract_segment." },
-    narration: { type: "string", description: "This beat's spoken narration line (the render speaks this over the muted clip)." },
+    narration: { type: "string", description: "This beat's SPOKEN narration line (the render voices this over the muted clip). May be phonetic for hard names (e.g. 'day-KETT-el-ah-reh') to fix TTS pronunciation." },
+    caption: { type: "string", description: "Optional on-screen CAPTION text when it must differ from what's spoken — the correctly-spelled version (e.g. 'De Ketelaere'). Use the SAME word count as narration so the captions line up. Omit to caption exactly what's spoken." },
     headline: { type: "string", description: "Optional short on-screen headline for this beat (3-6 words)." },
     channel: { type: "string", description: "Optional source handle/credit, e.g. r/soccer." },
   },
@@ -111,6 +127,7 @@ const TOOLS = [
         titleCard: { type: "boolean", description: "Show the opening title card (default true)." },
         outro: { type: "boolean", description: "Show the outro card (default true)." },
         crossfades: { type: "boolean", description: "Crossfade between beats (default true)." },
+        captionColor: { type: "string", description: "Hex color for the karaoke caption highlight, e.g. #FFF400 (default, bright yellow)." },
       },
       required: ["segments"],
       additionalProperties: false,
@@ -139,6 +156,7 @@ function normSegments(raw: any): any[] {
     .map((s: any) => ({
       url: String(s?.url ?? "").trim(),
       narration: String(s?.narration ?? "").trim(),
+      caption: String(s?.caption ?? "").trim(),
       headline: String(s?.headline ?? "").trim(),
       channel: String(s?.channel ?? "").trim(),
     }))
@@ -187,7 +205,11 @@ async function runCreateMatchStory(args: any): Promise<ToolResult> {
     throw new Error(`Only ${beats.length} of ${items.length} clips could be fetched (the rest may be full-highlight/watch URLs or blocked). In Scout, extract_segment each moment into an uploads path, then pass those paths.`);
   }
 
-  // 2) Enqueue the render.
+  // 2) Enqueue the render. Re-attach each beat's optional CAPTION (P4) — beats come back from
+  // fetch-urls keyed only on narration, so map caption by the (normalized) spoken line.
+  const norm = (t: string) => String(t || "").replace(/\s+/g, " ").trim().slice(0, 600);
+  const capByLine = new Map<string, string>();
+  segments.forEach((s) => { if (s.caption) capByLine.set(norm(s.narration), s.caption); });
   const body = {
     title: String(args?.title ?? "").slice(0, 120),
     frameStyle: "immersive",
@@ -195,7 +217,7 @@ async function runCreateMatchStory(args: any): Promise<ToolResult> {
     titleCardEnabled: args?.titleCard !== false,
     outroEnabled: args?.outro !== false,
     transitionsEnabled: args?.crossfades !== false,
-    captionColor: "#FFF400",
+    captionColor: /^#?[0-9a-fA-F]{6}$/.test(String(args?.captionColor ?? "")) ? String(args?.captionColor).replace(/^#?/, "#") : "#FFF400",
     // Default to a warm, natural British narrator at normal (1.0) pace — human, not robotic. Callers
     // can override with `voice` / `pace`.
     voiceoverVoice: String(args?.voice || "en_GB-alan-medium"),
@@ -204,6 +226,7 @@ async function runCreateMatchStory(args: any): Promise<ToolResult> {
       sourceType: "local", localFile: b.localFile,
       startTime: b.startTime, endTime: b.endTime,
       headline: b.headline, sourceChannel: b.sourceChannel, narrationLine: b.narrationLine,
+      captionLine: capByLine.get(norm(b.narrationLine)) || "",
     })),
   };
   const clip = await apiFetch("/clips/matchstory", {
@@ -212,9 +235,28 @@ async function runCreateMatchStory(args: any): Promise<ToolResult> {
   const id = clip?.id;
   if (!id) throw new Error("Render was not enqueued (no clip id returned).");
   logger.info({ clipId: id, beats: beats.length, words }, "story-mcp create_match_story");
+
+  // P5 (freeze check) + P7 (cross-beat dedupe) — non-blocking pre-finish warnings surfaced to the caller.
+  const warnings: string[] = [];
+  const seen = new Map<string, number>();
+  segments.forEach((s, i) => {
+    const k = s.url.trim();
+    if (!k) return;
+    if (seen.has(k)) warnings.push(`beats ${seen.get(k)! + 1} & ${i + 1} reuse the SAME source (${k.slice(0, 48)}…) — that shot repeats`);
+    else seen.set(k, i);
+  });
+  beats.forEach((b: any, i: number) => {
+    const clipDur = hmsToSec(b.endTime) - hmsToSec(b.startTime);
+    const voSec = countWords(b.narrationLine || "") / 2.4;
+    if (clipDur > 0 && voSec > 0 && clipDur < voSec * 1.3) {
+      warnings.push(`beat ${i + 1} clip is ~${clipDur.toFixed(1)}s but its line is ~${voSec.toFixed(1)}s of speech (want a clip ≥${(voSec * 1.3).toFixed(1)}s) — may freeze/bleed; re-extract a longer window`);
+    }
+  });
+  const warnBlock = warnings.length ? `\n\nHeads-up before it finishes:\n- ${warnings.join("\n- ")}` : "";
+
   return textResult(
     `Match Story enqueued — clipId ${id} (${beats.length} beats, ~${words} words ~${Math.round(words / 2.4)}s).\n` +
-    `Poll it with get_story({ clipId: ${id} }) until status is "done", then open the downloadUrl.`
+    `Poll it with get_story({ clipId: ${id} }) until status is "done", then open the downloadUrl.` + warnBlock
   );
 }
 
@@ -224,9 +266,23 @@ async function runGetStory(args: any, publicOrigin: string): Promise<ToolResult>
   const clip = await apiFetch(`/clips/${id}`);
   const status = clip?.status ?? "unknown";
   const progress = clip?.progress ?? 0;
-  if (status === "done") return textResult(`clipId ${id} — DONE (100%).\nDownload: ${publicOrigin}/api/clips/${id}/download`);
-  if (status === "error") return textResult(`clipId ${id} — ERROR: ${clip?.errorMessage || "render failed"}.`);
-  return textResult(`clipId ${id} — ${status} (${progress}%). Poll get_story again in ~15-30s.`);
+  // P7 — explicit terminal states so the caller can branch cleanly.
+  if (status === "done") {
+    // P3 — copy the finished render into the uploads dir so a sandboxed client (that can't reach the
+    // download tunnel) can understand_video it back to self-QC captions/frames.
+    let selfQc = "";
+    try {
+      const src = clip.outputFilename ? getOutputFilePath(clip.outputFilename) : "";
+      if (src && fs.existsSync(src)) {
+        const dest = path.join(getUploadsDir(), `render_${id}.mp4`);
+        fs.copyFileSync(src, dest);
+        selfQc = `\nSelf-QC: understand_video "${dest}" to inspect the finished render (frames + transcript).`;
+      }
+    } catch (e) { logger.warn({ e, id }, "story-mcp render self-QC copy failed"); }
+    return textResult(`clipId ${id} — status: done (100%).\nDownload: ${publicOrigin}/api/clips/${id}/download${selfQc}`);
+  }
+  if (status === "error") return textResult(`clipId ${id} — status: failed.\nError: ${clip?.errorMessage || "render failed (no error message)"}.`);
+  return textResult(`clipId ${id} — status: processing (${progress}%). Poll get_story again in ~15-30s.`);
 }
 
 async function callTool(name: string, args: any, publicOrigin: string): Promise<ToolResult> {

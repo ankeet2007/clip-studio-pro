@@ -62,6 +62,9 @@ export function rankCandidates(cands: RawCandidate[], terms: string[], opts: Sco
   for (let i = 0; i < cands.length; i++) {
     const c = cands[i]!;
     if (maxAgeSec && c.createdAt > 0 && nowSec - c.createdAt > maxAgeSec) continue; // too old
+    // P2 duration hard filter: drop KNOWN-too-short clips (e.g. asking for a ≥5min broadcast highlight,
+    // not an 8s reel). Unknown duration is kept (probed later).
+    if (opts.minDurationSec && c.durationSec != null && c.durationSec < opts.minDurationSec) continue;
     // Facebook has no search — its candidates are URLs the user explicitly pasted, so they're
     // relevant by definition and skip the topic-relevance floor.
     const relevance = c.platform === "facebook" ? 1 : relevanceScore(c.title, terms);
@@ -69,16 +72,22 @@ export function rankCandidates(cands: RawCandidate[], terms: string[], opts: Sco
     const engagement = engPct(c.engagement || 0);
     const recency = recencyScore(c.createdAt);
     const quality = prelimQuality(c.durationSec, opts);
-    const total =
+    // P2 commentary signal: a "music montage / no commentary" highlight is useless for locating moments
+    // by transcript — demote it (title heuristic; can't truly know without downloading).
+    const isMusicMontage = /\b(music|montage|no\s*commentary|song|hd\s*music|with\s*music)\b/i.test(c.title);
+    const musicPenalty = isMusicMontage ? 0.7 : 1;
+    const total = (
       WEIGHTS.relevance * relevance +
       WEIGHTS.engagement * engagement +
       WEIGHTS.recency * recency +
-      WEIGHTS.quality * quality;
+      WEIGHTS.quality * quality
+    ) * musicPenalty;
     const reasons: string[] = [
       `relevance ${(relevance * 100) | 0}%`,
       `engagement ${(engagement * 100) | 0}% (${c.engagement})`,
       `recency ${(recency * 100) | 0}%`,
     ];
+    if (isMusicMontage) reasons.push("likely music montage — no commentary");
     scored.push({ ...c, id: `${c.platform}_${i}_${Math.random().toString(36).slice(2, 8)}`, scores: { relevance, engagement, recency, quality, total }, reasons });
   }
 

@@ -2220,6 +2220,11 @@ export interface StorySegment {
   // Match Story only: this beat's own AI narration line. When present the beat is paced to
   // its voiceover and the line is placed at the beat's start (no flat timeline-guess script).
   narrationLine?: string;
+  // Match Story only (P4 spoken-vs-caption split): the on-screen CAPTION text for this beat when it
+  // must differ from what's spoken — narrationLine may be phonetic (for correct TTS pronunciation of
+  // hard names), captionLine carries the correctly-spelled words to burn on screen. Same word count as
+  // narrationLine so the karaoke re-spell aligns. Falls back to narrationLine when blank.
+  captionLine?: string;
   // Match Story 2.0 only: a beat sourced from a LOCAL downloaded clip (scout) instead of a
   // YouTube URL. When set, the whole file is used (no yt-dlp, no timestamp verify) and the beat
   // is NOT window-extended past the clip's real length.
@@ -2770,7 +2775,7 @@ export async function processMatchStory(
   const parts: string[] = [];
   const partDurs: number[] = [];
   // Per-beat voiceover captured during pacing (index-aligned to segs); reused for placement.
-  const beatVo: ({ text: string; wav: string; dur: number } | null)[] = segs.map(() => null);
+  const beatVo: ({ text: string; caption: string; wav: string; dur: number } | null)[] = segs.map(() => null);
 
   try {
     await updateProgress(2, true);
@@ -2805,7 +2810,8 @@ export async function processMatchStory(
           const wav = path.join(outputDir, `match_${clipId}_vo_${i}_${tmpId}.wav`);
           if (await generateNarrationWav(line, wav, msVoice, msSpeed)) {
             voDur = (await probeContentDuration(wav)) || 0;
-            beatVo[i] = { text: line, wav, dur: voDur };
+            // P4: the CAPTION shows captionLine (correct spelling) when given, else the spoken line.
+            beatVo[i] = { text: line, caption: (seg.captionLine ?? "").trim() || line, wav, dur: voDur };
           }
         }
         const pad = 0.3 + 0.9 + (isLast && outroEnabled ? 2 : 0);
@@ -2915,7 +2921,7 @@ export async function processMatchStory(
     //    every caption word matches the voice and lands on its onset via DTW karaoke. In
     //    per-beat mode we also hand over the exact script so captions carry zero ASR typos.
     if (captionsEnabled && totalDuration > 0) {
-      const knownCaptionText = perBeat ? beatVo.filter((v) => v && v.text).map((v) => v!.text).join(" ") : "";
+      const knownCaptionText = perBeat ? beatVo.filter((v) => v && v.caption).map((v) => v!.caption).join(" ") : "";
       await burnCaptionsOnFile(clipId, finalOutputPath, totalDuration, outroEnabled, captionColor, narrTrackPath, knownCaptionText);
     }
     try { narrTrackPath && fs.existsSync(narrTrackPath) && fs.unlinkSync(narrTrackPath); } catch { /* ignore */ }

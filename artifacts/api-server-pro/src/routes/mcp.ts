@@ -153,6 +153,7 @@ const TOOLS = [
         },
         maxCandidates: { type: "number", description: "Max clips to return (10-200, default 200 — returns everything found)." },
         maxAgeHours: { type: "number", description: "Freshness filter for a day-of match: only keep clips newer than this many hours (e.g. 48). Steers Reddit to recent threads, X to Latest, and YouTube to newest uploads. Omit for evergreen search." },
+        minDurationSec: { type: "number", description: "Only keep clips at least this long, in seconds (e.g. 300 for a ≥5-min broadcast highlight instead of short reels). Clips whose title looks like a silent music montage (no commentary) are auto-demoted." },
       },
       required: ["topic"],
       additionalProperties: false,
@@ -224,10 +225,15 @@ const TOOLS = [
       type: "object",
       properties: {
         url: { type: "string", description: "The source: a YouTube/reddit/x/instagram/facebook URL, or an uploads path from download_clip." },
-        start: { type: "string", description: "Segment start — seconds (e.g. 302.5) or HH:MM:SS (e.g. 00:05:02)." },
-        end: { type: "string", description: "Segment end — seconds or HH:MM:SS. Must be after start." },
+        start: { type: "string", description: "Segment start — seconds (e.g. 302.5) or HH:MM:SS (e.g. 00:05:02). Omit if using `segments`." },
+        end: { type: "string", description: "Segment end — seconds or HH:MM:SS. Must be after start. Omit if using `segments`." },
+        segments: {
+          type: "array",
+          description: "Cut MULTIPLE windows from this ONE source in a single call (e.g. 5 moments from a highlight) — much faster than 5 separate calls. Each is one beat's clip.",
+          items: { type: "object", properties: { start: { type: "string" }, end: { type: "string" } }, required: ["start", "end"], additionalProperties: false },
+        },
       },
-      required: ["url", "start", "end"],
+      required: ["url"],
       additionalProperties: false,
     },
   },
@@ -298,11 +304,13 @@ async function runSearchClips(args: any): Promise<ToolResult> {
   const maxCandidates = Math.min(200, Math.max(10, Number(args?.maxCandidates) || 200));
   const maxAgeHoursNum = Number(args?.maxAgeHours);
   const maxAgeHours = Number.isFinite(maxAgeHoursNum) && maxAgeHoursNum > 0 ? maxAgeHoursNum : undefined;
+  const minDurNum = Number(args?.minDurationSec);
+  const minDurationSec = Number.isFinite(minDurNum) && minDurNum > 0 ? minDurNum : undefined;
 
   const job = await apiFetch("/scout", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ topic, platforms, maxCandidates, maxAgeHours }),
+    body: JSON.stringify({ topic, platforms, maxCandidates, maxAgeHours, minDurationSec }),
   });
   const jobId = job?.id;
   if (!jobId) throw new Error("Scout did not start (no job id returned).");
@@ -442,21 +450,21 @@ async function runDownloadClip(args: any): Promise<ToolResult> {
 async function runExtractSegment(args: any): Promise<ToolResult> {
   const url = String(args?.url ?? "").trim();
   if (!url) throw new Error("Provide a source URL (YouTube/Reddit/X/IG/FB) or an uploads path from download_clip.");
-  if (args?.start == null || args?.end == null) throw new Error("Provide start and end (seconds or HH:MM:SS).");
-  const start = args.start;
-  const end = args.end;
+  // Batch: `segments:[{start,end},…]` cuts several windows from ONE source in a single call.
+  const pairs: { start: any; end: any }[] = Array.isArray(args?.segments) && args.segments.length
+    ? args.segments.map((s: any) => ({ start: s?.start, end: s?.end }))
+    : [{ start: args?.start, end: args?.end }];
+  for (const p of pairs) if (p.start == null || p.end == null) throw new Error("Each segment needs start and end (seconds or HH:MM:SS).");
   const job = startMediaJob("segment", async () => {
-    const r = await extractSegment(url, start, end);
-    return [
-      `Segment cut ✓`,
-      `path: ${r.path}`,
-      `duration: ${r.durationSec.toFixed(1)}s`,
-      ``,
-      `Use this uploads path as a Match Story beat's source.`,
-    ].join("\n");
+    const outs: string[] = [];
+    for (let i = 0; i < pairs.length; i++) {
+      const r = await extractSegment(url, pairs[i]!.start, pairs[i]!.end);
+      outs.push(`${pairs.length > 1 ? `[beat ${i + 1}] ` : ""}${r.path}  (${r.durationSec.toFixed(1)}s)`);
+    }
+    return [`Segment${pairs.length > 1 ? "s" : ""} cut ✓ — pass each uploads path as a Match Story beat's source:`, ...outs].join("\n");
   });
-  logger.info({ src: url.slice(0, 80), start, end, jobId: job.id }, "MCP extract_segment");
-  return pollMediaJob(job, 35_000);
+  logger.info({ src: url.slice(0, 80), pairs: pairs.length, jobId: job.id }, "MCP extract_segment");
+  return pollMediaJob(job, pairs.length > 2 ? 70_000 : 35_000);
 }
 
 async function runGetMediaResult(args: any): Promise<ToolResult> {

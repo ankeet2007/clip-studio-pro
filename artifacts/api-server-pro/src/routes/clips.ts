@@ -194,6 +194,7 @@ function sanitizeMatchSegments(raw: unknown): StorySegment[] {
         headline: String(seg.headline ?? "").slice(0, 120),
         sourceChannel: String(seg.sourceChannel ?? "").slice(0, 80),
         narrationLine: String(seg.narrationLine ?? "").slice(0, 600),
+        captionLine: String(seg.captionLine ?? "").slice(0, 600),
       });
       if (out.length >= 8) break;
       continue;

@@ -39,17 +39,19 @@ function publicJob(job: ScoutJob) {
 
 // POST /scout — start a scout run.
 router.post("/scout", (req, res): void => {
-  const body = req.body as { topic?: string; platforms?: string[]; subreddits?: string[]; maxCandidates?: number; maxAgeHours?: number };
+  const body = req.body as { topic?: string; platforms?: string[]; subreddits?: string[]; maxCandidates?: number; maxAgeHours?: number; minDurationSec?: number };
   const topic = (body.topic ?? "").trim();
   if (topic.length < 2) { res.status(400).json({ error: "Enter a topic to scout for." }); return; }
   const platforms = (Array.isArray(body.platforms) ? body.platforms : ALL_PLATFORMS).filter((p): p is Platform => (ALL_PLATFORMS as string[]).includes(p));
   const maxAgeHours = Number(body.maxAgeHours);
+  const minDurationSec = Number(body.minDurationSec);
   const opts: ScoutOptions = {
     platforms: platforms.length ? platforms : ["reddit"],
     subreddits: Array.isArray(body.subreddits) ? body.subreddits.slice(0, 6).map(String) : undefined,
     maxCandidates: Math.min(200, Math.max(10, Number(body.maxCandidates) || 40)),
     maxPerPlatform: 100,
     maxAgeHours: Number.isFinite(maxAgeHours) && maxAgeHours > 0 ? maxAgeHours : undefined,
+    minDurationSec: Number.isFinite(minDurationSec) && minDurationSec > 0 ? minDurationSec : undefined,
   };
   const job = startScout(topic, opts);
   logger.info({ jobId: job.id, topic, platforms: opts.platforms }, "Scout started");
