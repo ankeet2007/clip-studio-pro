@@ -28,7 +28,7 @@ const WHISPER_LIB = path.dirname(WHISPER_BIN);
 // gist/commentary — the keyframes carry the visual understanding. Override via env if desired.
 const WHISPER_MODEL = process.env["UNDERSTAND_WHISPER_MODEL"] || path.join(HOME, "whisper.cpp/models/ggml-tiny.en.bin");
 const TRANSCRIBE_CAP_SEC = 60; // only transcribe the first minute — bounds whisper time on long clips
-const OVERALL_BUDGET_MS = 55_000;
+const OVERALL_BUDGET_MS = 45_000; // keep the whole call under the ~35-45s an MCP client will wait for
 
 export type UnderstandPlatform = "reddit" | "x" | "instagram" | "facebook" | "youtube" | "local";
 
@@ -263,15 +263,19 @@ function pickFrameTimes(scenes: number[], winStart: number, winLen: number, n: n
   return times;
 }
 
-async function extractFramesAt(file: string, times: number[], dir: string): Promise<{ dataBase64: string; mimeType: string }[]> {
+async function extractFramesAt(file: string, times: number[], dir: string, deadlineMs?: number): Promise<{ dataBase64: string; mimeType: string }[]> {
   const frames: { dataBase64: string; mimeType: string }[] = [];
   for (let i = 0; i < times.length; i++) {
+    // Stay under the overall budget on a slow (e.g. AV1) source: once we're past the deadline and
+    // already have at least one frame, stop — a partial-but-timely result beats a late one the MCP
+    // client drops as blank. Long HD decodes are what pushed the whole call over the client timeout.
+    if (deadlineMs && frames.length >= 1 && Date.now() > deadlineMs) break;
     const ts = Math.max(0, times[i]!);
     const out = path.join(dir, `frame_${i}.jpg`);
     try {
       // Input-seek (-ss before -i) is fast; scale to 512px wide (even height) at moderate JPEG
       // quality — big enough to read shirt numbers / the scoreboard, small enough for the payload.
-      await execFileAsync("ffmpeg", ["-y", "-ss", ts.toFixed(2), "-i", file, "-frames:v", "1", "-vf", "scale=512:-2", "-q:v", "5", out], { timeout: 15_000 });
+      await execFileAsync("ffmpeg", ["-y", "-ss", ts.toFixed(2), "-i", file, "-frames:v", "1", "-vf", "scale=512:-2", "-q:v", "5", out], { timeout: 9_000 });
       if (fs.existsSync(out)) {
         frames.push({ dataBase64: fs.readFileSync(out).toString("base64"), mimeType: "image/jpeg" });
         fs.unlinkSync(out);
@@ -392,13 +396,16 @@ export async function understandVideo(src: string, maxFrames = 5, startSec?: num
     if (dur >= 3) {
       const sceneBudget = Math.min(15_000, OVERALL_BUDGET_MS - (Date.now() - started) - 22_000);
       if (sceneBudget >= 5000) {
-        const scanLen = explicitWindow ? Math.min(winLen, 120) : Math.min(winLen, 45);
+        const scanLen = explicitWindow ? Math.min(winLen, 40) : Math.min(winLen, 45);
         scenes = await sceneTimestamps(file, winStart, scanLen, sceneBudget);
       }
     }
+    // Bound frame extraction so the whole call still returns within the client's wait window even when
+    // the source is slow to decode (AV1 / long HD): finish frames by ~30s in, leaving time for the transcript.
+    const frameDeadline = started + 30_000;
     const frames = dur >= 2
-      ? await extractFramesAt(file, pickFrameTimes(scenes, winStart, winLen, n), dir)
-      : await extractFramesAt(file, [Math.max(0, dur / 2)], dir);
+      ? await extractFramesAt(file, pickFrameTimes(scenes, winStart, winLen, n), dir, frameDeadline)
+      : await extractFramesAt(file, [Math.max(0, dur / 2)], dir, frameDeadline);
     if (scenes.length >= 5) notes.push(`action-heavy: ${scenes.length} scene changes detected — the keyframes target those moments`);
     else if (winLen > 6 && scenes.length <= 1) notes.push("low visual motion (few/no scene changes) — likely static, a talking-head, or a graphic; verify it shows real action before using");
 

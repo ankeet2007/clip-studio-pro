@@ -5,6 +5,7 @@ import path from "path";
 import fs from "fs";
 import router from "./routes";
 import mcpRouter from "./routes/mcp";
+import storyMcpRouter from "./routes/storyMcp";
 import { logger } from "./lib/logger";
 
 const app: Express = express();
@@ -22,6 +23,14 @@ try {
   app.use("/mcp", mcpRouter);
 } catch (err) {
   logger.error({ err }, "Failed to mount MCP connector route (continuing without it)");
+}
+
+// Second connector — "Clip Studio STORY Mode 2.0" (render) — on the same permanent URL as /mcp, so it
+// survives restarts and never rotates (unlike a standalone process + cloudflared quick tunnel).
+try {
+  app.use("/story-mcp", storyMcpRouter);
+} catch (err) {
+  logger.error({ err }, "Failed to mount story MCP connector route (continuing without it)");
 }
 
 // OAuth discovery probes from MCP connector clients (e.g. the Claude app) must cleanly 404

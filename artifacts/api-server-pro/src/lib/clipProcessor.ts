@@ -1392,13 +1392,22 @@ async function tryCloudMultiSegment(
     const sub = await postFileExpectJson(new URL("/worker/render-job", base), tarPath);
     if (!sub || !sub.jobId) return false;
     onProgress(30);
-    const statusUrl = new URL(`/worker/job/${sub.jobId}`, base);
     const deadline = Date.now() + 45 * 60 * 1000;
+    let fails = 0;
     while (Date.now() < deadline) {
       await httpSleep(5000);
-      const st = await getJson(statusUrl);
-      if (!st) continue; // transient network blip — keep polling
-      if (st.status === "done") return await getFileTo(new URL(`/worker/job/${sub.jobId}/result`, base), outPath);
+      // Re-read CLOUD_RENDER_URL each poll so a mid-render tunnel rotation (`cloud on` re-points it;
+      // the worker + its job survive the rotation) is FOLLOWED instead of orphaning the poll on the
+      // dead old URL. And never poll a dead URL forever: after ~3 min of consecutive failures, give
+      // up so the caller falls back to a LOCAL render instead of stalling the clip at 30% (the clip-71 bug).
+      const curBase = process.env.CLOUD_RENDER_URL || base;
+      const st = await getJson(new URL(`/worker/job/${sub.jobId}`, curBase));
+      if (!st) {
+        if (++fails >= 36) { logger.warn("Cloud unreachable ~3min mid-render — falling back to local render"); return false; }
+        continue;
+      }
+      fails = 0;
+      if (st.status === "done") return await getFileTo(new URL(`/worker/job/${sub.jobId}/result`, curBase), outPath);
       if (st.status === "error") { logger.warn({ error: st.error }, "Cloud job errored"); return false; }
     }
     return false;
