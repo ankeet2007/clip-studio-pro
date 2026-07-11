@@ -193,7 +193,7 @@ function sanitizeMatchSegments(raw: unknown): StorySegment[] {
         endTime: toHMS(en),
         headline: String(seg.headline ?? "").slice(0, 120),
         sourceChannel: String(seg.sourceChannel ?? "").slice(0, 80),
-        narrationLine: String(seg.narrationLine ?? "").slice(0, 200),
+        narrationLine: String(seg.narrationLine ?? "").slice(0, 600),
       });
       if (out.length >= 8) break;
       continue;
@@ -206,7 +206,7 @@ function sanitizeMatchSegments(raw: unknown): StorySegment[] {
       endTime: toHMS(en),
       headline: String(seg.headline ?? "").slice(0, 120),
       sourceChannel: String(seg.sourceChannel ?? "").slice(0, 80),
-      narrationLine: String(seg.narrationLine ?? "").slice(0, 200),
+      narrationLine: String(seg.narrationLine ?? "").slice(0, 600),
       zoomMoments: typeof seg.zoomMoments === "string" ? seg.zoomMoments : "",
       punchInEnabled: seg.punchInEnabled === true,
     });
@@ -328,6 +328,25 @@ router.post("/clips/matchstory", async (req, res): Promise<void> => {
     res.status(400).json({ error: "A Match Story needs at least 2 valid beats (each with a source URL and a start/end time)." });
     return;
   }
+
+  // Story-length floor (scout / "Story Mode 2.0" only): the final video length = the spoken
+  // narration (each B-roll clip is cut down to its line), so a thin script renders a too-short
+  // clip. Count the words across the per-beat lines (+ flat script fallback) and refuse anything
+  // that would come out well under a minute. Scoped to all-local (scout) stories so the YouTube
+  // Match Story mode is untouched. ~140 words ≈ ~56s speech + per-beat pads/title card ≥ 60s.
+  const allLocal = segments.every((s) => s.sourceType === "local");
+  if (allLocal) {
+    const narrationWords = (segments.map((s) => s.narrationLine ?? "").join(" ") + " " + (body.narrationScript ?? ""))
+      .trim().split(/\s+/).filter(Boolean).length;
+    const MIN_STORY_WORDS = 140;
+    if (narrationWords < MIN_STORY_WORDS) {
+      res.status(400).json({
+        error: `Story narration is only ~${narrationWords} words (≈${Math.round(narrationWords / 2.4)}s). A Story needs ~150-220 words (60-90s) — go back to Step 1 and get a fuller script before finding clips.`,
+      });
+      return;
+    }
+  }
+
   const transitionsEnabled = body.transitionsEnabled ?? true;
   const titleCardEnabled = body.titleCardEnabled ?? true;
 
@@ -473,7 +492,7 @@ function sanitizeTop5Segments(raw: unknown, jobUrl: string): Top5Segment[] {
       endTime: toHMS(en),
       headline: String(seg.headline ?? "").slice(0, 120),
       sourceChannel: String(seg.sourceChannel ?? "").slice(0, 80),
-      narrationLine: String(seg.narrationLine ?? "").slice(0, 200),
+      narrationLine: String(seg.narrationLine ?? "").slice(0, 600),
       zoomMoments: typeof seg.zoomMoments === "string" ? seg.zoomMoments : "",
       punchInEnabled: seg.punchInEnabled === true,
     });

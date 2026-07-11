@@ -30,8 +30,10 @@ function percentiles(values: number[]): (v: number) => number {
   };
 }
 
-/** Gentle recency decay: ~1 for today, ~0.5 at 30 days, still >0 for classics. */
+/** Gentle recency decay: ~1 for today, ~0.5 at 30 days, still >0 for classics. Unknown date
+ *  (createdAt<=0, e.g. YouTube flat search) is neutral so it isn't unfairly buried. */
 function recencyScore(createdAt: number): number {
+  if (!createdAt || createdAt <= 0) return 0.5;
   const ageDays = Math.max(0, (Date.now() / 1000 - createdAt) / 86400);
   return 1 / (1 + ageDays / 30);
 }
@@ -51,10 +53,15 @@ function prelimQuality(durationSec: number | undefined, opts: ScoutOptions): num
  */
 export function rankCandidates(cands: RawCandidate[], terms: string[], opts: ScoutOptions): ScoredCandidate[] {
   const engPct = percentiles(cands.map((c) => c.engagement || 0));
+  // Freshness hard filter: drop candidates with a KNOWN createdAt older than maxAgeHours. Unknown
+  // dates (createdAt<=0) are kept — the adapter (e.g. YouTube ytsearchdate) already fronts fresh.
+  const nowSec = Date.now() / 1000;
+  const maxAgeSec = opts.maxAgeHours && opts.maxAgeHours > 0 ? opts.maxAgeHours * 3600 : 0;
 
   const scored: ScoredCandidate[] = [];
   for (let i = 0; i < cands.length; i++) {
     const c = cands[i]!;
+    if (maxAgeSec && c.createdAt > 0 && nowSec - c.createdAt > maxAgeSec) continue; // too old
     // Facebook has no search — its candidates are URLs the user explicitly pasted, so they're
     // relevant by definition and skip the topic-relevance floor.
     const relevance = c.platform === "facebook" ? 1 : relevanceScore(c.title, terms);

@@ -918,6 +918,26 @@ async function downloadSegment(
   throw lastError;
 }
 
+/**
+ * extract_segment (YouTube): download EXACTLY [startTime,endTime] via the HD-floored downloadSegment
+ * ladder above, then remux the result into `outPath` as a faststart mp4. Used by the MCP connector so
+ * a montage beat can be the precise moment cut out of a long official highlight — not the whole video.
+ * (downloadSegment already downloads only the section, so no second trim is needed here.)
+ */
+export async function downloadYouTubeSegment(url: string, startTime: string, endTime: string, outPath: string): Promise<string> {
+  const ytDlp = findYtDlp();
+  const tmpId = `mcpseg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const raw = await downloadSegment(ytDlp, url, startTime, endTime, tmpId, () => {});
+  try {
+    // Remux (no re-encode) into the requested mp4 path — downloadSegment may hand back mkv/webm.
+    await spawnProcess("ffmpeg", ["-y", "-i", raw, "-c", "copy", "-movflags", "+faststart", outPath], 300_000, () => {}, 90_000, "download");
+    if (!fs.existsSync(outPath)) throw new Error("segment remux produced no file");
+    return outPath;
+  } finally {
+    try { fs.existsSync(raw) && fs.unlinkSync(raw); } catch { /* */ }
+  }
+}
+
 // The six AI auto-zoom effects. Gemini picks one per moment; the ffmpeg expressions
 // for each are built in processClip (all sharp lanczos scale+crop — never zoompan).
 type ZoomType = "punch" | "whip" | "cut" | "pushin" | "pullout" | "kenburns";
@@ -2784,10 +2804,13 @@ export async function processMatchStory(
           // Scout/local beats: TRIM the downloaded clip down to its narration line (B-roll cut to
           // fit) so the story is NARRATION-DRIVEN and tight — not the full clip (playing whole scout
           // clips made a 4-beat story run ~4 min). Capped at the real footage length (never
-          // freeze-pad past it) and ≤ 20s so no single beat dominates.
+          // freeze-pad past it — a short clip padded to a long line reads as a frozen video) and
+          // ≤ 24s so no single beat dominates. Script-first stories use ~25-word lines (~11s), so
+          // the clip-finding brief tells Claude to pick clips at least as long as their line; when
+          // a clip IS shorter, the beat is capped to the footage (its line may bleed a touch).
           const clipLen = Math.max(1, timeToSeconds(seg.endTime) - timeToSeconds(seg.startTime));
           const want = voDur > 0 ? voDur + pad : Math.min(clipLen, 8);
-          const targetLen = Math.min(clipLen, 20, want);
+          const targetLen = Math.min(clipLen, 24, want);
           endTime = secondsToHMS(timeToSeconds(seg.startTime) + targetLen);
         } else {
           // YouTube beats: stretch the window to cover the voiceover (capped 24s).

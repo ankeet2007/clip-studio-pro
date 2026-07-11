@@ -6,7 +6,7 @@
 // ./index.ts); the downloaded files persist on disk, and only the final Match Story clip row
 // is stored in the DB — so no migration is needed.
 
-export type Platform = "reddit" | "x" | "instagram" | "facebook";
+export type Platform = "reddit" | "x" | "instagram" | "facebook" | "youtube";
 
 /** A search hit before scoring — the metadata each adapter can cheaply return. */
 export interface RawCandidate {
@@ -52,6 +52,10 @@ export interface ScoutOptions {
   maxCandidates?: number;   // how many top-ranked candidates to PRESENT for review
   minDurationSec?: number;  // target clip window
   maxDurationSec?: number;
+  // Freshness: when set, drop candidates whose KNOWN createdAt is older than this, and steer the
+  // adapters toward recent results (Reddit t=day/week, X f=live, YouTube ytsearchdate). Unknown
+  // dates (e.g. YouTube flat search) are kept — the adapter already fronts the freshest.
+  maxAgeHours?: number;
 }
 
 export interface ScoutJob {

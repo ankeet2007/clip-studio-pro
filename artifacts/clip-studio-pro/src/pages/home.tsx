@@ -681,9 +681,15 @@ export default function Home() {
   const [ms2Beats, setMs2Beats] = useState<MatchSeg[]>([]);
   const [ms2NarrPaste, setMs2NarrPaste] = useState("");
   const [ms2Submitting, setMs2Submitting] = useState(false);
-  // Claude-driven MS 2.0: paste of Claude's SEGMENTS+NARRATION reply, the parsed timeline
-  // narration, and the loading flag while the pasted social clips download.
-  const [ms2ClaudePaste, setMs2ClaudePaste] = useState("");
+  // Script-first Story (2 trips to Claude): paste #1 = Claude's full ~1-min script -> parsed into
+  // numbered beats; paste #2 = Claude's clip picks (one per beat, via the Scout connector).
+  // ms2Narration = optional legacy timeline block; ms2Loading spins while clips download.
+  const [storyScriptPaste, setStoryScriptPaste] = useState("");
+  const [storyBeats, setStoryBeats] = useState<{ n: number; line: string }[]>([]);
+  const [clipPicksPaste, setClipPicksPaste] = useState("");
+  // One-shot Research-first Story: paste = Claude's single reply (TITLE + SEGMENTS with per-beat
+  // narration inline). Reuses the same /scout/fetch-urls download + montage as the 2-trip flow.
+  const [storyOneShotPaste, setStoryOneShotPaste] = useState("");
   const [ms2Narration, setMs2Narration] = useState("");
   const [ms2Loading, setMs2Loading] = useState(false);
 
@@ -1551,11 +1557,13 @@ ${blocks}`;
     const topic = ms2Topic.trim() || "<the topic of this montage>";
     const list = ms2Beats.map((s, i) => `${i + 1} | ${s.headline || "(clip)"} — ${s.sourceChannel || "?"}, ${fmtDuration(s.startTime, s.endTime)}`).join("\n");
     const prompt =
-`ROLE: You are a viral short-form sports editor writing the VOICEOVER for a fast vertical montage titled "${topic}". I ALREADY have these clips, in THIS order. Write ONE punchy commentator line per clip so that together they tell a HOOK-FIRST story arc (hook → escalation → payoff) that holds viewers to the very end.
+`ROLE: You are a football short-form STORY DIRECTOR writing the VOICEOVER for a vertical montage titled "${topic}". I ALREADY have these clips, in THIS order. Write ONE short storyteller line per clip so together they tell a single arc — hook → escalation → payoff — that holds viewers to the end.
 
 RULES:
-- Clip 1's line is the HOOK — a curiosity-gap opener that makes people NOT scroll.
-- Each line 6-16 words, present tense, hype commentator tone; ADVANCE the story, don't just describe what's on screen.
+- Clip 1's line is the HOOK — a curiosity-gap opener that stops the scroll.
+- Each line calm and specific: names + numbers, cause before effect, a little tension; most lines end on a small curiosity gap. ADVANCE the story, don't just describe what's on screen.
+- SIMPLE, everyday English a 12-13 year old easily understands. Short sentences, common words. NO hype play-by-play, no rare/fancy/literary words.
+- ~12-24 words per line. The footage is MUTED, so the words carry the whole story.
 - Don't reference other clips, the montage, or timestamps.
 
 CLIPS (in order):
@@ -1586,83 +1594,140 @@ OUTPUT — return EXACTLY one line per clip and nothing else:
     toast({ title: `Narration filled for ${map.size} beats`, description: "Review the lines, then Enqueue." });
   }
 
-  // Claude-driven Story Mode 2.0: the SAME story-arc research brief as Match Story, but the
-  // sources are SOCIAL clips and CLAUDE does the finding + watching via the MCP connector
-  // (search_clips + understand_video). Output = SEGMENTS (social URLs) + timeline NARRATION,
-  // which applyMs2ClaudePaste downloads + renders. Run it in the Claude app (connector on).
-  async function copyMs2ClaudePrompt() {
-    const topic = ms2Topic.trim() || "<the match / topic — e.g. France vs Uruguay, FIFA World Cup 2026>";
+  const countWords = (s: string) => s.trim().split(/\s+/).filter(Boolean).length;
+
+  // Script-first Story — STEP 1: copy a prompt that makes Claude research the topic on the web
+  // and write the FULL ~1-min spoken script (clips come later, in Step 2). Run in the Claude app
+  // with web search ON. The script alone must carry the story, so it must clear 60s in simple words.
+  async function copyStoryScriptPrompt() {
+    const topic = ms2Topic.trim() || "<the match / topic — e.g. Morocco vs Spain, 2026 World Cup>";
     const prompt =
-`ROLE: You are a world-class football short-form researcher + STORY DIRECTOR. Build ONE vertical "story" montage about the topic below, told as a single dramatic arc (hook → escalation → payoff) that holds viewers to the very end. The PICKS are everything — a great edit can't save weak moments — so base every choice on real evidence, not memory.
+`ROLE: You are a football short-form STORY WRITER. Research the topic below on the web, then write the FULL spoken script for one vertical Short. This is STEP 1 — write ONLY the script now; the clips are chosen later.
 
-LENGTH — HARD RULE: the finished video MUST run between 60 and 90 seconds — never under 60, never over 90. Each clip is muted and cut to fit its narration line, so the TOTAL length = the sum of all your narration lines. Budget ~150-220 spoken words across ALL beats (≈150 words = 60s, ≈220 words = 90s): write enough detail to clear 60s, but trim to stay under 90s.
+TOPIC: ${topic}
 
-MATCH / TOPIC: ${topic}
+RESEARCH FIRST: search the web for what ACTUALLY happened — real names, the score, minute marks, who did what, the turning point. Get the facts right before you write a word.
 
-USE YOUR TOOLS: you have a "Clip Studio Scout" connector. Use search_clips to find the most viral, most-talked-about clips across Reddit, X (Twitter), Instagram and Facebook, and use understand_video on the strongest candidates to actually WATCH them (keyframes + transcript) before committing.
+WRITE THE SCRIPT — hard rules:
+- Tell the WHOLE story as one arc: hook → what happened, in order → turning point → payoff.
+- LENGTH: 150-220 words TOTAL (NEVER under 150). This IS the video length (~60-90s spoken). Under ~150 words is TOO SHORT and Clip Studio will reject it — so write enough to clear a full minute.
+- Break it into 6-8 numbered lines, ONE beat per line, ~20-30 words each (a real sentence or two, never a fragment).
+- SIMPLE, everyday English a 12-13 year old easily understands. Short, punchy sentences. Common words only — NO rare, literary, formal or fancy words. Say it plainly.
+- Clips play muted UNDER the voice, so the words alone carry everything. Names + numbers, cause before effect, a little tension.
 
-METHOD:
-1. ANGLE — pick ONE throughline the whole video is about (a single question, claim or character, e.g. "the referee decided this match"). Every clip must serve that angle; drop anything off-topic.
-2. ARC — select 4-8 beats that, IN ORDER, build the story:
-   - Beat 1 = the HOOK: the single most curiosity-grabbing moment.
-   - Middle beats ESCALATE: each raises the stakes or adds a twist, cause before effect.
-   - Final beat = the PAYOFF: the biggest moment / the answer to the hook — never bury it.
-3. WHICH CLIP AT WHICH BEAT — each clip you pick must LITERALLY SHOW the moment its narration describes; verify with understand_video first. Reject blurry, zoomed-logo, static or ambiguous clips (a beat with no clear action is a dead beat). Use each clip's REAL source URL from search_clips — NEVER invent a URL.
-
-NARRATION — for EACH beat write ONE short spoken line in a STORYTELLER voice: calm, specific (names + numbers), cause→effect, a little tension/humor, ending most beats on a curiosity gap that pulls into the next ("…but that wasn't even the strangest part"). The line is what's spoken WHILE that clip is on screen, so words and picture always match. NOT rapid hype play-by-play, and don't just describe what's on screen — advance the story. The clip's own audio is MUTED, so the narration alone carries the whole story.
-
-OUTPUT — return EXACTLY this and nothing else (one line per beat, IN PLAY ORDER, fields separated by " | "):
+OUTPUT exactly this and nothing else:
 TITLE: <4-7 word title>
-SEGMENTS:
-<clip url> | <channel/handle> | <on-screen headline, 3-6 words> | <the narration line spoken over this clip>
-...
-
-Example:
-TITLE: Messi's Free Kick Masterclass
-SEGMENTS:
-https://x.com/i/status/123 | @FanCam | The Wall Sets Up | Ninety-third minute, one chance left — and Messi doesn't even wait for the whistle.
-https://www.reddit.com/r/soccer/comments/abc/ | r/soccer | He Curls It In | It bends over the wall and into the top corner — the keeper never moved.`;
+SCRIPT:
+1. <beat 1 — the hook>
+2. <beat 2>
+3. <beat 3>
+4. <beat 4>
+5. <beat 5>
+6. <beat 6>`;
     const ok = await copyTextToClipboard(prompt);
     toast(ok
-      ? { title: "Claude prompt copied", description: "Run it in the Claude app (Clip Studio connector on), then paste its reply below." }
+      ? { title: "Script prompt copied", description: "Run it in the Claude app (web search ON), then paste the script below." }
       : { title: "Copy failed", variant: "destructive" });
   }
 
-  // Parse Claude's reply. Preferred format = SEGMENTS lines carrying their OWN narration as a 4th
-  // field (`url | channel | headline | narration line`) so each beat is paced to its own voice;
-  // a legacy separate `NARRATION:` timeline block (SS | line) is still honored as a fallback.
-  // Downloads each clip via /scout/fetch-urls, then fills the montage below.
-  async function applyMs2ClaudePaste() {
-    const text = ms2ClaudePaste.replace(/[​‌‍﻿⁠]/g, "");
-    const titleMatch = text.match(/^\s*TITLE\s*:\s*(.+)$/im);
-    if (titleMatch && titleMatch[1].trim() && !ms2Topic.trim()) setMs2Topic(titleMatch[1].trim().slice(0, 120));
-    const nIdx = text.search(/narration\s*:/i);
-    let segBlock = nIdx >= 0 ? text.slice(0, nIdx) : text;
-    const narrBlock = nIdx >= 0 ? text.slice(nIdx).replace(/^[^\n]*\n?/, "") : "";
-    segBlock = segBlock.replace(/(?:beats|segments)\s*:/i, "").replace(/^\s*TITLE\s*:.*$/im, "");
-
-    const items: { url: string; headline: string; sourceChannel: string; narrationLine: string }[] = [];
-    for (const rawLine of segBlock.split(/\r?\n/)) {
-      const urlM = rawLine.match(/https?:\/\/[^\s|]+/i);
-      if (!urlM) continue;
-      const rest = rawLine.split("|").map((f) => f.trim())
-        .filter((f) => f.length > 0 && !/^https?:\/\//i.test(f) && !/\d{1,2}:\d{2}(?::\d{2})?\s*(?:-|–|—|to|→)/i.test(f));
-      // Fields after the url, in order: channel, on-screen headline, spoken narration line.
-      items.push({
-        url: urlM[0],
-        sourceChannel: (rest[0] ?? "").slice(0, 80),
-        headline: (rest[1] ?? rest[0] ?? "").slice(0, 120),
-        narrationLine: rest.slice(2).join(" — ").slice(0, 240),
-      });
-      if (items.length >= 8) break;
-    }
-    if (items.length < 2) {
-      toast({ title: "Couldn't read the clips", description: "Paste SEGMENTS lines like  https://x.com/i/status/… | @handle | Headline | narration line", variant: "destructive" });
+  // STEP 1 (apply): parse Claude's script paste → TITLE + numbered beats. Enforce the same floor
+  // as the server (≥140 words, 4-8 beats) so the user fixes a thin script BEFORE finding clips.
+  function applyStoryScript() {
+    const text = storyScriptPaste.replace(/[​‌‍﻿⁠]/g, "");
+    // A one-shot SEGMENTS reply (pipe-delimited clip URLs) pasted here would be mis-parsed as a plain
+    // numbered script and undercounted — route the user to the Research-first box instead.
+    const looksLikeSegments = text.split(/\r?\n/).filter((l) => /(?:https?:\/\/|\/uploads\/)\S+/.test(l) && l.includes("|")).length >= 2;
+    if (looksLikeSegments) {
+      toast({ title: "That's a SEGMENTS reply", description: "Paste it into the ‘Research-first Story — one prompt’ box above (after Copy prompt), not the script box.", variant: "destructive" });
       return;
     }
-    // Per-beat narration is preferred; only fall back to the old timeline block if Claude gave none.
-    const hasPerBeat = items.some((it) => it.narrationLine.length > 0);
-    const timelineNarration = hasPerBeat ? "" : narrBlock.split(/\r?\n/).map((l) => l.trim()).filter((l) => /^\d{1,2}(:\d{2})?\s*\|/.test(l)).join("\n");
+    const titleMatch = text.match(/^\s*TITLE\s*:\s*(.+)$/im);
+    if (titleMatch && titleMatch[1].trim()) setMs2Topic(titleMatch[1].trim().slice(0, 120));
+    const sIdx = text.search(/script\s*:/i);
+    let body = (sIdx >= 0 ? text.slice(sIdx).replace(/^[^\n]*\n?/, "") : text).replace(/^\s*TITLE\s*:.*$/im, "");
+    // Prefer numbered lines ("1." / "1)" / "1 |"); strip the leading number so it isn't spoken.
+    let beats = body.split(/\r?\n/)
+      .map((l) => l.replace(/^\s*\d{1,2}\s*[.)|:\-]\s*/, "").trim())
+      .filter((l) => l.length > 0 && !/^(title|script|segments|clips)\s*:/i.test(l));
+    // Fallback: Claude wrote one paragraph — split into sentences.
+    if (beats.length < 4) {
+      const flat = body.replace(/\s+/g, " ").trim();
+      if (flat) beats = flat.split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter(Boolean);
+    }
+    beats = beats.slice(0, 8);
+    if (beats.length < 4) {
+      toast({ title: "Couldn't read the script", description: "Paste 6-8 numbered lines after a SCRIPT: header (1. …  2. …).", variant: "destructive" });
+      return;
+    }
+    const words = countWords(beats.join(" "));
+    if (words < 140) {
+      setStoryBeats([]);
+      toast({ title: `Script too short — ~${words} words ≈ ${Math.round(words / 2.4)}s`, description: "A 1-minute Story needs ~150-220 words. Go back to Step 1 and ask Claude for a fuller script.", variant: "destructive" });
+      return;
+    }
+    setStoryBeats(beats.map((line, i) => ({ n: i + 1, line: line.slice(0, 200) })));
+    toast({ title: `${beats.length} beats · ~${words} words ≈ ${Math.round(words / 2.4)}s`, description: "Now copy the clip-finding prompt (Step 2) and run it in Claude with the connector ON." });
+  }
+
+  // Script-first Story — STEP 2: build the clip-finding brief from the locked script. Claude (Scout
+  // connector) returns one clip per beat; it must NOT rewrite the narration.
+  async function copyClipFindingPrompt() {
+    if (storyBeats.length < 4) { toast({ title: "Add the script first (Step 1)", variant: "destructive" }); return; }
+    const beatsBlock = storyBeats.map((b) => `${b.n}. ${b.line}`).join("\n");
+    const prompt =
+`ROLE: You are a football clip finder using the Clip Studio Scout connector. My script is DONE — do NOT rewrite, shorten or re-order any line. For EACH numbered beat below, use search_clips + understand_video to find ONE real clip that VISIBLY shows that exact moment.
+
+RULES:
+- One clip per beat, in the SAME order. Use each clip's REAL url from search_clips — never invent one.
+- Verify with understand_video: the keyframes must actually show the moment the line describes. Reject blurry, zoomed-logo, static, talking-head or off-topic clips.
+- Prefer a clip AT LEAST as long as its line (~12s+) so nothing gets cut. No repeats.
+
+MY SCRIPT BEATS:
+${beatsBlock}
+
+OUTPUT exactly this and nothing else (one line per beat, SAME order):
+CLIPS:
+1 | <clip url> | <3-6 word on-screen headline>
+2 | <clip url> | <headline>
+...`;
+    const ok = await copyTextToClipboard(prompt);
+    toast(ok
+      ? { title: "Clip-finding prompt copied", description: "Run it in the Claude app (Scout connector ON), then paste Claude's CLIPS reply below." }
+      : { title: "Copy failed", variant: "destructive" });
+  }
+
+  // Script-first Story — STEP 3: parse Claude's CLIPS reply and ZIP each url to its script beat (by
+  // the "N |" index if given, else by position), so narrationLine always comes from MY script — the
+  // clip reply only supplies the url (+ headline). Then download via /scout/fetch-urls → fill montage.
+  async function applyClipPicks() {
+    const text = clipPicksPaste.replace(/[​‌‍﻿⁠]/g, "");
+    // A clip reference is a normal http(s) URL OR an uploads path returned by the Scout connector's
+    // download_clip / extract_segment (a precise moment already cut into the render pipeline).
+    const clipRefRe = /(?:https?:\/\/[^\s|]+|\/[^\s|]*\/uploads\/[^\s|]+)/i;
+    const isClipRef = (f: string) => clipRefRe.test(f);
+    const picks: { idx: number | null; url: string; headline: string }[] = [];
+    for (const rawLine of text.split(/\r?\n/)) {
+      const urlM = rawLine.match(clipRefRe);
+      if (!urlM) continue;
+      const nM = rawLine.match(/^\s*(\d{1,2})\s*[.)|:\-]/);
+      const headline = rawLine.split("|").map((f) => f.trim())
+        .find((f) => f.length > 0 && !isClipRef(f) && !/^\d{1,2}$/.test(f)) ?? "";
+      picks.push({ idx: nM ? parseInt(nM[1]!, 10) : null, url: urlM[0], headline: headline.slice(0, 120) });
+      if (picks.length >= 8) break;
+    }
+    if (picks.length < 2) {
+      toast({ title: "Couldn't read the clips", description: "Paste CLIPS lines like  1 | https://x.com/i/status/… | Headline", variant: "destructive" });
+      return;
+    }
+    const items = picks.map((p, i) => {
+      const beat = (p.idx != null ? storyBeats.find((b) => b.n === p.idx) : undefined) ?? storyBeats[i];
+      const line = beat ? beat.line : "";
+      return { url: p.url, sourceChannel: "", headline: (p.headline || line.split(/[.!?]/)[0]!).slice(0, 120), narrationLine: line };
+    }).filter((it) => it.narrationLine);
+    if (items.length < 2) {
+      toast({ title: "Clips didn't line up with the script", description: "Paste one CLIPS line per script beat, in order.", variant: "destructive" });
+      return;
+    }
 
     setMs2Loading(true);
     try {
@@ -1677,10 +1742,121 @@ https://www.reddit.com/r/soccer/comments/abc/ | r/soccer | He Curls It In | It b
         headline: b.headline ?? "", narrationLine: b.narrationLine ?? "", localFile: b.localFile, sourceType: "local", thumbUrl: b.thumbUrl ?? undefined, verify: null,
       }));
       setMs2Beats(beats);
-      setMs2Narration(timelineNarration);
-      setMs2ClaudePaste("");
-      const voiced = beats.filter((b) => (b.narrationLine ?? "").trim().length > 0).length;
-      toast({ title: `${beats.length} clips downloaded`, description: voiced ? `${voiced} beats have their own narration line — review the montage below, then Enqueue.` : "Review the montage + timeline narration below, then Enqueue." });
+      setMs2Narration("");
+      setClipPicksPaste("");
+      toast({ title: `${beats.length} clips downloaded`, description: "Your script is set as the narration — review the montage below, then Enqueue." });
+    } catch (e) {
+      toast({ title: e instanceof Error ? e.message : "Couldn't fetch the clips", variant: "destructive" });
+    } finally {
+      setMs2Loading(false);
+    }
+  }
+
+  // One-shot Research-first Story — STEP 1: copy a single prompt that makes Claude research the match
+  // on the web, find + verify one clip per beat with the Scout connector, AND write the narration
+  // inline. Output = TITLE + SEGMENTS (url | channel | headline | narration). Run in the Claude app
+  // with web search AND the Scout connector ON.
+  async function copyStoryOneShotPrompt() {
+    const topic = ms2Topic.trim() || `<match + the specific angle, e.g. "France vs Morocco — Mbappé's redemption after the missed penalty">`;
+    const prompt =
+`ROLE: World-class football short-form researcher + story director. Build ONE vertical narrated montage as a single dramatic arc (hook → escalation → payoff).
+
+MATCH / TOPIC: ${topic}
+
+LENGTH: Finished video 60–90s. Total runtime = sum of narration lines. Budget 150–220 spoken words across all beats.
+
+TOOLS — Clip Studio Scout (use in this order):
+- list_platforms first as a connectivity check.
+- search_clips with narrow player + action + scoreline queries (these beat broad topic searches). One search per beat/moment I need — don't combine.
+- understand_video on the top candidate for EACH beat before committing. Transcript is the key signal; reject anything music-only, silent, low-motion, blurry, zoomed-logo, or ambiguous. Prefer Reddit clips at 720p with real commentary.
+
+BEFORE WRITING THE SCRIPT — footage-gap check (do this early, not at the end):
+- Tell me which beats have a verified clip and which don't.
+- If any beat can't be filled with a clip that literally shows that moment, STOP and show me the gap + the verified vs missing list. Don't pad with mismatched footage, don't reuse one clip across 3 beats to fake an arc, and don't invent URLs.
+- If total verified runtime can't clear 60s, say so up front and give me the choice: (a) cut a shorter honest version now, (b) I re-run when more clips post, or (c) fall back to the official highlight.
+
+METHOD: Pick ONE throughline; every clip serves it. 4–8 beats in play order — beat 1 = most curiosity-grabbing hook, middle beats escalate cause→effect, final beat = the payoff/answer, never buried. Each clip must show the exact moment its narration describes.
+
+NARRATION: One short storyteller line per beat — calm, specific (names + numbers), cause→effect, light tension, most beats ending on a curiosity gap. The footage is muted, so narration carries the whole story. Not hype play-by-play; advance the story, don't just describe the screen.
+
+OUTPUT — exactly this, nothing else, one line per beat in play order:
+TITLE: <4-7 word title>
+SEGMENTS:
+<real clip url from search_clips> | <channel/handle> | <on-screen headline, 3-6 words> | <narration line>`;
+    const ok = await copyTextToClipboard(prompt);
+    toast(ok
+      ? { title: "Story prompt copied", description: "Run it in the Claude app (web search + Scout connector ON), then paste Claude's TITLE + SEGMENTS reply below." }
+      : { title: "Copy failed", variant: "destructive" });
+  }
+
+  // Parse a one-shot reply's SEGMENTS lines into {url, channel, headline, narration}. Robust to a
+  // glued "TITLE: … SEGMENTS: <beat1>" first line: a line is a beat IFF it carries a clip ref (header
+  // lines have none → skipped by the no-url guard, so beat 1 is never eaten). Narration = 4th field,
+  // capped at 600 (long beats stay intact). Shared by the live word count + apply.
+  function parseOneShotSegments(raw: string) {
+    const text = raw.replace(/[​‌‍﻿⁠]/g, "");
+    // A clip reference is a normal http(s) URL OR an uploads path from download_clip / extract_segment.
+    const clipRefRe = /(?:https?:\/\/[^\s|]+|\/[^\s|]*\/uploads\/[^\s|]+)/i;
+    const isClipRef = (f: string) => clipRefRe.test(f);
+    const items: { url: string; sourceChannel: string; headline: string; narrationLine: string }[] = [];
+    for (const rawLine of text.split(/\r?\n/)) {
+      const urlM = rawLine.match(clipRefRe);
+      if (!urlM) continue; // header/blank lines carry no clip ref
+      const fields = rawLine.split("|").map((f) => f.trim());
+      const urlIdx = fields.findIndex((f) => isClipRef(f));
+      // The non-url, non-numeric fields in order: [channel, headline, narration].
+      const rest = fields.filter((f, i) => i !== urlIdx && f.length > 0 && !/^\d{1,2}$/.test(f));
+      const channel = rest[0] ?? "";
+      const narration = (rest[rest.length - 1] ?? "").slice(0, 600);
+      const headline = rest.length >= 3 ? rest[rest.length - 2]! : "";
+      items.push({
+        url: urlM[0],
+        sourceChannel: channel.slice(0, 80),
+        headline: (headline || narration.split(/[.!?]/)[0] || "").slice(0, 120),
+        narrationLine: narration,
+      });
+      if (items.length >= 8) break;
+    }
+    return items.filter((it) => it.narrationLine.trim().length > 0);
+  }
+
+  // One-shot Research-first Story — STEP 2: parse Claude's single reply (TITLE -> topic; each SEGMENTS
+  // line's 4th field = Claude's narration), verify the narration clears the ~150-word floor, then
+  // download each url via /scout/fetch-urls and fill the montage — same path as applyClipPicks.
+  async function applyStoryOneShotPaste() {
+    const text = storyOneShotPaste.replace(/[​‌‍﻿⁠]/g, "");
+    // Title stops at SEGMENTS so a glued "TITLE: … SEGMENTS: …" first line doesn't pollute the topic.
+    const titleMatch = text.match(/TITLE\s*:\s*([^\n]*?)(?:\s*SEGMENTS\s*:|$)/im);
+    if (titleMatch && titleMatch[1].trim()) setMs2Topic(titleMatch[1].trim().slice(0, 120));
+    const usable = parseOneShotSegments(text);
+    if (usable.length < 2) {
+      toast({ title: "Couldn't read the segments", description: "Paste SEGMENTS lines like  https://reddit.com/… | r/soccer | Headline | Narration line", variant: "destructive" });
+      return;
+    }
+    const totalWords = usable.reduce((a, it) => a + countWords(it.narrationLine), 0);
+    const secs = Math.round(totalWords / 2.4);
+    if (totalWords < 150) {
+      toast({ title: `Narration too short — ~${totalWords} words ≈ ${secs}s`, description: "A 60-90s Story needs ~150-220 words across the beats. Ask Claude for fuller narration lines.", variant: "destructive" });
+      return;
+    }
+
+    setMs2Loading(true);
+    try {
+      const r = await fetch(`${API_BASE}/api/scout/fetch-urls`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items: usable }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error ?? "Couldn't fetch the clips");
+      const beats: MatchSeg[] = (data.beats ?? []).map((b: any) => ({
+        youtubeUrl: "", startTime: b.startTime, endTime: b.endTime, sourceChannel: b.sourceChannel ?? "",
+        headline: b.headline ?? "", narrationLine: b.narrationLine ?? "", localFile: b.localFile, sourceType: "local", thumbUrl: b.thumbUrl ?? undefined, verify: null,
+      }));
+      if (beats.length < 2) throw new Error(`Only ${beats.length} clip(s) downloaded — the rest may be full-highlight URLs or blocked. Ask Claude to extract_segment those and paste the clip path.`);
+      setMs2Beats(beats);
+      setMs2Narration("");
+      setStoryOneShotPaste("");
+      toast({ title: `${beats.length} clips · ~${totalWords} words ≈ ${secs}s`, description: "Claude's narration is set per beat — review the montage below, then Enqueue." });
     } catch (e) {
       toast({ title: e instanceof Error ? e.message : "Couldn't fetch the clips", variant: "destructive" });
     } finally {
@@ -2995,12 +3171,42 @@ https://www.reddit.com/r/soccer/comments/abc/ | r/soccer | He Curls It In | It b
                     <Input placeholder="e.g. Messi free kick goal" value={ms2Topic} onChange={(e) => setMs2Topic(e.target.value)} className="text-sm bg-background" />
                   </div>
 
-                  <div className="rounded-xl border border-[#9b7bff]/30 bg-gradient-to-b from-[#9b7bff]/[0.08] to-[#9b7bff]/[0.02] p-4 space-y-2.5">
-                    <div className="flex items-center gap-1.5"><Sparkles className="w-3.5 h-3.5 text-[#9b7bff]" /><span className="text-[10.5px] font-mono uppercase tracking-[0.1em] text-[#c9b8ff]">Research with Claude — Reddit · X · Instagram · Facebook</span></div>
-                    <p className="text-[11px] text-muted-foreground">Copy the prompt → run it in the Claude app (with the Clip Studio connector on). Claude searches + watches real clips, then hands back the story. Paste its reply here and it auto-downloads the clips.</p>
-                    <button type="button" onClick={copyMs2ClaudePrompt} className="text-[11px] font-mono uppercase tracking-[0.08em] px-3 h-8 rounded-md bg-[#9b7bff]/15 border border-[#9b7bff]/30 text-[#c9b8ff] hover:bg-[#9b7bff]/25 transition-colors inline-flex items-center gap-1.5"><SendHorizonal className="w-3 h-3" /> Copy Claude prompt</button>
-                    <Textarea value={ms2ClaudePaste} onChange={(e) => setMs2ClaudePaste(e.target.value)} placeholder={"Paste Claude's reply:\nTITLE: …\nSEGMENTS:\nhttps://x.com/i/status/… | @handle | Headline\nNARRATION:\n0 | Ninety-third minute…"} className="text-sm bg-background font-mono min-h-[110px]" />
-                    <button type="button" onClick={applyMs2ClaudePaste} disabled={ms2Loading || !ms2ClaudePaste.trim()} className="text-[11px] font-mono uppercase tracking-[0.08em] px-3 h-9 rounded-md border border-[#9b7bff]/40 text-[#c9b8ff] hover:bg-[#9b7bff]/15 disabled:opacity-40 transition-colors inline-flex items-center gap-1.5">{ms2Loading ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Downloading clips…</> : <>Load &amp; download clips</>}</button>
+                  <div className="rounded-xl border border-[#9b7bff]/30 bg-gradient-to-b from-[#9b7bff]/[0.08] to-[#9b7bff]/[0.02] p-4 space-y-3">
+                    <div className="flex items-center gap-1.5"><Sparkles className="w-3.5 h-3.5 text-[#9b7bff]" /><span className="text-[10.5px] font-mono uppercase tracking-[0.1em] text-[#c9b8ff]">Research-first Story — one prompt, one paste</span></div>
+                    <p className="text-[11px] text-muted-foreground">One trip to Claude: it researches the match, finds + verifies one clip per beat with the Scout connector, and writes the narration inline. Turn ON <b>web search</b> AND the <b>Scout connector</b>, then paste its <span className="font-mono">TITLE + SEGMENTS</span> reply.</p>
+                    <p className="text-[10.5px] text-muted-foreground/70">Tip: put the <b>angle</b> in your topic (e.g. "Mbappé's redemption", not just "France vs Morocco"), and run it <b>24–48h after</b> the match so the clips have posted.</p>
+                    <button type="button" onClick={copyStoryOneShotPrompt} className="text-[11px] font-mono uppercase tracking-[0.08em] px-3 h-8 rounded-md bg-[#9b7bff]/15 border border-[#9b7bff]/30 text-[#c9b8ff] hover:bg-[#9b7bff]/25 transition-colors inline-flex items-center gap-1.5"><SendHorizonal className="w-3 h-3" /> Copy prompt</button>
+                    <Textarea value={storyOneShotPaste} onChange={(e) => setStoryOneShotPaste(e.target.value)} placeholder={"Paste Claude's reply:\nTITLE: …\nSEGMENTS:\nhttps://reddit.com/… | r/soccer | Headline | Narration line\n…"} className="text-sm bg-background font-mono min-h-[120px]" />
+                    {storyOneShotPaste.trim() && (() => { const segs = parseOneShotSegments(storyOneShotPaste); if (segs.length === 0) return null; const w = segs.reduce((a, it) => a + countWords(it.narrationLine), 0); const ok = w >= 150; return (
+                      <p className={`text-[11px] font-mono ${ok ? "text-emerald-400" : "text-amber-400"}`}>{ok ? "✓" : "⚠"} {segs.length} beats · ~{w} words · ≈{Math.round(w / 2.4)}s{ok ? "" : " · needs ≥150 words"}</p>
+                    ); })()}
+                    <button type="button" onClick={applyStoryOneShotPaste} disabled={ms2Loading || !storyOneShotPaste.trim()} className="text-[11px] font-mono uppercase tracking-[0.08em] px-3 h-9 rounded-md border border-[#9b7bff]/40 text-[#c9b8ff] hover:bg-[#9b7bff]/15 disabled:opacity-40 transition-colors inline-flex items-center gap-1.5">{ms2Loading ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Downloading clips…</> : <>Load &amp; download clips</>}</button>
+                  </div>
+
+                  <div className="rounded-xl border border-[#9b7bff]/30 bg-gradient-to-b from-[#9b7bff]/[0.08] to-[#9b7bff]/[0.02] p-4 space-y-4">
+                    <div className="flex items-center gap-1.5"><Sparkles className="w-3.5 h-3.5 text-[#9b7bff]" /><span className="text-[10.5px] font-mono uppercase tracking-[0.1em] text-[#c9b8ff]">Script-first Story — write the script, then match clips</span></div>
+                    <p className="text-[11px] text-muted-foreground">Two trips to Claude: <b>Step 1</b> it researches the topic on the web and writes the full ~1-minute script; <b>Step 2</b> it finds one clip for each line. This keeps the story a real minute long and in simple words.</p>
+
+                    {/* Step 1 — get + lock the script */}
+                    <div className="space-y-2">
+                      <div className="text-[10px] font-mono uppercase tracking-[0.1em] text-[#c9b8ff]/80">Step 1 · Get the script <span className="text-muted-foreground/40 normal-case">(Claude web search ON)</span></div>
+                      <button type="button" onClick={copyStoryScriptPrompt} className="text-[11px] font-mono uppercase tracking-[0.08em] px-3 h-8 rounded-md bg-[#9b7bff]/15 border border-[#9b7bff]/30 text-[#c9b8ff] hover:bg-[#9b7bff]/25 transition-colors inline-flex items-center gap-1.5"><SendHorizonal className="w-3 h-3" /> Copy script prompt</button>
+                      <Textarea value={storyScriptPaste} onChange={(e) => setStoryScriptPaste(e.target.value)} placeholder={"Paste Claude's script:\nTITLE: …\nSCRIPT:\n1. …\n2. …"} className="text-sm bg-background font-mono min-h-[120px]" />
+                      <button type="button" onClick={applyStoryScript} disabled={!storyScriptPaste.trim()} className="text-[11px] font-mono uppercase tracking-[0.08em] px-3 h-9 rounded-md border border-[#9b7bff]/40 text-[#c9b8ff] hover:bg-[#9b7bff]/15 disabled:opacity-40 transition-colors">Use this script</button>
+                      {storyBeats.length > 0 && (() => { const w = storyBeats.reduce((a, b) => a + countWords(b.line), 0); return (
+                        <p className="text-[11px] font-mono text-emerald-400">✓ {storyBeats.length} beats · ~{w} words · ≈{Math.round(w / 2.4)}s</p>
+                      ); })()}
+                    </div>
+
+                    {/* Step 2 — only unlocks once a valid script is loaded */}
+                    {storyBeats.length >= 4 && (
+                      <div className="space-y-2 pt-3 border-t border-[#9b7bff]/15">
+                        <div className="text-[10px] font-mono uppercase tracking-[0.1em] text-[#c9b8ff]/80">Step 2 · Find a clip per beat <span className="text-muted-foreground/40 normal-case">(Scout connector ON)</span></div>
+                        <button type="button" onClick={copyClipFindingPrompt} className="text-[11px] font-mono uppercase tracking-[0.08em] px-3 h-8 rounded-md bg-[#9b7bff]/15 border border-[#9b7bff]/30 text-[#c9b8ff] hover:bg-[#9b7bff]/25 transition-colors inline-flex items-center gap-1.5"><SendHorizonal className="w-3 h-3" /> Copy clip-finding prompt</button>
+                        <Textarea value={clipPicksPaste} onChange={(e) => setClipPicksPaste(e.target.value)} placeholder={"Paste Claude's clips:\nCLIPS:\n1 | https://x.com/i/status/… | Headline\n2 | …"} className="text-sm bg-background font-mono min-h-[100px]" />
+                        <button type="button" onClick={applyClipPicks} disabled={ms2Loading || !clipPicksPaste.trim()} className="text-[11px] font-mono uppercase tracking-[0.08em] px-3 h-9 rounded-md border border-[#9b7bff]/40 text-[#c9b8ff] hover:bg-[#9b7bff]/15 disabled:opacity-40 transition-colors inline-flex items-center gap-1.5">{ms2Loading ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Downloading clips…</> : <>Load &amp; download clips</>}</button>
+                      </div>
+                    )}
                   </div>
 
                   <div className="flex items-center gap-2 text-[10px] font-mono uppercase tracking-[0.14em] text-muted-foreground/50">

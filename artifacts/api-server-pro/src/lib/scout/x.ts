@@ -69,7 +69,9 @@ export const xAdapter: ScoutAdapter = {
     if (!cookie) return [];
     const limit = Math.min(100, opts.maxPerPlatform ?? 100);
     const q = encodeURIComponent(`${topic} filter:native_video`);
-    const url = `https://x.com/search?q=${q}&f=top`;
+    // f=live = "Latest" (freshest-first) for a day-of montage; f=top = most-engaged otherwise.
+    const feed = opts.maxAgeHours ? "live" : "top";
+    const url = `https://x.com/search?q=${q}&f=${feed}`;
     const gdl = findGalleryDl();
 
     const json = await new Promise<string>((resolve) => {

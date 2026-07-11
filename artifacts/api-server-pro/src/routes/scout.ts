@@ -8,7 +8,7 @@ import type { Platform, ScoutJob, ScoutOptions } from "../lib/scout/types";
 import { logger } from "../lib/logger";
 
 const router: IRouter = Router();
-const ALL_PLATFORMS: Platform[] = ["reddit", "x", "instagram", "facebook"];
+const ALL_PLATFORMS: Platform[] = ["reddit", "x", "instagram", "facebook", "youtube"];
 
 // Strip filesystem paths from a job before returning it; expose a thumbUrl instead.
 function publicJob(job: ScoutJob) {
@@ -32,21 +32,24 @@ function publicJob(job: ScoutJob) {
       reasons: c.reasons,
       status: c.status,
       thumbUrl: c.thumbnail ?? null,
+      createdAt: c.createdAt > 0 ? c.createdAt : null, // unix seconds (null = unknown, e.g. YT flat search)
     })),
   };
 }
 
 // POST /scout — start a scout run.
 router.post("/scout", (req, res): void => {
-  const body = req.body as { topic?: string; platforms?: string[]; subreddits?: string[]; maxCandidates?: number };
+  const body = req.body as { topic?: string; platforms?: string[]; subreddits?: string[]; maxCandidates?: number; maxAgeHours?: number };
   const topic = (body.topic ?? "").trim();
   if (topic.length < 2) { res.status(400).json({ error: "Enter a topic to scout for." }); return; }
   const platforms = (Array.isArray(body.platforms) ? body.platforms : ALL_PLATFORMS).filter((p): p is Platform => (ALL_PLATFORMS as string[]).includes(p));
+  const maxAgeHours = Number(body.maxAgeHours);
   const opts: ScoutOptions = {
     platforms: platforms.length ? platforms : ["reddit"],
     subreddits: Array.isArray(body.subreddits) ? body.subreddits.slice(0, 6).map(String) : undefined,
     maxCandidates: Math.min(200, Math.max(10, Number(body.maxCandidates) || 40)),
     maxPerPlatform: 100,
+    maxAgeHours: Number.isFinite(maxAgeHours) && maxAgeHours > 0 ? maxAgeHours : undefined,
   };
   const job = startScout(topic, opts);
   logger.info({ jobId: job.id, topic, platforms: opts.platforms }, "Scout started");

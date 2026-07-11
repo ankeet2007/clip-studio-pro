@@ -13,7 +13,7 @@ import os from "os";
 import path from "path";
 import { execFile } from "child_process";
 import { promisify } from "util";
-import { downloadSocialClip, downloadHlsClip } from "./clipProcessor";
+import { downloadSocialClip, downloadHlsClip, getUploadsDir, downloadYouTubeSegment } from "./clipProcessor";
 import { cookieFileFor, cookieHeaderFor } from "./scout/config";
 import { logger } from "./logger";
 
@@ -30,7 +30,7 @@ const WHISPER_MODEL = process.env["UNDERSTAND_WHISPER_MODEL"] || path.join(HOME,
 const TRANSCRIBE_CAP_SEC = 60; // only transcribe the first minute — bounds whisper time on long clips
 const OVERALL_BUDGET_MS = 55_000;
 
-export type UnderstandPlatform = "reddit" | "x" | "instagram" | "facebook";
+export type UnderstandPlatform = "reddit" | "x" | "instagram" | "facebook" | "youtube" | "local";
 
 export interface VideoUnderstanding {
   platform: UnderstandPlatform;
@@ -42,6 +42,12 @@ export interface VideoUnderstanding {
   transcriptTruncated: boolean;
   frames: { dataBase64: string; mimeType: string }[];
   notes: string[];
+  // Absolute scene-change timecodes (seconds) detected in the analysed window — real in/out
+  // anchors for extract_segment. Empty when the pass was skipped/failed or the clip is static.
+  scenes: number[];
+  // The window actually analysed (for a long-video windowed scan); [0, durationSec] otherwise.
+  windowStart: number;
+  windowEnd: number;
 }
 
 export function detectPlatform(url: string): UnderstandPlatform | null {
@@ -56,7 +62,39 @@ export function detectPlatform(url: string): UnderstandPlatform | null {
   if (host === "x.com" || host.endsWith(".x.com") || host.endsWith("twitter.com") || host === "t.co") return "x";
   if (host.endsWith("instagram.com")) return "instagram";
   if (host.endsWith("facebook.com") || host === "fb.watch" || host === "fb.me") return "facebook";
+  if (host.endsWith("youtube.com") || host === "youtu.be" || host === "youtube-nocookie.com") return "youtube";
   return null;
+}
+
+/** True when `src` is an EXISTING file inside the uploads dir — a clip already fetched by
+ *  download_clip. Confined to uploads (matches the render pipeline's sanitizeMatchSegments guard)
+ *  so a caller can never point us at an arbitrary path on the box. */
+export function localUploadPath(src: string): string | null {
+  try {
+    const resolved = path.resolve(src);
+    const uploads = getUploadsDir();
+    if ((resolved === uploads || resolved.startsWith(uploads + path.sep)) && fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
+      return resolved;
+    }
+  } catch { /* not a path */ }
+  return null;
+}
+
+/** Accept seconds ("12.5") or HH:MM:SS / MM:SS and return seconds. */
+export function parseTimecode(v: string | number): number {
+  if (typeof v === "number") return Math.max(0, v);
+  const s = String(v).trim();
+  if (/^\d+(\.\d+)?$/.test(s)) return Math.max(0, parseFloat(s));
+  const parts = s.split(":").map((p) => parseFloat(p));
+  if (parts.some((n) => !Number.isFinite(n))) return NaN;
+  let sec = 0;
+  for (const p of parts) sec = sec * 60 + p;
+  return Math.max(0, sec);
+}
+
+function toHMS(sec: number): string {
+  const t = Math.max(0, Math.round(sec));
+  return [Math.floor(t / 3600), Math.floor((t % 3600) / 60), t % 60].map((n) => String(n).padStart(2, "0")).join(":");
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
@@ -108,27 +146,99 @@ async function downloadReddit(url: string, out: string): Promise<void> {
  *  Shared by understand_video AND Match Story 2.0's paste-and-render (buildBeatsFromUrls). */
 export async function downloadSocialUrl(url: string, out: string): Promise<UnderstandPlatform> {
   const platform = detectPlatform(url);
-  if (!platform) throw new Error("Unsupported URL. Provide a Reddit, X/Twitter, Instagram or Facebook video link.");
+  if (!platform) throw new Error("Unsupported URL. Provide a Reddit, X/Twitter, Instagram, Facebook or YouTube video link.");
   if (platform === "reddit") await downloadReddit(url, out);
+  // YouTube has no per-platform scout cookie file; downloadSocialClip falls back to the
+  // YOUTUBE_COOKIES env cookies (restored at boot) when cookieFileFor returns undefined.
   else await downloadSocialClip(url, out, cookieFileFor(platform));
   return platform;
 }
 
-// Detect scene-change timestamps with ONE fast, low-res, time-capped decode pass. Scaling to a
-// tiny size makes the decode cheap on the weak phone CPU, and the pts_time is the SOURCE timestamp
-// so downscaling doesn't move it. Best-effort — any failure/timeout yields [] (→ evenly-spaced).
-async function sceneTimestamps(file: string, duration: number, budgetMs: number): Promise<number[]> {
+/** download_clip: fetch the REAL file to the persistent uploads dir and return its path + metadata,
+ *  so a verified clip lands in the render pipeline (uploads/ is the only dir the renderer reads).
+ *  Long sources (a full YouTube highlight) are allowed a generous budget — the caller runs this as
+ *  an async media-job so the connector's request never blocks on it. */
+export async function downloadClipToUploads(url: string): Promise<{ path: string; platform: UnderstandPlatform; durationSec: number; width?: number; height?: number; hasAudio: boolean }> {
+  const platform = detectPlatform(url);
+  if (!platform) throw new Error("Unsupported URL. Provide a Reddit, X/Twitter, Instagram, Facebook or YouTube video link.");
+  const uploads = getUploadsDir();
+  const out = path.join(uploads, `clip_dl_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.mp4`);
   try {
+    await withTimeout(downloadSocialUrl(url, out), 12 * 60_000, "Download");
+    const meta = await probe(out);
+    if (!meta.duration) { try { fs.unlinkSync(out); } catch { /**/ } throw new Error("Downloaded file is unreadable (0s) — the platform cookie may be missing/expired."); }
+    return { path: out, platform, durationSec: meta.duration, width: meta.width, height: meta.height, hasAudio: meta.hasAudio };
+  } catch (e) {
+    try { fs.existsSync(out) && fs.unlinkSync(out); } catch { /**/ }
+    throw e;
+  }
+}
+
+/** extract_segment: cut [start,end] out of a source into a NEW uploads file, returning its path +
+ *  real duration — the exact beat (e.g. "the 3.5s where Dembélé strikes"). Three sources:
+ *   • a local uploads path (a clip already fetched by download_clip) → fast ffmpeg stream-copy;
+ *   • a YouTube URL → yt-dlp --download-sections (downloads ONLY the window, HD-floored);
+ *   • any other social URL → download the whole clip to temp, then stream-copy the window. */
+export async function extractSegment(src: string, start: string | number, end: string | number): Promise<{ path: string; durationSec: number }> {
+  const startSec = parseTimecode(start);
+  const endSec = parseTimecode(end);
+  if (!Number.isFinite(startSec) || !Number.isFinite(endSec)) throw new Error("start/end must be seconds or HH:MM:SS.");
+  if (endSec <= startSec) throw new Error("end must be after start.");
+  const dur = endSec - startSec;
+  const uploads = getUploadsDir();
+  const out = path.join(uploads, `clip_seg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.mp4`);
+
+  const local = localUploadPath(src);
+  try {
+    if (local) {
+      // Stream-copy trim (input-seek is fast; -c copy snaps to the nearest keyframe — fine for B-roll).
+      await execFileAsync("ffmpeg", ["-y", "-ss", String(startSec), "-i", local, "-t", String(dur), "-c", "copy", "-movflags", "+faststart", out], { timeout: 300_000 });
+    } else {
+      const platform = detectPlatform(src);
+      if (!platform) throw new Error("Unsupported source. Provide an uploads path (from download_clip) or a Reddit/X/Instagram/Facebook/YouTube URL.");
+      if (platform === "youtube") {
+        await withTimeout(downloadYouTubeSegment(src, toHMS(startSec), toHMS(endSec), out), 12 * 60_000, "Segment download");
+      } else {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "extract_"));
+        const tmp = path.join(tmpDir, "src.mp4");
+        try {
+          await withTimeout(downloadSocialUrl(src, tmp), 5 * 60_000, "Download");
+          await execFileAsync("ffmpeg", ["-y", "-ss", String(startSec), "-i", tmp, "-t", String(dur), "-c", "copy", "-movflags", "+faststart", out], { timeout: 300_000 });
+        } finally {
+          try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /**/ }
+        }
+      }
+    }
+    const meta = await probe(out);
+    if (!meta.duration) { try { fs.unlinkSync(out); } catch { /**/ } throw new Error("Extracted segment is empty — check the start/end are within the clip."); }
+    return { path: out, durationSec: meta.duration };
+  } catch (e) {
+    try { fs.existsSync(out) && fs.unlinkSync(out); } catch { /**/ }
+    throw e;
+  }
+}
+
+// Detect scene-change timestamps with ONE fast, low-res, time-capped decode pass over the window
+// [winStart, winStart+scanLen]. Scaling to a tiny size makes the decode cheap on the weak phone CPU.
+// When winStart>0 we input-seek (-ss before -i), which resets output pts to ~0 at the seek point,
+// so we add winStart back to recover the true SOURCE timecode (accurate to within a keyframe — good
+// enough to anchor an extract_segment; Claude confirms the exact moment from the keyframes).
+// Best-effort — any failure/timeout yields [] (→ evenly-spaced frames).
+async function sceneTimestamps(file: string, winStart: number, scanLen: number, budgetMs: number): Promise<number[]> {
+  try {
+    const preArgs = winStart > 0 ? ["-ss", String(winStart)] : [];
     const { stderr } = await execFileAsync("ffmpeg", [
-      "-t", String(Math.min(45, Math.max(1, Math.ceil(duration) || 45))), "-i", file, "-an",
+      ...preArgs,
+      "-t", String(Math.max(1, Math.ceil(scanLen) || 1)), "-i", file, "-an",
       "-vf", "scale=192:-2,select='gt(scene,0.30)',showinfo", "-f", "null", "-",
     ], { timeout: budgetMs, maxBuffer: 16 * 1024 * 1024 });
     const ts: number[] = [];
     const re = /pts_time:([0-9.]+)/g;
     let m: RegExpExecArray | null;
+    const winEnd = winStart + scanLen;
     while ((m = re.exec(stderr)) !== null) {
-      const t = parseFloat(m[1]!);
-      if (Number.isFinite(t) && t >= 0 && t <= duration) ts.push(t);
+      const t = winStart + parseFloat(m[1]!);
+      if (Number.isFinite(t) && t >= winStart - 0.05 && t <= winEnd + 0.5) ts.push(Math.round(t * 100) / 100);
     }
     return ts;
   } catch {
@@ -140,12 +250,12 @@ async function sceneTimestamps(file: string, duration: number, budgetMs: number)
 // n equal windows and, per window, take the scene-cut nearest its centre when there is one, else
 // the window centre. Guarantees coverage of the setup (first window) and the result (last window)
 // while landing frames on the moments where something actually changes on screen.
-function pickFrameTimes(scenes: number[], duration: number, n: number): number[] {
-  if (duration <= 0) return [0];
+function pickFrameTimes(scenes: number[], winStart: number, winLen: number, n: number): number[] {
+  if (winLen <= 0) return [Math.max(0, winStart)];
   const times: number[] = [];
   for (let i = 0; i < n; i++) {
-    const lo = (i / n) * duration;
-    const hi = ((i + 1) / n) * duration;
+    const lo = winStart + (i / n) * winLen;
+    const hi = winStart + ((i + 1) / n) * winLen;
     const mid = (lo + hi) / 2;
     const inWin = scenes.filter((t) => t >= lo && t < hi).sort((a, b) => Math.abs(a - mid) - Math.abs(b - mid));
     times.push(inWin.length ? inWin[0]! : mid);
@@ -173,11 +283,13 @@ async function extractFramesAt(file: string, times: number[], dir: string): Prom
   return frames;
 }
 
-// Pull the first TRANSCRIBE_CAP_SEC of audio as 16kHz mono wav — the shared input for whichever
-// transcriber (cloud medium.en or local tiny.en) runs.
-async function extractWav(file: string, dir: string): Promise<string> {
+// Pull [winStart, winStart+winLen] of audio as 16kHz mono wav — the shared input for whichever
+// transcriber (cloud medium.en or local tiny.en) runs. Input-seek (-ss/-t before -i) so a windowed
+// scan of a long video only pulls its window.
+async function extractWav(file: string, dir: string, winStart: number, winLen: number): Promise<string> {
   const wav = path.join(dir, "audio.wav");
-  await execFileAsync("ffmpeg", ["-y", "-t", String(TRANSCRIBE_CAP_SEC), "-i", file, "-ar", "16000", "-ac", "1", "-vn", wav], { timeout: 20_000 });
+  const preArgs = winStart > 0 ? ["-ss", String(winStart)] : [];
+  await execFileAsync("ffmpeg", ["-y", ...preArgs, "-t", String(Math.max(1, Math.ceil(winLen))), "-i", file, "-ar", "16000", "-ac", "1", "-vn", wav], { timeout: 30_000 });
   return wav;
 }
 
@@ -235,41 +347,68 @@ async function cloudTranscribe(wav: string): Promise<string | null> {
   }
 }
 
-export async function understandVideo(url: string, maxFrames = 5): Promise<VideoUnderstanding> {
-  const platform = detectPlatform(url);
-  if (!platform) throw new Error("Unsupported URL. Provide a Reddit, X/Twitter, Instagram or Facebook video link.");
+// `src` is a social/YouTube URL (downloaded to temp, then deleted) OR a local uploads path from
+// download_clip (used in place, NOT deleted). `startSec`/`windowSec` scan just that WINDOW of a long
+// video — the moment-search primitive: walk a highlight window-by-window, read absolute scene cuts,
+// then extract_segment the exact beat.
+export async function understandVideo(src: string, maxFrames = 5, startSec?: number, windowSec?: number): Promise<VideoUnderstanding> {
+  const local = localUploadPath(src);
+  let platform: UnderstandPlatform;
+  if (local) {
+    platform = "local";
+  } else {
+    const p = detectPlatform(src);
+    if (!p) throw new Error("Unsupported source. Provide a Reddit, X/Twitter, Instagram, Facebook or YouTube URL — or an uploads path from download_clip.");
+    platform = p;
+  }
 
   const started = Date.now();
+  // Scratch dir for the wav / keyframe jpegs. For a URL the clip is downloaded into it (and the
+  // whole dir is removed in `finally`); for a local upload the source stays put — only scratch dies.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "understand_"));
-  const file = path.join(dir, "clip.mp4");
+  const file = local ?? path.join(dir, "clip.mp4");
   const notes: string[] = [];
   try {
-    await withTimeout(downloadSocialUrl(url, file), 40_000, "Download").catch((e) => {
-      throw new Error(`Couldn't download the clip (${e instanceof Error ? e.message : e}). The platform cookie may be missing or expired.`);
-    });
+    if (!local) {
+      await withTimeout(downloadSocialUrl(src, file), 60_000, "Download").catch((e) => {
+        throw new Error(`Couldn't download the clip (${e instanceof Error ? e.message : e}). The platform cookie may be missing or expired.`);
+      });
+    }
     const meta = await probe(file);
+    const dur = meta.duration;
+
+    // Analysis window: whole clip by default, or [startSec, startSec+windowSec] for a long-video scan.
+    const explicitWindow = startSec != null || windowSec != null;
+    const winStart = Math.max(0, Math.min(startSec ?? 0, Math.max(0, dur - 0.5)));
+    const winLen = explicitWindow ? Math.max(1, Math.min(windowSec ?? 90, Math.max(1, dur - winStart))) : dur;
+    if (explicitWindow) notes.push(`scanned window ${toHMS(winStart)}–${toHMS(winStart + winLen)} of a ${toHMS(dur)} source`);
 
     const n = Math.min(8, Math.max(1, maxFrames));
     // Find the action moments (scene cuts) with a fast, bounded pass — but only if enough of the
     // overall budget remains to still leave room for the transcript; otherwise fall back cleanly to
-    // evenly-spaced frames (scenes = []).
+    // evenly-spaced frames (scenes = []). Normal clips cap the scan at 45s (phone budget); an
+    // explicit window may scan up to 120s.
     let scenes: number[] = [];
-    if (meta.duration >= 3) {
+    if (dur >= 3) {
       const sceneBudget = Math.min(15_000, OVERALL_BUDGET_MS - (Date.now() - started) - 22_000);
-      if (sceneBudget >= 5000) scenes = await sceneTimestamps(file, meta.duration, sceneBudget);
+      if (sceneBudget >= 5000) {
+        const scanLen = explicitWindow ? Math.min(winLen, 120) : Math.min(winLen, 45);
+        scenes = await sceneTimestamps(file, winStart, scanLen, sceneBudget);
+      }
     }
-    const frames = meta.duration >= 2
-      ? await extractFramesAt(file, pickFrameTimes(scenes, meta.duration, n), dir)
-      : await extractFramesAt(file, [Math.max(0, meta.duration / 2)], dir);
+    const frames = dur >= 2
+      ? await extractFramesAt(file, pickFrameTimes(scenes, winStart, winLen, n), dir)
+      : await extractFramesAt(file, [Math.max(0, dur / 2)], dir);
     if (scenes.length >= 5) notes.push(`action-heavy: ${scenes.length} scene changes detected — the keyframes target those moments`);
-    else if (meta.duration > 6 && scenes.length <= 1) notes.push("low visual motion (few/no scene changes) — likely static, a talking-head, or a graphic; verify it shows real action before using");
+    else if (winLen > 6 && scenes.length <= 1) notes.push("low visual motion (few/no scene changes) — likely static, a talking-head, or a graphic; verify it shows real action before using");
 
     let transcript: string | null = null;
     let transcriptTruncated = false;
     if (meta.hasAudio) {
       try {
-        const wav = await extractWav(file, dir);
-        transcriptTruncated = meta.duration > TRANSCRIBE_CAP_SEC;
+        const wavLen = explicitWindow ? winLen : Math.min(TRANSCRIBE_CAP_SEC, dur || TRANSCRIBE_CAP_SEC);
+        const wav = await extractWav(file, dir, winStart, wavLen);
+        transcriptTruncated = !explicitWindow && dur > TRANSCRIBE_CAP_SEC;
         // Prefer the cloud worker's medium.en when the render cloud is on; else local tiny.en.
         const cloud = await cloudTranscribe(wav);
         if (cloud) {
@@ -281,7 +420,7 @@ export async function understandVideo(url: string, maxFrames = 5): Promise<Video
           if (budget >= 8000 && fs.existsSync(WHISPER_BIN) && fs.existsSync(WHISPER_MODEL)) {
             transcript = (await localTranscribe(wav, dir, budget)) || null;
           } else if (budget < 8000) {
-            notes.push("skipped transcript (download left too little time budget)");
+            notes.push("skipped transcript (too little time budget remained)");
           } else {
             notes.push("transcript unavailable (whisper not found on server)");
           }
@@ -292,8 +431,8 @@ export async function understandVideo(url: string, maxFrames = 5): Promise<Video
       }
     }
 
-    logger.info({ platform, duration: meta.duration, frames: frames.length, transcript: transcript ? transcript.length : 0 }, "understand: done");
-    return { platform, durationSec: meta.duration, width: meta.width, height: meta.height, hasAudio: meta.hasAudio, transcript, transcriptTruncated, frames, notes };
+    logger.info({ platform, duration: dur, window: explicitWindow ? [winStart, winLen] : null, frames: frames.length, scenes: scenes.length, transcript: transcript ? transcript.length : 0 }, "understand: done");
+    return { platform, durationSec: dur, width: meta.width, height: meta.height, hasAudio: meta.hasAudio, transcript, transcriptTruncated, frames, notes, scenes, windowStart: winStart, windowEnd: winStart + winLen };
   } finally {
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* */ }
   }

@@ -8,12 +8,13 @@ import path from "path";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import { getUploadsDir, downloadSocialClip, downloadHlsClip } from "../clipProcessor";
-import { downloadSocialUrl } from "../videoUnderstand";
+import { downloadSocialUrl, localUploadPath } from "../videoUnderstand";
 import { logger } from "../logger";
 import { redditAdapter } from "./reddit";
 import { xAdapter } from "./x";
 import { instagramAdapter } from "./instagram";
 import { facebookAdapter } from "./facebook";
+import { youtubeAdapter } from "./youtube";
 import { buildQueryPlan } from "./query";
 import { rankCandidates } from "./score";
 import { readScoutConfig, cookieFileFor, type ScoutConfig } from "./config";
@@ -23,7 +24,7 @@ const execFileAsync = promisify(execFile);
 
 // Registry — Reddit ships in Phase A; x/instagram/facebook adapters slot in behind the same
 // interface in later phases without touching this file's logic.
-const ADAPTERS: ScoutAdapter[] = [redditAdapter, xAdapter, instagramAdapter, facebookAdapter];
+const ADAPTERS: ScoutAdapter[] = [redditAdapter, xAdapter, instagramAdapter, facebookAdapter, youtubeAdapter];
 
 const jobs = new Map<string, ScoutJob>();
 
@@ -153,9 +154,11 @@ export async function buildBeatsFromJob(jobId: string): Promise<{ localFile: str
   return beats;
 }
 
-/** Match Story 2.0 (Claude-driven): download a PASTED list of reddit/x/ig/fb clip URLs (the beats
- * Claude picked via the MCP connector) into local Match Story beats. Each whole clip is one beat;
- * failed/too-long downloads are skipped. Mirrors buildBeatsFromJob but starts from bare URLs. */
+/** Match Story 2.0 (Claude-driven): turn a PASTED list of beats (the ones Claude picked via the MCP
+ * connector) into local Match Story beats. Each `url` is EITHER a social clip URL (downloaded whole)
+ * OR an uploads path already fetched/segmented by the connector's download_clip / extract_segment
+ * (used in place — the precise moment Claude cut). Each whole clip is one beat; failed/too-long
+ * downloads are skipped. Mirrors buildBeatsFromJob but starts from bare URLs/paths. */
 export async function buildBeatsFromUrls(items: { url: string; headline?: string; sourceChannel?: string; narrationLine?: string }[]): Promise<{ localFile: string; sourceType: "local"; startTime: string; endTime: string; headline: string; sourceChannel: string; narrationLine: string; thumbUrl: string | null }[]> {
   const uploads = getUploadsDir();
   const toHMS = (s: number) => {
@@ -165,19 +168,22 @@ export async function buildBeatsFromUrls(items: { url: string; headline?: string
   const beats: { localFile: string; sourceType: "local"; startTime: string; endTime: string; headline: string; sourceChannel: string; narrationLine: string; thumbUrl: string | null }[] = [];
   for (let i = 0; i < items.length && i < 8; i++) {
     const it = items[i]!;
-    const file = path.join(uploads, `ms2url_${Date.now()}_${i}.mp4`);
+    // A clip already downloaded/segmented via the connector → its `url` is an uploads path; use it
+    // directly (no re-download, and never delete it on reject — it's not ours to remove).
+    const preExisting = localUploadPath(it.url);
+    const file = preExisting ?? path.join(uploads, `ms2url_${Date.now()}_${i}.mp4`);
     try {
-      await downloadSocialUrl(it.url, file);
+      if (!preExisting) await downloadSocialUrl(it.url, file);
       const meta = await probeMedia(file);
-      if (meta.duration < 1 || meta.duration > 300) { try { fs.unlinkSync(file); } catch { /**/ } continue; }
+      if (meta.duration < 1 || meta.duration > 300) { if (!preExisting) { try { fs.unlinkSync(file); } catch { /**/ } } continue; }
       beats.push({
         localFile: file, sourceType: "local", startTime: "00:00:00", endTime: toHMS(meta.duration),
         headline: (it.headline ?? "").replace(/\s+/g, " ").slice(0, 80), sourceChannel: (it.sourceChannel ?? "").slice(0, 80),
-        narrationLine: (it.narrationLine ?? "").replace(/\s+/g, " ").slice(0, 240), thumbUrl: null,
+        narrationLine: (it.narrationLine ?? "").replace(/\s+/g, " ").slice(0, 600), thumbUrl: null,
       });
     } catch (e) {
       logger.warn({ e, url: it.url.slice(0, 80) }, "MS2 pasted-URL download failed");
-      try { fs.existsSync(file) && fs.unlinkSync(file); } catch { /**/ }
+      if (!preExisting) { try { fs.existsSync(file) && fs.unlinkSync(file); } catch { /**/ } }
     }
   }
   return beats;

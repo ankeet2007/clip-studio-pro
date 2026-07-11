@@ -106,17 +106,25 @@ export const redditAdapter: ScoutAdapter = {
     const limit = Math.min(100, opts.maxPerPlatform ?? 100);
     const q = encodeURIComponent(plan.primary);
 
+    // Freshness steering: for a day-of montage the penalty/heartbreak clips are hours old, so
+    // scope to recent windows; otherwise cast the evergreen year+all-time nets. `sort=new` on the
+    // tight window surfaces the just-posted threads first.
+    const windows: string[] = opts.maxAgeHours && opts.maxAgeHours <= 24 ? ["day", "week"]
+      : opts.maxAgeHours && opts.maxAgeHours <= 168 ? ["week", "month"]
+      : ["year", "all"];
+    const sortMode = opts.maxAgeHours ? "new" : "top";
+
     const urls: string[] = [];
-    // Subreddit-scoped searches (highest signal), across the last year and all-time so evergreen
-    // clips backfill toward the ~40 target.
+    // Subreddit-scoped searches (highest signal). Two time windows so results backfill toward the
+    // ~40 target (fresh windows when maxAgeHours is set, else last-year + all-time evergreen).
     for (const sub of plan.subreddits.slice(0, 5)) {
       const sr = `${base}/r/${encodeURIComponent(sub)}/search.json?q=${q}&restrict_sr=1&limit=${limit}&include_over_18=on`;
-      urls.push(`${sr}&sort=top&t=year`);
-      urls.push(`${sr}&sort=top&t=all`);
+      urls.push(`${sr}&sort=${sortMode}&t=${windows[0]}`);
+      urls.push(`${sr}&sort=${sortMode}&t=${windows[1]}`);
     }
-    // Site-wide nets (year + all-time) to catch clips outside the mapped subreddits.
-    urls.push(`${base}/search.json?q=${q}&sort=top&t=year&limit=${limit}&type=link`);
-    urls.push(`${base}/search.json?q=${q}&sort=top&t=all&limit=${limit}&type=link`);
+    // Site-wide nets to catch clips outside the mapped subreddits.
+    urls.push(`${base}/search.json?q=${q}&sort=${sortMode}&t=${windows[0]}&limit=${limit}&type=link`);
+    urls.push(`${base}/search.json?q=${q}&sort=${sortMode}&t=${windows[1]}&limit=${limit}&type=link`);
 
     const all: RawCandidate[] = [];
     const seen = new Set<string>();

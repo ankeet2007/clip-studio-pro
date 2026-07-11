@@ -3,67 +3,96 @@
 // be added as a custom connector in the Claude web/mobile app (Customize -> Connectors).
 //
 // Hand-rolled (no SDK dependency) because the build is dependency-constrained. Stateless: every
-// POST is self-contained, no Mcp-Session-Id, no server-initiated SSE. It only exposes SEARCH +
-// REVIEW tools that proxy the existing /api/scout endpoints in-process over localhost — it can
-// never download a clip or start a render, so exposing it publicly is low-risk.
+// POST is self-contained, no Mcp-Session-Id, no server-initiated SSE. It exposes SEARCH + REVIEW
+// tools (proxying /api/scout in-process) PLUS download_clip / extract_segment, which fetch/trim a
+// real file into the uploads dir so a verified clip lands in the render pipeline. Writes are
+// confined to the uploads dir (generated filenames); it still never TRIGGERS a render — the user
+// pastes the resulting plan/paths into Clip Studio to render.
 
 import { Router, type IRouter, type Request, type Response } from "express";
 import { logger } from "../lib/logger";
-import { understandVideo } from "../lib/videoUnderstand";
+import { understandVideo, downloadClipToUploads, extractSegment } from "../lib/videoUnderstand";
 
-const SERVER_INFO = { name: "clip-studio-scout", version: "1.0.0" };
+const SERVER_INFO = { name: "clip-studio-scout", version: "1.1.0" };
 // Protocol versions we understand; we echo the client's if it's one of these, else use the latest.
 const SUPPORTED_PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 const DEFAULT_PROTOCOL = "2025-06-18";
-const PLATFORMS = ["reddit", "x", "instagram", "facebook"] as const;
+const PLATFORMS = ["reddit", "x", "instagram", "facebook", "youtube"] as const;
 
 // The connector doubles as a STORY DIRECTOR: these instructions carry the whole method for
-// turning scattered social clips into one narrated "story" montage (Clip Studio's Match Story
-// 2.0). The render mutes each clip's own audio and speaks ONLY your narration, so the narration
-// alone must carry the story — and each clip must SHOW the exact moment its line describes.
+// turning scattered social clips (or one long official highlight) into one narrated "story"
+// montage (Clip Studio's Match Story 2.0). The render mutes each clip's own audio and speaks ONLY
+// your narration, so the narration alone must carry the story — and each clip must SHOW the exact
+// moment its line describes.
 const INSTRUCTIONS = [
-  "You are a story-driven narrator + director for short-form football/sports videos. Your tools",
-  "search Reddit, X (Twitter), Instagram and Facebook for real video clips (`search_clips`), and",
-  "WATCH a clip to see what actually happens in it (`understand_video` -> keyframes + transcript).",
-  "`list_platforms` shows usable platforms; `get_scout_results` re-polls a running search. Read-only",
-  "-- nothing is downloaded/rendered here; you hand the user a plan they paste into Clip Studio.",
+  "ROLE: World-class football/sports short-form researcher + story director. You build ONE vertical",
+  "narrated montage as a single dramatic arc (hook -> escalation -> payoff). The finished render mutes",
+  "every clip's own audio and speaks ONLY your AI voiceover, so the narration IS the story and the",
+  "clips play under it as muted B-roll cut to the narration.",
   "",
-  "GOAL: ONE tight vertical Short, 60-90 SECONDS (minimum 60, never over 90), where the AI VOICEOVER tells the",
-  "FULL story of what happened -- in detail, start to finish -- and the clips play UNDER it as short",
-  "background B-roll (auto-cut to the narration; clip audio is muted). The narration is the STAR; the",
-  "clips just show what is being described. Length = the narration length, so the narration must carry it.",
+  "TOOLS:",
+  "• list_platforms — connectivity check (which of reddit / x / instagram / facebook / youtube are usable).",
+  "• search_clips — search a platform for real clips (narrow player+action+scoreline queries beat broad",
+  "  ones; ONE search per beat/moment, don't combine). Pass maxAgeHours (e.g. 48) for a day-of match so",
+  "  you get the just-posted threads + YouTube's newest uploads, not evergreen classics.",
+  "• understand_video(url|uploadsPath, frames, startSec?, windowSec?) — WATCH a clip: keyframes +",
+  "  transcript + real scene-cut timecodes. Transcript is the KEY signal. For a LONG video (a full",
+  "  highlight) pass startSec/windowSec to scan just that window and get ABSOLUTE scene timecodes.",
+  "• download_clip(url) — download the REAL file into the render pipeline; returns an uploads path.",
+  "• extract_segment(url|uploadsPath, start, end) — cut EXACTLY [start,end] into a new uploads file",
+  "  (the precise beat, e.g. the 4s a goal is scored). start/end are seconds or HH:MM:SS. On a YouTube",
+  "  URL it downloads only that window; on an uploads path it trims the already-downloaded file.",
+  "• get_media_result(mediaJobId) — fetch a download_clip / extract_segment result that was still",
+  "  running (a full highlight can take a few minutes).",
   "",
-  "METHOD -- follow in order:",
-  "1. RESEARCH THE WHOLE STORY FIRST. Before writing anything, work out what ACTUALLY happened -- the",
-  "   full sequence: the setup, the key moments IN ORDER, the turning point, the result, the drama. Use",
-  "   `search_clips` to find footage and `understand_video` on SEVERAL clips (read their transcripts +",
-  "   see the frames) to gather the real facts from MULTIPLE sources: names, numbers, minute marks, the",
-  "   score, who did what. Do NOT start writing until you understand the complete story.",
-  "2. WRITE THE FULL NARRATION. Write ONE continuous narration that TELLS THE WHOLE STORY in detail --",
-  "   setup -> key moments in order -> turning point -> payoff. Storyteller voice: specific, names +",
-  "   numbers, cause->effect, a little tension. It must stand on its own (clips are muted). TARGET",
-  "   ~150-220 words TOTAL ~= 60-90 seconds spoken (never under 60s, never over 90s). This total IS the",
-  "   video length, so budget it deliberately -- enough detail to clear 60s, trimmed to stay under 90s --",
-  "   detailed but zero filler/hype padding.",
-  "3. SPLIT INTO BEATS + MATCH EACH TO A CLIP THAT ACTUALLY SHOWS IT. Break the narration into 5-8",
-  "   beats (one or two sentences each, in story order). For EACH beat you MUST call `understand_video`",
-  "   on your candidate and keep it ONLY IF its keyframes visibly show the exact action that beat",
-  "   describes (that specific goal / tackle / save / celebration). If the frames don't clearly show",
-  "   it, REJECT that clip and try another candidate -- never assign a clip you have not visually",
-  "   verified. Judge with the keyframes + the motion note + the transcript together; drop",
-  "   blurry / zoomed-logo / static / talking-head / ambiguous clips (the motion note flags these).",
-  "   Use a DIFFERENT clip per beat (no repeats) so the montage has variety and moves the story forward.",
+  "GOAL: ONE tight vertical Short, 60-90 SECONDS (min 60, never over 90). Total runtime = the sum of the",
+  "beat narration lines; budget ~150-220 spoken words across all beats.",
   "",
-  "OUTPUT -- when the user asks you to build it, return EXACTLY this and nothing else (fields separated",
-  "by ' | ', one line per beat, in story order):",
+  "METHOD — follow in order:",
+  "1. SET THE ANGLE. A match is not a story — pick ONE throughline (e.g. 'Mbappé's redemption', 'Morocco's",
+  "   dream dies again') and make every clip serve it. If the user didn't give an angle, choose the",
+  "   sharpest one.",
+  "2. RESEARCH THE WHOLE STORY FIRST. Work out what ACTUALLY happened — setup, key moments IN ORDER, the",
+  "   turning point, the result. Use search_clips + understand_video on SEVERAL clips (read transcripts +",
+  "   frames) to gather real facts from multiple sources: names, numbers, minute marks, the score.",
+  "3. FOOTAGE-GAP CHECK (do this EARLY, before writing the script). Tell the user which beats have a",
+  "   verified clip and which don't. If a beat can't be filled with a clip that LITERALLY shows that",
+  "   moment, STOP and show the verified-vs-missing list — do NOT pad with mismatched footage, reuse one",
+  "   clip across beats, or invent URLs. If total verified runtime can't clear 60s, say so and offer:",
+  "   (a) a shorter honest version now, (b) re-run in 24-48h once more clips post, or (c) fall back to the",
+  "   OFFICIAL YOUTUBE HIGHLIGHT: download_clip it, then understand_video with startSec/windowSec to walk",
+  "   it, and extract_segment each moment — one reliable source can supply the whole arc.",
+  "4. WRITE THE NARRATION. One short storyteller line per beat — calm, specific (names + numbers),",
+  "   cause->effect, light tension, most beats ending on a curiosity gap; beat 1 = the strongest hook,",
+  "   final beat = the payoff, never buried. SIMPLE everyday English a 12-13 year old understands — short",
+  "   punchy sentences, common words, NO rare/literary/formal vocabulary. It must stand on its own",
+  "   (clips are muted); advance the story, don't just describe the screen. 4-8 beats in play order.",
+  "5. VERIFY EVERY BEAT. For EACH beat, understand_video your candidate and keep it ONLY IF its keyframes",
+  "   visibly show the exact action the line describes. Reject music-only / silent / low-motion / blurry /",
+  "   zoomed-logo / talking-head / ambiguous clips (the transcript + motion note flag these). Use a",
+  "   DIFFERENT clip per beat. Prefer Reddit clips at 720p with real commentary.",
+  "",
+  "TIMING TIP: run this the DAY AFTER a match, not the same night — the penalty/heartbreak clips often",
+  "aren't posted for 24-48h. Same-day, lean on the official YouTube highlight + extract_segment.",
+  "",
+  "OUTPUT — when the user asks you to build it, return EXACTLY this and nothing else (fields separated by",
+  "' | ', one line per beat, in play order). In the first slot put a real clip URL from search_clips OR an",
+  "uploads path returned by download_clip / extract_segment (both are accepted by Clip Studio):",
   "TITLE: <4-7 word title>",
   "SEGMENTS:",
-  "<real clip url from search_clips> | <channel/handle> | <on-screen headline, 3-6 words> | <this beat's chunk of the narration>",
+  "<clip url OR uploads path> | <channel/handle> | <on-screen headline, 3-6 words> | <this beat's narration line>",
   "...",
   "",
-  "Only use URLs that `search_clips` returned and `understand_video` could open -- never invent a link.",
-  "Keep the TOTAL narration 60-90s (minimum 60, max 90 — the clips are cut to fit it). Example beat line:",
+  "Never invent a link. Keep the TOTAL narration 60-90s. Example beat line:",
   "https://www.reddit.com/r/soccer/comments/abc/ | r/soccer | Egypt Break The Deadlock | Twenty-three minutes in, Egypt catch them cold: a quick counter, one-nil, and the underdogs are suddenly dreaming.",
+  "",
+  "CLIP-MATCHING MODE: sometimes the user has ALREADY written the finished script and pastes their",
+  "numbered beats asking ONLY for clips. Do NOT rewrite/shorten/re-order their narration — their words are",
+  "final. Just find + understand_video-verify ONE real clip per beat that visibly shows it (prefer a clip",
+  "AT LEAST as long as the line, ~12s+), and return one line per beat, in the SAME order, nothing else:",
+  "CLIPS:",
+  "1 | <clip url OR uploads path> | <on-screen headline, 3-6 words>",
+  "2 | ...",
 ].join("\n");
 
 // ---------------------------------------------------------------------------
@@ -106,22 +135,24 @@ const TOOLS = [
   {
     name: "search_clips",
     description:
-      "Search Reddit, X (Twitter), Instagram and Facebook for the best video clips about a topic, " +
-      "ranked by relevance + engagement + recency + quality. Returns candidate clips with title, " +
-      "platform, author, score, engagement, duration, source URL — PLUS a real THUMBNAIL IMAGE for " +
-      "the top candidates so you can pre-filter visually before spending understand_video on each. " +
-      "Read-only: it does NOT download anything. If the search is still running when it returns, " +
-      "call get_scout_results with the returned jobId for the rest.",
+      "Search Reddit, X (Twitter), Instagram, Facebook and YouTube for the best video clips about a " +
+      "topic, ranked by relevance + engagement + recency + quality. Returns candidate clips with title, " +
+      "platform, author, score, engagement, duration, age (when known), source URL — PLUS a real " +
+      "THUMBNAIL IMAGE for the top candidates so you can pre-filter visually before spending " +
+      "understand_video on each. YouTube is where the official day-of highlight lives. Read-only: it " +
+      "does NOT download anything. If the search is still running when it returns, call " +
+      "get_scout_results with the returned jobId for the rest.",
     inputSchema: {
       type: "object",
       properties: {
-        topic: { type: "string", description: "What to search for, e.g. 'Argentina vs Cape Verde red card'." },
+        topic: { type: "string", description: "What to search for, e.g. 'Argentina vs Cape Verde red card'. One narrow player+action+scoreline query per beat beats a broad topic." },
         platforms: {
           type: "array",
           items: { type: "string", enum: [...PLATFORMS] },
-          description: "Which platforms to search. Omit to search all configured platforms.",
+          description: "Which platforms to search (reddit, x, instagram, facebook, youtube). Omit to search all configured platforms.",
         },
         maxCandidates: { type: "number", description: "Max clips to return (10-200, default 200 — returns everything found)." },
+        maxAgeHours: { type: "number", description: "Freshness filter for a day-of match: only keep clips newer than this many hours (e.g. 48). Steers Reddit to recent threads, X to Latest, and YouTube to newest uploads. Omit for evergreen search." },
       },
       required: ["topic"],
       additionalProperties: false,
@@ -142,25 +173,89 @@ const TOOLS = [
   {
     name: "understand_video",
     description:
-      "Watch/understand a single video from a Reddit, X (Twitter), Instagram or Facebook URL. " +
-      "Downloads the clip and returns KEYFRAME IMAGES sampled at the clip's key ACTION moments " +
-      "(scene changes — the goal, tackle, celebration, not just even time steps) plus a transcript " +
-      "of the spoken audio/commentary and a motion note — look at the frames and read the transcript " +
-      "to describe what actually happens. ALWAYS understand a clip before assigning it to a story " +
-      "beat. Pairs with search_clips: find a link, then understand it. Usually ~50s, but can take a " +
-      "few minutes when the render cloud is on (it transcribes with the far more accurate medium.en " +
-      "then); only the first 60s of audio is transcribed.",
+      "Watch/understand a single video from a Reddit, X (Twitter), Instagram, Facebook or YouTube URL — " +
+      "OR an uploads path returned by download_clip. Returns KEYFRAME IMAGES sampled at the key ACTION " +
+      "moments (scene changes), a transcript of the spoken commentary, a motion note, and the real " +
+      "SCENE-CUT TIMECODES (seconds) — use those as in/out anchors for extract_segment. ALWAYS " +
+      "understand a clip before assigning it to a beat; the transcript is your key signal. To find a " +
+      "moment inside a LONG video (e.g. a full highlight), pass startSec + windowSec to scan just that " +
+      "window and get absolute scene timecodes for it, then step the window along. Usually ~50s, but a " +
+      "few minutes when the render cloud is on (far more accurate medium.en transcription then).",
     inputSchema: {
       type: "object",
       properties: {
-        url: { type: "string", description: "The video URL (reddit.com/redd.it, x.com/twitter.com, instagram.com, or facebook.com)." },
+        url: { type: "string", description: "The video URL (reddit, x/twitter, instagram, facebook, youtube) OR an uploads path from download_clip." },
         frames: { type: "number", description: "How many keyframes to return (1-8, default 6)." },
+        startSec: { type: "number", description: "Optional: start of the window to analyse (seconds) — for scanning a long video. Omit to analyse the whole clip." },
+        windowSec: { type: "number", description: "Optional: length of the window to analyse (seconds, default 90 when startSec is given). Keeps a long-video scan fast." },
       },
       required: ["url"],
       additionalProperties: false,
     },
   },
+  {
+    name: "download_clip",
+    description:
+      "Download the REAL video file for a URL into the Clip Studio render pipeline (the uploads dir) and " +
+      "return its local path + duration/resolution/audio. This is how a verified clip actually becomes " +
+      "usable footage — use the returned uploads path as a Match Story beat's source, or feed it to " +
+      "understand_video / extract_segment (e.g. to walk a long highlight and cut out single moments). " +
+      "A short social clip finishes inline; a full YouTube highlight runs in the background — if it's " +
+      "still going, call get_media_result with the returned mediaJobId.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "The video URL (reddit, x/twitter, instagram, facebook, or youtube)." },
+      },
+      required: ["url"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "extract_segment",
+    description:
+      "Cut EXACTLY [start, end] out of a source into a NEW uploads file and return its path — the precise " +
+      "beat, e.g. 'the 4 seconds the penalty is missed', not the whole clip. Source can be a YouTube URL " +
+      "(downloads only that window, HD), any other social URL (downloads the clip, then trims), or an " +
+      "uploads path from download_clip (fast trim of the already-downloaded file — ideal for pulling " +
+      "several moments out of one long highlight). A long download runs in the background — if it's still " +
+      "going, call get_media_result with the returned mediaJobId.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "The source: a YouTube/reddit/x/instagram/facebook URL, or an uploads path from download_clip." },
+        start: { type: "string", description: "Segment start — seconds (e.g. 302.5) or HH:MM:SS (e.g. 00:05:02)." },
+        end: { type: "string", description: "Segment end — seconds or HH:MM:SS. Must be after start." },
+      },
+      required: ["url", "start", "end"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_media_result",
+    description:
+      "Fetch the result of a download_clip or extract_segment call that was still running when it " +
+      "returned (a full highlight download can take a few minutes). Returns the finished uploads path, or " +
+      "'still working' if it isn't done yet — poll again.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        mediaJobId: { type: "string", description: "The mediaJobId returned by download_clip / extract_segment." },
+      },
+      required: ["mediaJobId"],
+      additionalProperties: false,
+    },
+  },
 ];
+
+// Compact "how old is this clip" for the candidate list — helps judge freshness for a day-of match.
+function humanAge(createdAt?: number | null): string {
+  if (!createdAt || createdAt <= 0) return "";
+  const s = Math.max(0, Date.now() / 1000 - createdAt);
+  if (s < 3600) return `${Math.round(s / 60)}m ago`;
+  if (s < 86400) return `${Math.round(s / 3600)}h ago`;
+  return `${Math.round(s / 86400)}d ago`;
+}
 
 function renderJob(job: any): string {
   const cands: any[] = Array.isArray(job?.candidates) ? job.candidates : [];
@@ -175,9 +270,11 @@ function renderJob(job: any): string {
 
   const lines = cands.map((c, i) => {
     const dur = c.durationSec ? ` · ${Math.round(c.durationSec)}s` : "";
+    const age = humanAge(c.createdAt);
+    const ageStr = age ? ` · ${age}` : "";
     const thumb = c.thumbUrl ? `\n   thumb: ${c.thumbUrl}` : "";
     const why = Array.isArray(c.reasons) && c.reasons.length ? `\n   why: ${c.reasons.join(", ")}` : "";
-    return `${i + 1}. [${c.platform}] score ${c.score} — ${c.title || "(no title)"}\n   by ${c.author} · ${c.engagement} engagement${dur}\n   ${c.sourceUrl}${thumb}${why}`;
+    return `${i + 1}. [${c.platform}] score ${c.score} — ${c.title || "(no title)"}\n   by ${c.author} · ${c.engagement} engagement${dur}${ageStr}\n   ${c.sourceUrl}${thumb}${why}`;
   });
   return `${header}\n\n${lines.join("\n\n")}`;
 }
@@ -199,11 +296,13 @@ async function runSearchClips(args: any): Promise<ToolResult> {
     ? args.platforms.filter((p: unknown): p is string => (PLATFORMS as readonly string[]).includes(p as string))
     : undefined;
   const maxCandidates = Math.min(200, Math.max(10, Number(args?.maxCandidates) || 200));
+  const maxAgeHoursNum = Number(args?.maxAgeHours);
+  const maxAgeHours = Number.isFinite(maxAgeHoursNum) && maxAgeHoursNum > 0 ? maxAgeHoursNum : undefined;
 
   const job = await apiFetch("/scout", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ topic, platforms, maxCandidates }),
+    body: JSON.stringify({ topic, platforms, maxCandidates, maxAgeHours }),
   });
   const jobId = job?.id;
   if (!jobId) throw new Error("Scout did not start (no job id returned).");
@@ -274,17 +373,98 @@ async function renderJobResult(job: any): Promise<ToolResult> {
 
 async function runUnderstandVideo(args: any): Promise<ToolResult> {
   const url = String(args?.url ?? "").trim();
-  if (!url) throw new Error("Provide a video URL (Reddit, X, Instagram or Facebook).");
-  const u = await understandVideo(url, Number(args?.frames) || 6);
+  if (!url) throw new Error("Provide a video URL (Reddit, X, Instagram, Facebook, YouTube) or an uploads path from download_clip.");
+  const startNum = Number(args?.startSec);
+  const windowNum = Number(args?.windowSec);
+  const startSec = Number.isFinite(startNum) && startNum >= 0 ? startNum : undefined;
+  const windowSec = Number.isFinite(windowNum) && windowNum > 0 ? windowNum : undefined;
+  const u = await understandVideo(url, Number(args?.frames) || 6, startSec, windowSec);
   const res = u.width ? ` · ${u.width}x${u.height}` : "";
-  const lines = [`Video from ${u.platform} · ${Math.round(u.durationSec)}s${res}.`];
+  const windowed = startSec != null || windowSec != null;
+  const lines = [`Video from ${u.platform} · ${Math.round(u.durationSec)}s${res}${windowed ? ` (analysed ${u.windowStart.toFixed(0)}s–${u.windowEnd.toFixed(0)}s)` : ""}.`];
   if (u.transcript) lines.push(`\nSpoken/commentary transcript${u.transcriptTruncated ? " (first 60s)" : ""}:\n${u.transcript}`);
   else lines.push("\nNo speech transcript (the clip is silent or transcription was unavailable).");
+  if (u.scenes.length) lines.push(`\nScene cuts (real source timecodes, seconds) — use as extract_segment in/out anchors: ${u.scenes.map((s) => s.toFixed(1)).join(", ")}`);
   if (u.notes.length) lines.push(`\nNotes: ${u.notes.join("; ")}`);
   lines.push(`\n[${u.frames.length} keyframe image(s) attached below, sampled at the clip's key action moments — read them to see exactly what happens.]`);
   const content: ContentBlock[] = [{ type: "text", text: lines.join("\n") }];
   for (const f of u.frames) content.push({ type: "image", data: f.dataBase64, mimeType: f.mimeType });
   return { content };
+}
+
+// ---------------------------------------------------------------------------
+// Media jobs (download_clip / extract_segment). These WRITE a real file into the uploads dir, which
+// can take minutes for a full YouTube highlight — longer than the connector's tunnel timeout. So we
+// run them as in-memory background jobs (submit → poll), mirroring search_clips: the tool polls
+// briefly inline, then hands back a mediaJobId for get_media_result. Evicted after 2h.
+// ---------------------------------------------------------------------------
+
+interface MediaJob { id: string; kind: "download" | "segment"; status: "running" | "done" | "error"; text?: string; error?: string; createdAt: number }
+const mediaJobs = new Map<string, MediaJob>();
+
+function startMediaJob(kind: MediaJob["kind"], work: () => Promise<string>): MediaJob {
+  const id = `media_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const job: MediaJob = { id, kind, status: "running", createdAt: Date.now() };
+  mediaJobs.set(id, job);
+  void work()
+    .then((text) => { job.status = "done"; job.text = text; })
+    .catch((e) => { job.status = "error"; job.error = e instanceof Error ? e.message : String(e); });
+  for (const [k, v] of mediaJobs) if (Date.now() - v.createdAt > 2 * 3600_000) mediaJobs.delete(k);
+  return job;
+}
+
+async function pollMediaJob(job: MediaJob, budgetMs: number): Promise<ToolResult> {
+  const deadline = Date.now() + budgetMs;
+  while (Date.now() < deadline && job.status === "running") await sleep(1500);
+  if (job.status === "done") return textResult(job.text!);
+  if (job.status === "error") return { content: [{ type: "text", text: `Error: ${job.error}` }], isError: true };
+  return textResult(`Still working on the ${job.kind} (a full highlight can take a few minutes). Call get_media_result with mediaJobId "${job.id}" to fetch the file path when it's done.`);
+}
+
+async function runDownloadClip(args: any): Promise<ToolResult> {
+  const url = String(args?.url ?? "").trim();
+  if (!url) throw new Error("Provide a video URL (Reddit, X, Instagram, Facebook or YouTube).");
+  const job = startMediaJob("download", async () => {
+    const r = await downloadClipToUploads(url);
+    const res = r.width ? ` · ${r.width}x${r.height}` : "";
+    return [
+      `Downloaded ✓`,
+      `path: ${r.path}`,
+      `${r.platform} · ${Math.round(r.durationSec)}s${res} · ${r.hasAudio ? "has audio" : "silent"}`,
+      ``,
+      `Use this uploads path as a Match Story beat's source, or pass it to understand_video / extract_segment (e.g. to walk a long highlight and cut out single moments).`,
+    ].join("\n");
+  });
+  logger.info({ url: url.slice(0, 80), jobId: job.id }, "MCP download_clip");
+  return pollMediaJob(job, 35_000);
+}
+
+async function runExtractSegment(args: any): Promise<ToolResult> {
+  const url = String(args?.url ?? "").trim();
+  if (!url) throw new Error("Provide a source URL (YouTube/Reddit/X/IG/FB) or an uploads path from download_clip.");
+  if (args?.start == null || args?.end == null) throw new Error("Provide start and end (seconds or HH:MM:SS).");
+  const start = args.start;
+  const end = args.end;
+  const job = startMediaJob("segment", async () => {
+    const r = await extractSegment(url, start, end);
+    return [
+      `Segment cut ✓`,
+      `path: ${r.path}`,
+      `duration: ${r.durationSec.toFixed(1)}s`,
+      ``,
+      `Use this uploads path as a Match Story beat's source.`,
+    ].join("\n");
+  });
+  logger.info({ src: url.slice(0, 80), start, end, jobId: job.id }, "MCP extract_segment");
+  return pollMediaJob(job, 35_000);
+}
+
+async function runGetMediaResult(args: any): Promise<ToolResult> {
+  const id = String(args?.mediaJobId ?? "").trim();
+  if (!id) throw new Error("Provide the mediaJobId returned by download_clip / extract_segment.");
+  const job = mediaJobs.get(id);
+  if (!job) throw new Error("That media job wasn't found (it may have expired after 2h). Re-run download_clip / extract_segment.");
+  return pollMediaJob(job, 20_000);
 }
 
 async function callTool(name: string, args: any): Promise<ToolResult> {
@@ -293,6 +473,9 @@ async function callTool(name: string, args: any): Promise<ToolResult> {
     case "search_clips": return runSearchClips(args);
     case "get_scout_results": return runGetResults(args);
     case "understand_video": return runUnderstandVideo(args);
+    case "download_clip": return runDownloadClip(args);
+    case "extract_segment": return runExtractSegment(args);
+    case "get_media_result": return runGetMediaResult(args);
     default: throw new Error(`Unknown tool: ${name}`);
   }
 }
