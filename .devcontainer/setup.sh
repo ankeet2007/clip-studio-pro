@@ -13,6 +13,9 @@ log(){ echo "[setup] $*"; }
 log "apt: ffmpeg + build tools + python (Pillow for watermark detect) + tmux…"
 sudo apt-get update -qq
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ffmpeg cmake build-essential git curl python3 python3-pip python3-pil tmux >/dev/null
+# pilmoji (emoji-in-headline PNGs, used by scripts/render_headline.py) — pip only, not in apt. Without it
+# the render dies at "Beat #1: ModuleNotFoundError: No module named 'pilmoji'".
+pip3 install --break-system-packages -q pilmoji >/dev/null 2>&1 || sudo pip3 install --break-system-packages -q pilmoji >/dev/null 2>&1
 
 log "build the render worker (pnpm install + esbuild → dist/worker.mjs)…"
 cd "$REPO"
