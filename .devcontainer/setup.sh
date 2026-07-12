@@ -33,6 +33,10 @@ fi
 mkdir -p "$HOME/whisper.cpp/models"
 [ -s "$HOME/whisper.cpp/models/ggml-medium.en-q5_0.bin" ] || curl -fsSL -o "$HOME/whisper.cpp/models/ggml-medium.en-q5_0.bin" https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en-q5_0.bin
 [ -s "$HOME/whisper.cpp/models/ggml-silero-v5.1.2.bin" ] || curl -fsSL -o "$HOME/whisper.cpp/models/ggml-silero-v5.1.2.bin" https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin
+# The render worker's transcribe endpoint (understand_video's cloud path) defaults to ggml-medium.en.bin;
+# the caption script uses the q5_0 variant. Point the default name at the q5_0 we downloaded so both work
+# off one model (no separate 1.5GB full-model download).
+ln -sf ggml-medium.en-q5_0.bin "$HOME/whisper.cpp/models/ggml-medium.en.bin"
 
 log "piper (voiceover) — binary + 7 voices…"
 if [ ! -x "$HOME/piper/piper/piper" ]; then
