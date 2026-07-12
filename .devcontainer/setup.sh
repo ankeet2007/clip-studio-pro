@@ -16,8 +16,10 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ffmpeg cmake build-es
 
 log "build the render worker (pnpm install + esbuild → dist/worker.mjs)…"
 cd "$REPO"
-command -v pnpm >/dev/null 2>&1 || sudo npm install -g pnpm >/dev/null 2>&1
-pnpm install --frozen-lockfile >/dev/null 2>&1 || pnpm install >/dev/null 2>&1
+# corepack (bundled with node) uses the pnpm version the repo pins in package.json's packageManager —
+# node 22 image satisfies it (pnpm 10 needs node >=22.13; node 20 was the earlier build failure).
+corepack enable >/dev/null 2>&1 || sudo corepack enable >/dev/null 2>&1
+pnpm install --frozen-lockfile 2>&1 | tail -2 || pnpm install 2>&1 | tail -2
 ( cd artifacts/api-server-pro && node ./build.mjs )
 [ -f artifacts/api-server-pro/dist/worker.mjs ] && log "worker built ✓" || log "WARN worker build produced no dist/worker.mjs"
 
