@@ -1,0 +1,11 @@
+{
+  "name": "clip-studio-render-worker",
+  "//": "Pinned Debian/glibc image so piper's glibc ONNX runtime runs (the Alpine rebuild is what killed the old box). setup.sh reinstalls the whole render toolchain on every create/rebuild so the box SELF-HEALS instead of wiping.",
+  "image": "mcr.microsoft.com/devcontainers/javascript-node:20-bookworm",
+  "hostRequirements": {
+    "cpus": 4,
+    "memory": "16gb",
+    "storage": "32gb"
+  },
+  "postCreateCommand": "bash .devcontainer/setup.sh"
+}
