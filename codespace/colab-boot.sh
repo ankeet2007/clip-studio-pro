@@ -43,10 +43,28 @@ pnpm install --frozen-lockfile >/dev/null 2>&1 || pnpm install >/dev/null 2>&1 \
 if [ -f artifacts/api-server-pro/dist/worker.mjs ]; then log "    worker built ✓"; else log "    FATAL: worker build failed"; exit 1; fi
 
 log "5/8 whisper.cpp build + models (medium.en-q5_0 + Silero VAD)…"
-if [ ! -x "$HOME/whisper.cpp/build/bin/whisper-cli" ]; then
+# Colab's 2-core CPU can't run medium.en inside the connector's transcribe budget (observed 82-280s →
+# understand_video returns empty). If a GPU is present (T4 runtime), build whisper.cpp with CUDA so
+# medium.en runs in ~seconds. Falls back to a CPU build if there's no GPU or the CUDA build fails.
+GPU=0; command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1 && GPU=1
+WANT=cpu; [ "$GPU" = 1 ] && WANT=cuda
+if [ -x "$HOME/whisper.cpp/build/bin/whisper-cli" ] && [ "$(cat "$HOME/whisper.cpp/.flavor" 2>/dev/null)" = "$WANT" ]; then
+  log "    whisper already built ($WANT) ✓"
+else
   rm -rf "$HOME/whisper.cpp"; git clone -q --depth 1 https://github.com/ggerganov/whisper.cpp "$HOME/whisper.cpp"
-  cmake -S "$HOME/whisper.cpp" -B "$HOME/whisper.cpp/build" -DCMAKE_BUILD_TYPE=Release >/dev/null 2>&1
-  cmake --build "$HOME/whisper.cpp/build" -j"$(nproc)" --config Release >/dev/null 2>&1
+  if [ "$GPU" = 1 ]; then
+    log "    GPU detected ($(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)) → building whisper with CUDA…"
+    cmake -S "$HOME/whisper.cpp" -B "$HOME/whisper.cpp/build" -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=1 >/dev/null 2>&1
+    cmake --build "$HOME/whisper.cpp/build" -j"$(nproc)" --config Release >/dev/null 2>&1
+    if [ -x "$HOME/whisper.cpp/build/bin/whisper-cli" ]; then echo cuda > "$HOME/whisper.cpp/.flavor"; log "    whisper CUDA build ✓"
+    else log "    ⚠ CUDA build failed → falling back to CPU build"; rm -rf "$HOME/whisper.cpp/build"; GPU=0; fi
+  fi
+  if [ "$GPU" = 0 ]; then
+    log "    building whisper (CPU — medium.en will be slow; prefer a T4 GPU runtime)…"
+    cmake -S "$HOME/whisper.cpp" -B "$HOME/whisper.cpp/build" -DCMAKE_BUILD_TYPE=Release >/dev/null 2>&1
+    cmake --build "$HOME/whisper.cpp/build" -j"$(nproc)" --config Release >/dev/null 2>&1
+    echo cpu > "$HOME/whisper.cpp/.flavor"
+  fi
 fi
 mkdir -p "$HOME/whisper.cpp/models"
 [ -s "$HOME/whisper.cpp/models/ggml-medium.en-q5_0.bin" ] || curl -fsSL -o "$HOME/whisper.cpp/models/ggml-medium.en-q5_0.bin" https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en-q5_0.bin
