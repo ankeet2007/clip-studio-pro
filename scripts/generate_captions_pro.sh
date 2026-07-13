@@ -20,6 +20,14 @@ WHISPER="$HOME/whisper.cpp/build/bin/whisper-cli"
 # has ~small.en's memory footprint but far higher accuracy on noisy/shouty audio.
 MODEL="$HOME/whisper.cpp/models/ggml-medium.en-q5_0.bin"
 DTW_PRESET="medium.en"
+# On a CUDA/GPU render box (e.g. a Colab T4) prefer large-v3 — the most accurate whisper model, a big
+# win on noisy/shouty commentary — but ONLY if it's actually been downloaded. Stays on medium.en-q5_0 on
+# the phone / any CPU box (large-v3 on ARM/CPU is far too slow and would OOM). The DTW preset moves WITH
+# the model (large.v3) — a mismatched preset silently corrupts word onsets.
+LV3="$HOME/whisper.cpp/models/ggml-large-v3-q5_0.bin"
+if [ -s "$LV3" ] && command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+  MODEL="$LV3"; DTW_PRESET="large.v3"
+fi
 # Silero VAD (already on disk) gates whisper to real speech: kills hallucination
 # over crowd/music and stops loud non-narration windows being dropped as "no speech"
 # (the cause of captions vanishing after the clip's midpoint).
