@@ -53,9 +53,15 @@ if [ -x "$HOME/whisper.cpp/build/bin/whisper-cli" ] && [ "$(cat "$HOME/whisper.c
 else
   rm -rf "$HOME/whisper.cpp"; git clone -q --depth 1 https://github.com/ggerganov/whisper.cpp "$HOME/whisper.cpp"
   if [ "$GPU" = 1 ]; then
-    log "    GPU detected ($(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)) → building whisper with CUDA…"
-    cmake -S "$HOME/whisper.cpp" -B "$HOME/whisper.cpp/build" -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=1 >/dev/null 2>&1
-    cmake --build "$HOME/whisper.cpp/build" -j"$(nproc)" --config Release >/dev/null 2>&1
+    GPUNAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+    # Build ONLY for this GPU's compute capability (T4=7.5 → "75"). The default multi-arch CUDA build
+    # compiles ggml-cuda for many GPU generations — ~15 min and can OOM the box. Single-arch ≈ 1-2 min.
+    CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')
+    [ -z "$CC" ] && CC=75
+    log "    GPU detected ($GPUNAME, sm_$CC) → building whisper with CUDA (arch $CC only)…"
+    cmake -S "$HOME/whisper.cpp" -B "$HOME/whisper.cpp/build" -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=1 -DCMAKE_CUDA_ARCHITECTURES="$CC" >/dev/null 2>&1
+    # Un-silenced: stream the [ nn%] progress lines so the long compile never looks frozen.
+    cmake --build "$HOME/whisper.cpp/build" -j"$(nproc)" --config Release 2>&1 | grep --line-buffered -E "^\[[ 0-9]+%\]|[Ee]rror" || true
     if [ -x "$HOME/whisper.cpp/build/bin/whisper-cli" ]; then echo cuda > "$HOME/whisper.cpp/.flavor"; log "    whisper CUDA build ✓"
     else log "    ⚠ CUDA build failed → falling back to CPU build"; rm -rf "$HOME/whisper.cpp/build"; GPU=0; fi
   fi
