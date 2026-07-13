@@ -2,7 +2,7 @@
 # Show THIS MONTH's GitHub Codespace usage (estimated) + free budget remaining.
 # Usage is tracked from `cloud on` / `cloud off` timestamps in ~/cloud-usage.log; the live
 # codespace state (via `gh codespace view`) resolves an open session (running now vs idle-stopped).
-CS=super-duper-capybara-wvrxj4p9r955c5wj4
+CS=glorious-telegram-jrj9wgv4jjw4fp9pp
 LOG="$HOME/cloud-usage.log"
 FREE_CORE_HOURS=120     # GitHub Free personal: 120 core-hours/month
 CORES=4                 # this codespace = 4 cores → 120 core-hrs = 30 wall-hrs

@@ -309,10 +309,12 @@ async function localTranscribe(wav: string, dir: string, budgetMs: number): Prom
 
 // When the render cloud is ON, transcribe on the worker's medium.en (much sharper on names / scores
 // / minute-marks than the phone's tiny.en). ASYNC submit→poll (each request short, so the cloud's
-// ~100s tunnel timeout never cuts a long medium.en pass) with a generous overall deadline, so LONGER
-// clips are never rejected. Health-gated; ANY problem (cloud off/unreachable/error/deadline) returns
-// null so the caller falls back to the phone's local tiny.en. Reuses CLOUD_RENDER_URL/SECRET.
-async function cloudTranscribe(wav: string): Promise<string | null> {
+// ~100s tunnel timeout never cuts a long medium.en pass). Health-gated; ANY problem (cloud off/
+// unreachable/error/deadline) returns null so the caller falls back to the phone's local tiny.en.
+// `maxWaitMs` caps the poll so the SYNCHRONOUS understand_video call can't run past the MCP client's
+// wait — a COLD medium.en load is ~30s, so an unbounded wait made watching the pipeline's own render
+// output time out. On a bail the worker still finishes in the background; the caller uses local tiny.en.
+async function cloudTranscribe(wav: string, maxWaitMs = 90_000): Promise<string | null> {
   const base = process.env["CLOUD_RENDER_URL"];
   if (!base) return null;
   const secret = process.env["CLOUD_RENDER_SECRET"] || "";
@@ -334,9 +336,9 @@ async function cloudTranscribe(wav: string): Promise<string | null> {
     if (!submit || !submit.ok) return null;
     const { jobId } = (await submit.json()) as { jobId?: string };
     if (!jobId) return null;
-    // Poll (short requests) until done. Generous 5-min deadline so a long clip is never rejected.
+    // Poll (short requests) until done, but only for the caller's budget (below the MCP client wait).
     const statusUrl = new URL(`/worker/transcribe-job/${encodeURIComponent(jobId)}`, base);
-    const deadline = Date.now() + 300_000;
+    const deadline = Date.now() + Math.max(8_000, maxWaitMs);
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 4000));
       const st = await fetchT(statusUrl, { headers: { "x-worker-secret": secret } }, 15_000);
@@ -401,8 +403,9 @@ export async function understandVideo(src: string, maxFrames = 5, startSec?: num
       }
     }
     // Bound frame extraction so the whole call still returns within the client's wait window even when
-    // the source is slow to decode (AV1 / long HD): finish frames by ~30s in, leaving time for the transcript.
-    const frameDeadline = started + 30_000;
+    // the source is slow to decode (AV1 / long HD / a 1080x1920 render output): finish frames by ~22s in,
+    // leaving the rest of the budget for the transcript (a cold cloud medium.en load is ~30s on its own).
+    const frameDeadline = started + 22_000;
     const frames = dur >= 2
       ? await extractFramesAt(file, pickFrameTimes(scenes, winStart, winLen, n), dir, frameDeadline)
       : await extractFramesAt(file, [Math.max(0, dur / 2)], dir, frameDeadline);
@@ -416,8 +419,13 @@ export async function understandVideo(src: string, maxFrames = 5, startSec?: num
         const wavLen = explicitWindow ? winLen : Math.min(TRANSCRIBE_CAP_SEC, dur || TRANSCRIBE_CAP_SEC);
         const wav = await extractWav(file, dir, winStart, wavLen);
         transcriptTruncated = !explicitWindow && dur > TRANSCRIBE_CAP_SEC;
-        // Prefer the cloud worker's medium.en when the render cloud is on; else local tiny.en.
-        const cloud = await cloudTranscribe(wav);
+        // Prefer the cloud worker's medium.en when the render cloud is on, but only give it the time
+        // left in the overall budget — otherwise a cold ~30s model load pushes the whole call past the
+        // ~45s an MCP client waits (this is why self-QC'ing the pipeline's own render output aborted,
+        // NOT any codec quirk). If the cloud can't finish in time it returns null and we fall back to
+        // the phone's fast local tiny.en right below, so the clip still gets a transcript.
+        const cloudBudget = OVERALL_BUDGET_MS - (Date.now() - started) - 3_000;
+        const cloud = cloudBudget >= 8_000 ? await cloudTranscribe(wav, cloudBudget) : null;
         if (cloud) {
           transcript = cloud;
           notes.push("transcript via cloud medium.en (sharper names/numbers)");
@@ -427,7 +435,7 @@ export async function understandVideo(src: string, maxFrames = 5, startSec?: num
           if (budget >= 8000 && fs.existsSync(WHISPER_BIN) && fs.existsSync(WHISPER_MODEL)) {
             transcript = (await localTranscribe(wav, dir, budget)) || null;
           } else if (budget < 8000) {
-            notes.push("skipped transcript (too little time budget remained)");
+            notes.push("transcript omitted this call (cloud medium.en was cold / clip long) — the keyframes are still valid; re-run understand_video for the transcript (the model is now warm and returns fast)");
           } else {
             notes.push("transcript unavailable (whisper not found on server)");
           }
