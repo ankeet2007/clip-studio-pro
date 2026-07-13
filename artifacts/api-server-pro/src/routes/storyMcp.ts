@@ -172,7 +172,11 @@ function validateStoryText(segments: any[]): string {
   if (n > 8) problems.push(`${n} beats — the render uses the first 8, so trim to <=8`);
   if (words < 150) problems.push(`~${words} words (~${secs}s) is under the 150-word / 60s floor (server hard-rejects under ~140) — lengthen the beats`);
   else if (words > 220) problems.push(`~${words} words (~${secs}s) is over the 220-word / 90s ceiling — trim it`);
-  const ok = n >= 2 && n <= 8 && words >= 150 && words <= 220;
+  // Shape-check each source (validate is a word-count preflight, so this only warns — a bad/missing
+  // clip still only truly fails at render).
+  const badUrls = segments.filter((s) => !/^(https?:\/\/|\/[^\s]*\/uploads\/)/i.test(String(s.url || "").trim())).length;
+  if (badUrls > 0) problems.push(`${badUrls} beat(s) have a source that isn't a real URL or an uploads path (e.g. a placeholder) — fix it before create_match_story or that beat fails at render`);
+  const ok = n >= 2 && n <= 8 && words >= 150 && words <= 220 && badUrls === 0;
   const head = ok
     ? `Ready to render: ${n} beats · ~${words} words · ~${secs}s (inside the 60-90s target).`
     : `Not ideal yet: ${n} beats · ~${words} words · ~${secs}s.`;
@@ -238,6 +242,7 @@ async function runCreateMatchStory(args: any): Promise<ToolResult> {
 
   // P5 (freeze check) + P7 (cross-beat dedupe) — non-blocking pre-finish warnings surfaced to the caller.
   const warnings: string[] = [];
+  if (segments.length > 8) warnings.push(`you passed ${segments.length} beats but only the first 8 render — beats 9-${segments.length} were DROPPED (that often includes the payoff). Re-send with <=8 beats.`);
   const seen = new Map<string, number>();
   segments.forEach((s, i) => {
     const k = s.url.trim();

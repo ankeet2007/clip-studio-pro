@@ -179,7 +179,7 @@ export async function downloadClipToUploads(url: string): Promise<{ path: string
  *   • a local uploads path (a clip already fetched by download_clip) → fast ffmpeg stream-copy;
  *   • a YouTube URL → yt-dlp --download-sections (downloads ONLY the window, HD-floored);
  *   • any other social URL → download the whole clip to temp, then stream-copy the window. */
-export async function extractSegment(src: string, start: string | number, end: string | number): Promise<{ path: string; durationSec: number }> {
+export async function extractSegment(src: string, start: string | number, end: string | number): Promise<{ path: string; durationSec: number; requestedSec: number }> {
   const startSec = parseTimecode(start);
   const endSec = parseTimecode(end);
   if (!Number.isFinite(startSec) || !Number.isFinite(endSec)) throw new Error("start/end must be seconds or HH:MM:SS.");
@@ -211,7 +211,7 @@ export async function extractSegment(src: string, start: string | number, end: s
     }
     const meta = await probe(out);
     if (!meta.duration) { try { fs.unlinkSync(out); } catch { /**/ } throw new Error("Extracted segment is empty — check the start/end are within the clip."); }
-    return { path: out, durationSec: meta.duration };
+    return { path: out, durationSec: meta.duration, requestedSec: dur };
   } catch (e) {
     try { fs.existsSync(out) && fs.unlinkSync(out); } catch { /**/ }
     throw e;

@@ -317,7 +317,8 @@ async function runSearchClips(args: any): Promise<ToolResult> {
   const maxAgeHoursNum = Number(args?.maxAgeHours);
   const maxAgeHours = Number.isFinite(maxAgeHoursNum) && maxAgeHoursNum > 0 ? maxAgeHoursNum : undefined;
   const minDurNum = Number(args?.minDurationSec);
-  const minDurationSec = Number.isFinite(minDurNum) && minDurNum > 0 ? minDurNum : undefined;
+  // Clamp to a sane ceiling so a nonsense value (e.g. 99999) doesn't silently filter out everything.
+  const minDurationSec = Number.isFinite(minDurNum) && minDurNum > 0 ? Math.min(3600, minDurNum) : undefined;
 
   const job = await apiFetch("/scout", {
     method: "POST",
@@ -398,7 +399,14 @@ async function runUnderstandVideo(args: any): Promise<ToolResult> {
   const windowNum = Number(args?.windowSec);
   const startSec = Number.isFinite(startNum) && startNum >= 0 ? startNum : undefined;
   const windowSec = Number.isFinite(windowNum) && windowNum > 0 ? windowNum : undefined;
-  const u = await understandVideo(url, Number(args?.frames) || 6, startSec, windowSec);
+  // Hard ceiling so a slow/degenerate source (a big file, a stalled transcription) can NEVER hang the
+  // request forever — that showed up as a "tool execution" crash. On timeout, return an actionable error.
+  const u = await Promise.race([
+    understandVideo(url, Number(args?.frames) || 6, startSec, windowSec),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error(
+      "understand_video ran too long and was aborted (the source is likely large or the transcription stalled). Scan a SHORTER window — pass startSec + windowSec of ~10-15s over just the part you need."
+    )), 130_000)),
+  ]);
   const res = u.width ? ` · ${u.width}x${u.height}` : "";
   const windowed = startSec != null || windowSec != null;
   const lines = [`Video from ${u.platform} · ${Math.round(u.durationSec)}s${res}${windowed ? ` (analysed ${u.windowStart.toFixed(0)}s–${u.windowEnd.toFixed(0)}s)` : ""}.`];
@@ -471,7 +479,12 @@ async function runExtractSegment(args: any): Promise<ToolResult> {
     const outs: string[] = [];
     for (let i = 0; i < pairs.length; i++) {
       const r = await extractSegment(url, pairs[i]!.start, pairs[i]!.end);
-      outs.push(`${pairs.length > 1 ? `[beat ${i + 1}] ` : ""}${r.path}  (${r.durationSec.toFixed(1)}s)`);
+      // Warn when the source ran out before the requested end (silent ffmpeg clamp) — a blind cut would
+      // otherwise ship a near-empty beat unnoticed.
+      const short = r.durationSec < r.requestedSec - 0.5
+        ? `  ⚠ CLAMPED — you asked for ${r.requestedSec.toFixed(1)}s but only ${r.durationSec.toFixed(1)}s of footage exists from that start (end is past the clip). Pick an earlier window.`
+        : "";
+      outs.push(`${pairs.length > 1 ? `[beat ${i + 1}] ` : ""}${r.path}  (${r.durationSec.toFixed(1)}s)${short}`);
     }
     return [`Segment${pairs.length > 1 ? "s" : ""} cut ✓ — pass each uploads path as a Match Story beat's source:`, ...outs].join("\n");
   });
