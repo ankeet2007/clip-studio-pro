@@ -9,7 +9,11 @@ SECRET=$(cat ~/worker_secret 2>/dev/null); [ -z "$SECRET" ] && SECRET=$(head -c 
 mkdir -p ~/clips_out
 if ! curl -s --max-time 3 localhost:7860/health >/dev/null 2>&1; then
   tmux kill-session -t worker 2>/dev/null
-  tmux new-session -d -s worker "cd /workspaces/clip-studio-pro/artifacts/api-server-pro && env DATABASE_URL=postgresql://x:x@localhost:5432/x WORKER_SECRET=$SECRET PORT=7860 CLIPS_OUTPUT_DIR=$HOME/clips_out NODE_ENV=production CAPTION_LEAD_SEC=-0.12 node dist/worker.mjs > $HOME/worker.log 2>&1"
+  # Supervisor loop: if the worker process ever crashes (OOM/exception) it auto-restarts in 3s on the
+  # SAME port 7860, so the cloudflared tunnel (which points at localhost:7860) keeps working with NO
+  # URL rotation. This heals a genuine worker crash without needing another `cloud on`. (The dominant
+  # death is still the GitHub 30-min idle-STOP, which kills the whole box — fixed by --idle-timeout.)
+  tmux new-session -d -s worker "cd /workspaces/clip-studio-pro/artifacts/api-server-pro && while true; do env DATABASE_URL=postgresql://x:x@localhost:5432/x WORKER_SECRET=$SECRET PORT=7860 CLIPS_OUTPUT_DIR=$HOME/clips_out NODE_ENV=production CAPTION_LEAD_SEC=-0.12 node dist/worker.mjs >> $HOME/worker.log 2>&1; sleep 3; done"
   sleep 4
 fi
 [ -x ~/cloudflared ] || { wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O ~/cloudflared && chmod +x ~/cloudflared; }
