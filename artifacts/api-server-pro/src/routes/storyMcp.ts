@@ -169,7 +169,7 @@ function validateStoryText(segments: any[]): string {
   const n = segments.length;
   const problems: string[] = [];
   if (n < 2) problems.push(`only ${n} beat(s) — need at least 2 (aim 4-8)`);
-  if (n > 8) problems.push(`${n} beats — the render uses the first 8, so trim to <=8`);
+  if (n > 8) problems.push(`${n} beats — a Story renders at most 8; create_match_story will REJECT this. Merge/trim to <=8`);
   if (words < 150) problems.push(`~${words} words (~${secs}s) is under the 150-word / 60s floor (server hard-rejects under ~140) — lengthen the beats`);
   else if (words > 220) problems.push(`~${words} words (~${secs}s) is over the 220-word / 90s ceiling — trim it`);
   // Shape-check each source (validate is a word-count preflight, so this only warns — a bad/missing
@@ -196,6 +196,10 @@ async function runValidateStory(args: any): Promise<ToolResult> {
 async function runCreateMatchStory(args: any): Promise<ToolResult> {
   const segments = normSegments(args?.segments);
   if (segments.length < 2) throw new Error("Provide at least 2 segments (each a clip url/uploads path + a narration line).");
+  // Hard-reject >8 beats BEFORE enqueuing. The render only keeps the first 8, so a 9+-beat
+  // script would silently lose beat 9+ (usually the payoff). Fail fast so the caller resends a
+  // trimmed script instead of shipping a truncated video (a warning after "enqueued" got missed).
+  if (segments.length > 8) throw new Error(`You passed ${segments.length} beats, but a Match Story renders at most 8 — beats 9-${segments.length} (often the payoff) would be dropped. Merge or trim to 8 beats and resend.`);
   const words = totalWords(segments);
   if (words < 140) throw new Error(`Narration is only ~${words} words (~${Math.round(words / 2.4)}s) — a Story needs ~150-220 words (60-90s). Lengthen the beats, then retry.`);
 
@@ -241,8 +245,8 @@ async function runCreateMatchStory(args: any): Promise<ToolResult> {
   logger.info({ clipId: id, beats: beats.length, words }, "story-mcp create_match_story");
 
   // P5 (freeze check) + P7 (cross-beat dedupe) — non-blocking pre-finish warnings surfaced to the caller.
+  // (>8 beats is now hard-rejected above, so it can't reach here.)
   const warnings: string[] = [];
-  if (segments.length > 8) warnings.push(`you passed ${segments.length} beats but only the first 8 render — beats 9-${segments.length} were DROPPED (that often includes the payoff). Re-send with <=8 beats.`);
   const seen = new Map<string, number>();
   segments.forEach((s, i) => {
     const k = s.url.trim();

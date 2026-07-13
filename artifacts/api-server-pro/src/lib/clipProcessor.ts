@@ -523,15 +523,22 @@ function wrapText(text: string, maxChars = 38): string[] {
  */
 function makeProgressUpdater(clipId: number) {
   let lastTime = 0;
+  // Monotonic guard: progress only ever moves forward within a clip's render. Without this,
+  // a cloud attempt that reaches ~30% then falls back to a LOCAL render (which restarts its
+  // own counter at ~2%) made the bar visibly REWIND (the reported "7% → 2% went backwards").
+  let lastPct = -1;
   return async (pct: number, force = false) => {
     if (!clipId) return;
+    const clamped = Math.min(100, Math.max(0, Math.round(pct)));
+    if (clamped < lastPct) return; // never rewind
     const now = Date.now();
     if (!force && now - lastTime < 1000) return;
     lastTime = now;
+    lastPct = clamped;
     try {
       await db
         .update(clipsTable)
-        .set({ progress: Math.min(100, Math.max(0, Math.round(pct))) })
+        .set({ progress: clamped })
         .where(eq(clipsTable.id, clipId));
     } catch {
       // Non-fatal — progress is best-effort
@@ -1222,6 +1229,7 @@ async function offloadToCloud(
   inputPath: string,
   outPath: string,
   params: Record<string, unknown>,
+  onProgress: (p: number) => void = () => {},
 ): Promise<boolean> {
   const base = process.env.CLOUD_RENDER_URL;
   if (!base) return false;
@@ -1233,14 +1241,28 @@ async function offloadToCloud(
     "x-params": Buffer.from(JSON.stringify(params)).toString("base64"),
   });
   if (!sub || !sub.jobId) return false;
-  const statusUrl = new URL(`/worker/job/${sub.jobId}`, base);
-  const deadline = Date.now() + 45 * 60 * 1000;
+  // Animate 48→~92 while the worker renders (it doesn't stream progress) so a long clip doesn't
+  // look frozen; give up (→ local fallback) if the box goes unreachable ~3 min or a render runs
+  // past a sane ceiling, so a stuck worker never holds the bar for the full 45-min deadline.
+  const submittedAt = Date.now();
+  const deadline = submittedAt + 45 * 60 * 1000;
+  const renderCap = submittedAt + 22 * 60 * 1000;
+  const expectMs = 4 * 60 * 1000;
+  let fails = 0;
   while (Date.now() < deadline) {
     await httpSleep(5000);
-    const st = await getJson(statusUrl);
-    if (!st) continue; // transient — keep polling
-    if (st.status === "done") return await getFileTo(new URL(`/worker/job/${sub.jobId}/result`, base), outPath);
+    const elapsed = Date.now() - submittedAt;
+    onProgress(48 + 44 * (1 - Math.exp(-elapsed / expectMs)));
+    const curBase = process.env.CLOUD_RENDER_URL || base; // follow a mid-render tunnel rotation
+    const st = await getJson(new URL(`/worker/job/${sub.jobId}`, curBase));
+    if (!st) {
+      if (++fails >= 36) { logger.warn("Cloud unreachable ~3min mid-render — falling back to local render"); return false; }
+      continue;
+    }
+    fails = 0;
+    if (st.status === "done") { onProgress(96); return await getFileTo(new URL(`/worker/job/${sub.jobId}/result`, curBase), outPath); }
     if (st.status === "error") { logger.warn({ error: st.error }, "Cloud job errored"); return false; }
+    if (Date.now() > renderCap) { logger.warn("Cloud render exceeded 22min without finishing — falling back to local render"); return false; }
   }
   return false;
 }
@@ -1392,10 +1414,21 @@ async function tryCloudMultiSegment(
     const sub = await postFileExpectJson(new URL("/worker/render-job", base), tarPath);
     if (!sub || !sub.jobId) return false;
     onProgress(30);
-    const deadline = Date.now() + 45 * 60 * 1000;
+    // The worker doesn't stream progress, so a multi-minute render used to sit FROZEN at 30%
+    // the whole time — indistinguishable from a hang (the reported "hangs at 30% across 8 polls";
+    // the render was actually healthy, finishing in ~5 min). Animate the bar 30→~90 on a time
+    // estimate so it visibly moves, and cap the "rendering" wait so a GENUINELY stuck worker
+    // falls back to a local render instead of holding the bar for the full 45 min.
+    const submittedAt = Date.now();
+    const deadline = submittedAt + 45 * 60 * 1000;
+    const renderCap = submittedAt + 22 * 60 * 1000; // hard ceiling for the "rendering" state
+    const expectMs = 6 * 60 * 1000;                 // typical multi-seg cloud render; ramp shape only
     let fails = 0;
     while (Date.now() < deadline) {
       await httpSleep(5000);
+      // Asymptotic ramp toward 90 (never reaches it until the job actually reports "done").
+      const elapsed = Date.now() - submittedAt;
+      onProgress(30 + 60 * (1 - Math.exp(-elapsed / expectMs)));
       // Re-read CLOUD_RENDER_URL each poll so a mid-render tunnel rotation (`cloud on` re-points it;
       // the worker + its job survive the rotation) is FOLLOWED instead of orphaning the poll on the
       // dead old URL. And never poll a dead URL forever: after ~3 min of consecutive failures, give
@@ -1407,8 +1440,9 @@ async function tryCloudMultiSegment(
         continue;
       }
       fails = 0;
-      if (st.status === "done") return await getFileTo(new URL(`/worker/job/${sub.jobId}/result`, curBase), outPath);
+      if (st.status === "done") { onProgress(95); return await getFileTo(new URL(`/worker/job/${sub.jobId}/result`, curBase), outPath); }
       if (st.status === "error") { logger.warn({ error: st.error }, "Cloud job errored"); return false; }
+      if (Date.now() > renderCap) { logger.warn("Cloud render exceeded 22min without finishing — falling back to local render"); return false; }
     }
     return false;
   } catch (e) {
@@ -1555,7 +1589,7 @@ export async function processClip(
         punchInEnabled, zoomMoments, captionColor, voiceoverMode, narrationScript,
         voiceoverVoice: jobVoice, voiceoverSpeed: jobSpeed,
         startTime: "00:00:00", endTime: formatHMS(duration), topRank,
-      });
+      }, (p) => { void updateProgress(p); });
       if (ok) {
         logger.info({ finalOutputPath }, "Clip rendered on cloud worker (offloaded)");
         await updateProgress(100, true);

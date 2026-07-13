@@ -24,8 +24,16 @@ DTW_PRESET="medium.en"
 # over crowd/music and stops loud non-narration windows being dropped as "no speech"
 # (the cause of captions vanishing after the clip's midpoint).
 VAD_MODEL="$HOME/whisper.cpp/models/ggml-silero-v5.1.2.bin"
-TMP_WAV="/data/data/com.termux/files/home/myapp/clips_output/tmp_audio_$$.wav"
-TMP_BASE="/data/data/com.termux/files/home/myapp/clips_output/tmp_srt_$$"
+# Scratch files live next to the requested SRT output (a dir the caller already writes
+# to) so this runs on the phone (Termux) AND the cloud render box (different HOME/paths)
+# without a hardcoded Termux path — a stale hardcoded /data/data/com.termux/... path was
+# missing on the cloud box, so ffmpeg couldn't write the wav and every cloud render came
+# out UNCAPTIONED (script printed FAIL, exit 1). Fall back to the phone dir only if $2 has
+# no directory component.
+SCRATCH_DIR="$(dirname "$OUTPUT_SRT")"
+[ -d "$SCRATCH_DIR" ] || SCRATCH_DIR="/data/data/com.termux/files/home/myapp/clips_output"
+TMP_WAV="$SCRATCH_DIR/tmp_audio_$$.wav"
+TMP_BASE="$SCRATCH_DIR/tmp_srt_$$"
 # DTW gives accurate per-word onsets, so no global nudge is needed. This only shifts
 # the rarely-hit plain-SRT fallback; keep at 0.0 (raise a touch if it ever reads early).
 CAPTION_DELAY=0.0

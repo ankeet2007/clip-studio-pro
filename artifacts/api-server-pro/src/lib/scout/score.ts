@@ -10,6 +10,16 @@ import type { RawCandidate, ScoredCandidate, ScoutOptions } from "./types";
 export const WEIGHTS = { relevance: 0.34, engagement: 0.34, recency: 0.12, quality: 0.20 };
 const RELEVANCE_FLOOR = 0.15; // below this we assume it's off-topic and drop it
 
+// Video-game / simulated-match contamination. EA Sports FC ("FC 26"), eFootball/PES gameplay,
+// and "simulation"/"prediction" videos get titled EXACTLY like real fixtures — especially for a
+// match that hasn't been played yet — so a naive pipeline could splice a video-game render in as
+// real broadcast footage (the same failure family as era-contamination). These can NEVER serve as
+// real B-roll, so hard-drop them. Tight enough to spare real footage: `\bfc\s*2[0-9]\b` matches the
+// game "FC 26"/"FC24" but not "Juventus FC 2024"; bare "FIFA"/"FIFA World Cup 2026" is left alone
+// (the game variants say "gameplay"/"simulation", which are caught on their own).
+const SIM_CONTAMINATION_RE =
+  /\b(simulation|simulated|gameplay|game\s*play|career\s*mode|e-?football|pes\s*2[0-9]|konami|dream\s*league|score\s*prediction|match\s*prediction|prediction|predicted)\b|\bfc\s*2[0-9]\b/i;
+
 /** Fraction of topic terms that appear in the candidate's title (simple, fast, upgradeable). */
 function relevanceScore(title: string, terms: string[]): number {
   if (terms.length === 0) return 0.5;
@@ -62,6 +72,9 @@ export function rankCandidates(cands: RawCandidate[], terms: string[], opts: Sco
   for (let i = 0; i < cands.length; i++) {
     const c = cands[i]!;
     if (maxAgeSec && c.createdAt > 0 && nowSec - c.createdAt > maxAgeSec) continue; // too old
+    // Hard-drop video-game / simulated-match / prediction videos — they'd masquerade as real footage.
+    // Facebook candidates are user-pasted URLs (trusted), so they skip this title guard.
+    if (c.platform !== "facebook" && SIM_CONTAMINATION_RE.test(c.title)) continue;
     // P2 duration hard filter: drop KNOWN-too-short clips (e.g. asking for a ≥5min broadcast highlight,
     // not an 8s reel). Unknown duration is kept (probed later).
     if (opts.minDurationSec && c.durationSec != null && c.durationSec < opts.minDurationSec) continue;

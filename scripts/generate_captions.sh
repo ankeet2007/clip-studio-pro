@@ -4,8 +4,12 @@ OUTPUT_SRT="$2"
 OUTPUT_TXT="$3"
 WHISPER="$HOME/whisper.cpp/build/bin/whisper-cli"
 MODEL="$HOME/whisper.cpp/models/ggml-small.en.bin"
-TMP_WAV="/data/data/com.termux/files/home/myapp/clips_output/tmp_audio_$$.wav"
-TMP_BASE="/data/data/com.termux/files/home/myapp/clips_output/tmp_srt_$$"
+# Scratch next to the SRT output so this works on both the phone and the cloud box
+# (no hardcoded Termux path — that broke captions on the cloud render box).
+SCRATCH_DIR="$(dirname "$OUTPUT_SRT")"
+[ -d "$SCRATCH_DIR" ] || SCRATCH_DIR="/data/data/com.termux/files/home/myapp/clips_output"
+TMP_WAV="$SCRATCH_DIR/tmp_audio_$$.wav"
+TMP_BASE="$SCRATCH_DIR/tmp_srt_$$"
 
 # Get duration and calculate outro start
 DURATION=$(ffprobe -v quiet -show_entries format=duration -of csv=p=0 "$INPUT" 2>/dev/null)
