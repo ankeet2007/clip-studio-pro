@@ -58,25 +58,28 @@ else
     # compiles ggml-cuda for many GPU generations — ~15 min and can OOM the box. Single-arch ≈ 1-2 min.
     CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')
     [ -z "$CC" ] && CC=75
-    # libggml-cuda.so links hundreds of kernel objects. On a Kaggle/Colab box the stock bfd `ld` can
-    # run out of RAM at that final link → "collect2: error: ld returned 1 exit status" (compile hits
-    # ~80% then dies at the LINK, not the compile). Strategy: (1) build once with the flash-attn kernel
-    # set trimmed, capturing the FULL log to $BLOG; (2) if the link failed, retry ONLY the link with the
-    # low-memory lld linker — the compiled objects are cached so this relinks in seconds, no recompile;
-    # (3) if it still fails, print the REAL linker error (previously hidden by the progress-only filter)
-    # so the cause is visible, then fall back to a CPU build.
-    BLOG="$HOME/whisper_cuda_build.log"; : > "$BLOG"
-    $SUDO apt-get install -y -qq lld >/dev/null 2>&1 || true
-    log "    GPU detected ($GPUNAME, sm_$CC) → building whisper with CUDA (arch $CC only)…"
-    cmake -S "$HOME/whisper.cpp" -B "$HOME/whisper.cpp/build" -DCMAKE_BUILD_TYPE=Release \
-      -DGGML_CUDA=1 -DCMAKE_CUDA_ARCHITECTURES="$CC" -DGGML_CUDA_FA_ALL_QUANTS=OFF >>"$BLOG" 2>&1
-    cmake --build "$HOME/whisper.cpp/build" -j"$(nproc)" --config Release 2>&1 | tee -a "$BLOG" | grep --line-buffered -E "^\[[ 0-9]+%\]" || true
-    if [ ! -x "$HOME/whisper.cpp/build/bin/whisper-cli" ] && command -v ld.lld >/dev/null 2>&1; then
-      log "    ⚠ first link failed → retrying the link with lld (low-memory, reuses compiled objects)…"
-      cmake -S "$HOME/whisper.cpp" -B "$HOME/whisper.cpp/build" \
-        -DCMAKE_SHARED_LINKER_FLAGS="-Xcompiler=-fuse-ld=lld" -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" >>"$BLOG" 2>&1 || true
-      cmake --build "$HOME/whisper.cpp/build" -j"$(nproc)" --config Release 2>&1 | tee -a "$BLOG" | grep --line-buffered -E "^\[[ 0-9]+%\]|[Ee]rror" || true
+    # ggml links CUDA::cuda_driver (libcuda — the CUDA *driver* API, cuGetErrorString etc.). Kaggle/Colab
+    # GPU images carry the runtime driver (libcuda.so.1) and usually a link stub under <cuda>/lib64/stubs,
+    # but NOT a `libcuda.so` on the default linker search path → the link dies with
+    # "/usr/bin/ld: cannot find -lCUDA::cuda_driver". Fix: locate a libcuda.so (prefer the toolkit stub;
+    # else symlink one from the runtime libcuda.so.1), put its dir on LIBRARY_PATH, and hand it to CMake
+    # via CMAKE_LIBRARY_PATH so FindCUDAToolkit resolves the target. (This was never an OOM.)
+    CUDADRV=""
+    for d in /usr/local/cuda/lib64/stubs /usr/local/cuda-*/lib64/stubs /usr/local/cuda/targets/*/lib/stubs /usr/lib/x86_64-linux-gnu; do
+      [ -e "$d/libcuda.so" ] && CUDADRV="$d" && break
+    done
+    if [ -z "$CUDADRV" ]; then
+      RT="$(ldconfig -p 2>/dev/null | grep -m1 'libcuda\.so\.1' | awk '{print $NF}')"
+      [ -z "$RT" ] && RT="$(find /usr -name 'libcuda.so.1' 2>/dev/null | head -1)"
+      if [ -n "$RT" ]; then $SUDO ln -sf "$RT" "$(dirname "$RT")/libcuda.so" 2>/dev/null && CUDADRV="$(dirname "$RT")"; fi
     fi
+    export LIBRARY_PATH="${CUDADRV:+$CUDADRV:}${LIBRARY_PATH:-}"
+    BLOG="$HOME/whisper_cuda_build.log"; : > "$BLOG"
+    log "    GPU detected ($GPUNAME, sm_$CC) → building whisper with CUDA (arch $CC only; cuda-driver: ${CUDADRV:-NOT FOUND})…"
+    cmake -S "$HOME/whisper.cpp" -B "$HOME/whisper.cpp/build" -DCMAKE_BUILD_TYPE=Release \
+      -DGGML_CUDA=1 -DCMAKE_CUDA_ARCHITECTURES="$CC" -DGGML_CUDA_FA_ALL_QUANTS=OFF \
+      ${CUDADRV:+-DCMAKE_LIBRARY_PATH="$CUDADRV"} >>"$BLOG" 2>&1
+    cmake --build "$HOME/whisper.cpp/build" -j"$(nproc)" --config Release 2>&1 | tee -a "$BLOG" | grep --line-buffered -E "^\[[ 0-9]+%\]" || true
     if [ -x "$HOME/whisper.cpp/build/bin/whisper-cli" ]; then echo cuda > "$HOME/whisper.cpp/.flavor"; log "    whisper CUDA build ✓ (GPU)"
     else
       log "    ⚠ CUDA build still failing — REAL linker error (last 25 matching lines):"
