@@ -58,10 +58,20 @@ else
     # compiles ggml-cuda for many GPU generations — ~15 min and can OOM the box. Single-arch ≈ 1-2 min.
     CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')
     [ -z "$CC" ] && CC=75
-    log "    GPU detected ($GPUNAME, sm_$CC) → building whisper with CUDA (arch $CC only)…"
-    cmake -S "$HOME/whisper.cpp" -B "$HOME/whisper.cpp/build" -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=1 -DCMAKE_CUDA_ARCHITECTURES="$CC" >/dev/null 2>&1
+    # The final `ld` of libggml-cuda.so links hundreds of kernel objects and can exhaust RAM on a
+    # Kaggle/Colab box → "collect2: error: ld returned 1 exit status" (compile reaches ~80% then dies
+    # at the link, not the compile). Fix: make the linker conserve memory — --no-keep-memory stops it
+    # caching every input file's symbol table in RAM (re-reads from disk instead) and
+    # --reduce-memory-overheads uses more compact internal structures. Passed as -Wl, flags so they
+    # forward through the host compiler / nvcc to ld. Also pin flash-attn to f16-only (no all-quants
+    # kernels — whisper leans on cuBLAS, not those) to shrink the link a little.
+    LDFIX="-Wl,--no-keep-memory -Wl,--reduce-memory-overheads"
+    log "    GPU detected ($GPUNAME, sm_$CC) → building whisper with CUDA (arch $CC only, low-mem link)…"
+    cmake -S "$HOME/whisper.cpp" -B "$HOME/whisper.cpp/build" -DCMAKE_BUILD_TYPE=Release \
+      -DGGML_CUDA=1 -DCMAKE_CUDA_ARCHITECTURES="$CC" -DGGML_CUDA_FA_ALL_QUANTS=OFF \
+      -DCMAKE_SHARED_LINKER_FLAGS="$LDFIX" -DCMAKE_EXE_LINKER_FLAGS="$LDFIX" >/dev/null 2>&1
     # Un-silenced: stream the [ nn%] progress lines so the long compile never looks frozen.
-    cmake --build "$HOME/whisper.cpp/build" -j"$(nproc)" --config Release 2>&1 | grep --line-buffered -E "^\[[ 0-9]+%\]|[Ee]rror" || true
+    cmake --build "$HOME/whisper.cpp/build" -j"$(nproc)" --config Release 2>&1 | grep --line-buffered -E "^\[[ 0-9]+%\]|[Ee]rror|error:" || true
     if [ -x "$HOME/whisper.cpp/build/bin/whisper-cli" ]; then echo cuda > "$HOME/whisper.cpp/.flavor"; log "    whisper CUDA build ✓"
     else log "    ⚠ CUDA build failed → falling back to CPU build"; rm -rf "$HOME/whisper.cpp/build"; GPU=0; fi
   fi
