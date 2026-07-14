@@ -58,27 +58,32 @@ else
     # compiles ggml-cuda for many GPU generations — ~15 min and can OOM the box. Single-arch ≈ 1-2 min.
     CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')
     [ -z "$CC" ] && CC=75
-    # ggml links CUDA::cuda_driver (libcuda — the CUDA *driver* API, cuGetErrorString etc.). Kaggle/Colab
-    # GPU images carry the runtime driver (libcuda.so.1) and usually a link stub under <cuda>/lib64/stubs,
-    # but NOT a `libcuda.so` on the default linker search path → the link dies with
-    # "/usr/bin/ld: cannot find -lCUDA::cuda_driver". Fix: locate a libcuda.so (prefer the toolkit stub;
-    # else symlink one from the runtime libcuda.so.1), put its dir on LIBRARY_PATH, and hand it to CMake
-    # via CMAKE_LIBRARY_PATH so FindCUDAToolkit resolves the target. (This was never an OOM.)
-    CUDADRV=""
-    for d in /usr/local/cuda/lib64/stubs /usr/local/cuda-*/lib64/stubs /usr/local/cuda/targets/*/lib/stubs /usr/lib/x86_64-linux-gnu; do
-      [ -e "$d/libcuda.so" ] && CUDADRV="$d" && break
+    # ggml links CUDA::cuda_driver (libcuda — the CUDA *driver* API, cuGetErrorString etc.). Kaggle's
+    # CUDA toolkit ships EMPTY stubs dirs and no `libcuda.so` on any linker path, so FindCUDAToolkit
+    # can't resolve the target and leaks it → "/usr/bin/ld: cannot find -lCUDA::cuda_driver". The real
+    # driver libcuda.so.1 is present only while a GPU is attached. Find it, drop a `libcuda.so` symlink
+    # into the toolkit's stubs dir, and — most reliably — pre-set the exact cache var FindCUDAToolkit
+    # uses (CUDA_cuda_driver_LIBRARY) to that driver so CMake links it directly and never searches.
+    # (This was never an OOM.)
+    DRV=""
+    for c in /usr/lib/x86_64-linux-gnu/libcuda.so.1 /usr/local/cuda/compat/libcuda.so.1 /usr/lib64/libcuda.so.1; do
+      [ -e "$c" ] && DRV="$c" && break
     done
-    if [ -z "$CUDADRV" ]; then
-      RT="$(ldconfig -p 2>/dev/null | grep -m1 'libcuda\.so\.1' | awk '{print $NF}')"
-      [ -z "$RT" ] && RT="$(find /usr -name 'libcuda.so.1' 2>/dev/null | head -1)"
-      if [ -n "$RT" ]; then $SUDO ln -sf "$RT" "$(dirname "$RT")/libcuda.so" 2>/dev/null && CUDADRV="$(dirname "$RT")"; fi
+    [ -z "$DRV" ] && DRV="$(ldconfig -p 2>/dev/null | grep -m1 'libcuda\.so\.1' | awk '{print $NF}')"
+    [ -z "$DRV" ] && DRV="$(find /usr -name 'libcuda.so.1' 2>/dev/null | head -1)"
+    CUDADRV=""
+    if [ -n "$DRV" ]; then
+      STUBDIR=""; for s in /usr/local/cuda/targets/*/lib/stubs /usr/local/cuda/lib64/stubs; do [ -d "$s" ] && STUBDIR="$s" && break; done
+      [ -z "$STUBDIR" ] && STUBDIR="$(dirname "$DRV")"
+      $SUDO ln -sf "$DRV" "$STUBDIR/libcuda.so" 2>/dev/null && CUDADRV="$STUBDIR/libcuda.so"
+      [ -z "$CUDADRV" ] && CUDADRV="$DRV"
+      export LIBRARY_PATH="$(dirname "$CUDADRV"):${LIBRARY_PATH:-}"
     fi
-    export LIBRARY_PATH="${CUDADRV:+$CUDADRV:}${LIBRARY_PATH:-}"
     BLOG="$HOME/whisper_cuda_build.log"; : > "$BLOG"
     log "    GPU detected ($GPUNAME, sm_$CC) → building whisper with CUDA (arch $CC only; cuda-driver: ${CUDADRV:-NOT FOUND})…"
     cmake -S "$HOME/whisper.cpp" -B "$HOME/whisper.cpp/build" -DCMAKE_BUILD_TYPE=Release \
       -DGGML_CUDA=1 -DCMAKE_CUDA_ARCHITECTURES="$CC" -DGGML_CUDA_FA_ALL_QUANTS=OFF \
-      ${CUDADRV:+-DCMAKE_LIBRARY_PATH="$CUDADRV"} >>"$BLOG" 2>&1
+      ${CUDADRV:+-DCUDA_cuda_driver_LIBRARY="$CUDADRV" -DCMAKE_LIBRARY_PATH="$(dirname "$CUDADRV")"} >>"$BLOG" 2>&1
     cmake --build "$HOME/whisper.cpp/build" -j"$(nproc)" --config Release 2>&1 | tee -a "$BLOG" | grep --line-buffered -E "^\[[ 0-9]+%\]" || true
     if [ -x "$HOME/whisper.cpp/build/bin/whisper-cli" ]; then echo cuda > "$HOME/whisper.cpp/.flavor"; log "    whisper CUDA build ✓ (GPU)"
     else
