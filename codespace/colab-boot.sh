@@ -58,22 +58,31 @@ else
     # compiles ggml-cuda for many GPU generations — ~15 min and can OOM the box. Single-arch ≈ 1-2 min.
     CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')
     [ -z "$CC" ] && CC=75
-    # The final `ld` of libggml-cuda.so links hundreds of kernel objects and can exhaust RAM on a
-    # Kaggle/Colab box → "collect2: error: ld returned 1 exit status" (compile reaches ~80% then dies
-    # at the link, not the compile). Fix: make the linker conserve memory — --no-keep-memory stops it
-    # caching every input file's symbol table in RAM (re-reads from disk instead) and
-    # --reduce-memory-overheads uses more compact internal structures. Passed as -Wl, flags so they
-    # forward through the host compiler / nvcc to ld. Also pin flash-attn to f16-only (no all-quants
-    # kernels — whisper leans on cuBLAS, not those) to shrink the link a little.
-    LDFIX="-Wl,--no-keep-memory -Wl,--reduce-memory-overheads"
-    log "    GPU detected ($GPUNAME, sm_$CC) → building whisper with CUDA (arch $CC only, low-mem link)…"
+    # libggml-cuda.so links hundreds of kernel objects. On a Kaggle/Colab box the stock bfd `ld` can
+    # run out of RAM at that final link → "collect2: error: ld returned 1 exit status" (compile hits
+    # ~80% then dies at the LINK, not the compile). Strategy: (1) build once with the flash-attn kernel
+    # set trimmed, capturing the FULL log to $BLOG; (2) if the link failed, retry ONLY the link with the
+    # low-memory lld linker — the compiled objects are cached so this relinks in seconds, no recompile;
+    # (3) if it still fails, print the REAL linker error (previously hidden by the progress-only filter)
+    # so the cause is visible, then fall back to a CPU build.
+    BLOG="$HOME/whisper_cuda_build.log"; : > "$BLOG"
+    $SUDO apt-get install -y -qq lld >/dev/null 2>&1 || true
+    log "    GPU detected ($GPUNAME, sm_$CC) → building whisper with CUDA (arch $CC only)…"
     cmake -S "$HOME/whisper.cpp" -B "$HOME/whisper.cpp/build" -DCMAKE_BUILD_TYPE=Release \
-      -DGGML_CUDA=1 -DCMAKE_CUDA_ARCHITECTURES="$CC" -DGGML_CUDA_FA_ALL_QUANTS=OFF \
-      -DCMAKE_SHARED_LINKER_FLAGS="$LDFIX" -DCMAKE_EXE_LINKER_FLAGS="$LDFIX" >/dev/null 2>&1
-    # Un-silenced: stream the [ nn%] progress lines so the long compile never looks frozen.
-    cmake --build "$HOME/whisper.cpp/build" -j"$(nproc)" --config Release 2>&1 | grep --line-buffered -E "^\[[ 0-9]+%\]|[Ee]rror|error:" || true
-    if [ -x "$HOME/whisper.cpp/build/bin/whisper-cli" ]; then echo cuda > "$HOME/whisper.cpp/.flavor"; log "    whisper CUDA build ✓"
-    else log "    ⚠ CUDA build failed → falling back to CPU build"; rm -rf "$HOME/whisper.cpp/build"; GPU=0; fi
+      -DGGML_CUDA=1 -DCMAKE_CUDA_ARCHITECTURES="$CC" -DGGML_CUDA_FA_ALL_QUANTS=OFF >>"$BLOG" 2>&1
+    cmake --build "$HOME/whisper.cpp/build" -j"$(nproc)" --config Release 2>&1 | tee -a "$BLOG" | grep --line-buffered -E "^\[[ 0-9]+%\]" || true
+    if [ ! -x "$HOME/whisper.cpp/build/bin/whisper-cli" ] && command -v ld.lld >/dev/null 2>&1; then
+      log "    ⚠ first link failed → retrying the link with lld (low-memory, reuses compiled objects)…"
+      cmake -S "$HOME/whisper.cpp" -B "$HOME/whisper.cpp/build" \
+        -DCMAKE_SHARED_LINKER_FLAGS="-Xcompiler=-fuse-ld=lld" -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" >>"$BLOG" 2>&1 || true
+      cmake --build "$HOME/whisper.cpp/build" -j"$(nproc)" --config Release 2>&1 | tee -a "$BLOG" | grep --line-buffered -E "^\[[ 0-9]+%\]|[Ee]rror" || true
+    fi
+    if [ -x "$HOME/whisper.cpp/build/bin/whisper-cli" ]; then echo cuda > "$HOME/whisper.cpp/.flavor"; log "    whisper CUDA build ✓ (GPU)"
+    else
+      log "    ⚠ CUDA build still failing — REAL linker error (last 25 matching lines):"
+      grep -iE "error|undefined reference|cannot find|memory exhausted|ld returned|fatal|no such file" "$BLOG" | tail -25
+      log "    → falling back to CPU build"; rm -rf "$HOME/whisper.cpp/build"; GPU=0
+    fi
   fi
   if [ "$GPU" = 0 ]; then
     log "    building whisper (CPU — medium.en will be slow; prefer a T4 GPU runtime)…"
