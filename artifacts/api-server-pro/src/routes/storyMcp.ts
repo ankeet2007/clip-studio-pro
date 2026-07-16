@@ -41,8 +41,11 @@ const INSTRUCTIONS = [
   "render trims each clip to its line but WON'T stretch a short clip, so a clip shorter than its narration",
   "freezes/bleeds at the tail. If your extract_segment window is too short, re-cut it a few seconds longer.",
   "",
-  "VOICE: leave voice unset for the default warm British narrator (en_GB-alan-medium) at natural pace, or",
-  "pass voice/pace to override.",
+  "VOICE: leave voice unset for the default clean neutral US male narrator (en_US-hfc_male-medium) at",
+  "natural pace, or pass voice/pace to override.",
+  "",
+  "CARDS: the intro title card and outro SUBSCRIBE card are OFF by default. Pass titleCard:true or",
+  "outro:true to add them.",
   "",
   "HARD NAMES: if a name would be mispronounced by the TTS, spell the beat's `narration` PHONETICALLY",
   "(e.g. 'day-KETT-el-ah-reh') and put the correctly-spelled version in `caption` (same word count) — the",
@@ -119,13 +122,13 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        title: { type: "string", description: "4-7 word title (shown on the title card)." },
+        title: { type: "string", description: "4-7 word title (shown on the title card only if titleCard:true)." },
         segments: { type: "array", items: SEGMENT_SCHEMA, description: "The beats, in play order (2-8)." },
-        voice: { type: "string", description: "Optional Piper voice id (e.g. en_GB-alan-medium, en_US-joe-medium). Omit to use the default warm British narrator (en_GB-alan-medium)." },
+        voice: { type: "string", description: "Optional Piper voice id (e.g. en_US-hfc_male-medium, en_GB-alan-medium, en_US-joe-medium). Omit to use the default clean neutral US male narrator (en_US-hfc_male-medium)." },
         pace: { type: "string", description: "Narration pace: 'normal' (default, natural human speed), 'slightly-slow', 'slow', or a Piper length_scale 0.7-1.6." },
         captions: { type: "boolean", description: "Burn karaoke captions (default true)." },
-        titleCard: { type: "boolean", description: "Show the opening title card (default true)." },
-        outro: { type: "boolean", description: "Show the outro card (default true)." },
+        titleCard: { type: "boolean", description: "Show the opening title card (default false). Pass true to add an intro title card." },
+        outro: { type: "boolean", description: "Show the outro SUBSCRIBE card (default false). Pass true to add an end card." },
         crossfades: { type: "boolean", description: "Crossfade between beats (default true)." },
         captionColor: { type: "string", description: "Hex color for the karaoke caption highlight, e.g. #FFF400 (default, bright yellow)." },
       },
@@ -222,13 +225,15 @@ async function runCreateMatchStory(args: any): Promise<ToolResult> {
     title: String(args?.title ?? "").slice(0, 120),
     frameStyle: "immersive",
     captionsEnabled: args?.captions !== false,
-    titleCardEnabled: args?.titleCard !== false,
-    outroEnabled: args?.outro !== false,
+    // Story Mode 2.0 / Scout: intro + outro cards default OFF. The Claude app can still turn
+    // either on for a given render by passing titleCard:true / outro:true.
+    titleCardEnabled: args?.titleCard === true,
+    outroEnabled: args?.outro === true,
     transitionsEnabled: args?.crossfades !== false,
     captionColor: /^#?[0-9a-fA-F]{6}$/.test(String(args?.captionColor ?? "")) ? String(args?.captionColor).replace(/^#?/, "#") : "#FFF400",
-    // Default to a warm, natural British narrator at normal (1.0) pace — human, not robotic. Callers
+    // Default to the clean, neutral US male narrator (HFC male) at normal (1.0) pace. Callers
     // can override with `voice` / `pace`.
-    voiceoverVoice: String(args?.voice || "en_GB-alan-medium"),
+    voiceoverVoice: String(args?.voice || "en_US-hfc_male-medium"),
     voiceoverSpeed: resolvePace(args?.pace ?? "normal"),
     segments: beats.map((b) => ({
       sourceType: "local", localFile: b.localFile,

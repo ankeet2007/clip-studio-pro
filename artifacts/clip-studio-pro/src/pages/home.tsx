@@ -659,9 +659,10 @@ export default function Home() {
   const [msNarration, setMsNarration] = useState("");
   const [msPaste, setMsPaste] = useState("");
   const [msCaptions, setMsCaptions] = useState(true);
-  const [msOutro, setMsOutro] = useState(true);
+  // Story Mode 2.0 / Scout: intro + outro cards default OFF (toggle back on per render if wanted).
+  const [msOutro, setMsOutro] = useState(false);
   const [msTransitions, setMsTransitions] = useState(true);
-  const [msTitleCard, setMsTitleCard] = useState(true);
+  const [msTitleCard, setMsTitleCard] = useState(false);
   const [msVerifying, setMsVerifying] = useState(false);
   const [msSubmitting, setMsSubmitting] = useState(false);
 
@@ -3310,7 +3311,7 @@ SEGMENTS:
 
                       <div className="rounded-xl border border-[#9b7bff]/30 bg-gradient-to-b from-[#9b7bff]/[0.08] to-[#9b7bff]/[0.02] p-4">
                         <div className="flex items-center gap-1.5"><Mic className="w-3.5 h-3.5 text-[#9b7bff]" /><span className="text-[10.5px] font-mono uppercase tracking-[0.1em] text-[#c9b8ff]">Commentary voiceover</span></div>
-                        <VoicePicker voice={voVoice} speed={voSpeed} onVoice={setVoVoice} onSpeed={setVoSpeed} autoVoice="en_GB-alan-medium" />
+                        <VoicePicker voice={voVoice} speed={voSpeed} onVoice={setVoVoice} onSpeed={setVoSpeed} autoVoice="en_US-hfc_male-medium" />
                       </div>
 
                       <div className="flex flex-wrap gap-2">
@@ -3586,7 +3587,7 @@ SEGMENTS:
                       <span className="text-[10.5px] font-mono uppercase tracking-[0.1em] text-[#c9b8ff]">Commentary voiceover</span>
                       <span className="text-[8.5px] font-semibold tracking-[0.14em] text-[#b69dff] border border-[#9b7bff]/40 rounded px-1.5 py-0.5">PRO</span>
                     </div>
-                    <VoicePicker voice={voVoice} speed={voSpeed} onVoice={setVoVoice} onSpeed={setVoSpeed} autoVoice="en_GB-alan-medium" />
+                    <VoicePicker voice={voVoice} speed={voSpeed} onVoice={setVoVoice} onSpeed={setVoSpeed} autoVoice="en_US-hfc_male-medium" />
                   </div>
 
                   {/* Toggles + submit */}

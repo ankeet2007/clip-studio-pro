@@ -1076,13 +1076,15 @@ const KNOWN_VOICES = new Set([
 /**
  * Resolves the Piper voice for a job. An explicit, installed voice wins; otherwise the
  * default matches each mode's character (and the picker's defaults): Top 5 → Joe (deep,
- * "epic countdown"), Story / full-narration → Alan (warm documentary narrator), a
- * single-clip intro hook → Joe.
+ * "epic countdown"), Match Story 2.0 / Scout → HFC male (clean, neutral US narrator),
+ * base Story / full-narration → Alan (warm documentary narrator), a single-clip intro
+ * hook → Joe.
  */
 function resolveVoice(voice: string | undefined, kind: "top5" | "story" | "script" | "hook" | "matchstory"): string {
   const v = (voice ?? "").trim();
   if (v && KNOWN_VOICES.has(v)) return v;
-  if (kind === "story" || kind === "script" || kind === "matchstory") return "en_GB-alan-medium";
+  if (kind === "matchstory") return "en_US-hfc_male-medium"; // Story Mode 2.0 / Scout default
+  if (kind === "story" || kind === "script") return "en_GB-alan-medium";
   return "en_US-joe-medium"; // top5 + single-clip hook
 }
 

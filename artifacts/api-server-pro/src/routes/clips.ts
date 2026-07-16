@@ -349,12 +349,14 @@ router.post("/clips/matchstory", async (req, res): Promise<void> => {
   }
 
   const transitionsEnabled = body.transitionsEnabled ?? true;
-  const titleCardEnabled = body.titleCardEnabled ?? true;
+  // Story Mode 2.0 / Scout default to NO intro title card (still overridable per render).
+  const titleCardEnabled = body.titleCardEnabled ?? false;
 
   const frameStyle = (body.frameStyle === "standard" ? "standard" : "immersive") as "standard" | "immersive";
   const sourceChannel = body.sourceChannel ?? "";
   const captionsEnabled = body.captionsEnabled ?? true;
-  const outroEnabled = body.outroEnabled ?? true;
+  // Story Mode 2.0 / Scout default to NO outro SUBSCRIBE card (still overridable per render).
+  const outroEnabled = body.outroEnabled ?? false;
   const captionColor = body.captionColor ?? "";
   const narrationScript = body.narrationScript ?? "";
   const voiceoverVoice = body.voiceoverVoice ?? "";
