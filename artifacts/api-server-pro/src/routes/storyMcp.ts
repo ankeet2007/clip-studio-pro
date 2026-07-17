@@ -47,6 +47,17 @@ const INSTRUCTIONS = [
   "CARDS: the intro title card and outro SUBSCRIBE card are OFF by default. Pass titleCard:true or",
   "outro:true to add them.",
   "",
+  "RAPID CUTS (retention): a clip held still for >2s bleeds viewers. Keep the PICTURE moving at attention",
+  "speed while the STORY moves at story speed — give beats these optional fields:",
+  "  • cutDensity {minSec,maxSec}: seconds between rapid cuts within the beat. DECAY it — hook beats (first",
+  "    ~15s) {0.4,0.9}, later beats {1.5,2.5}. You set it per beat; the render obeys.",
+  "  • fillerAssets: >=2 uploads paths (download_clip/extract_segment) to flash between the words; content is",
+  "    arbitrary, only the motion matters. Pre-download them (raw URLs are rejected).",
+  "  • punchline {word,asset}: a sniper cut landing an image exactly on ONE spoken word (150ms early). A few",
+  "    per video. The word MUST appear in that beat's narration or it is dropped.",
+  "  • holdMs: if a beat shows something to READ (screenshot/meme), ms to hold before any filler cut.",
+  "  Omit all of these on a beat to keep the classic one-clip-per-beat look.",
+  "",
   "HARD NAMES: if a name would be mispronounced by the TTS, spell the beat's `narration` PHONETICALLY",
   "(e.g. 'day-KETT-el-ah-reh') and put the correctly-spelled version in `caption` (same word count) — the",
   "voice then says it right while the on-screen captions stay correct.",
@@ -93,6 +104,31 @@ const SEGMENT_SCHEMA = {
     caption: { type: "string", description: "Optional on-screen CAPTION text when it must differ from what's spoken — the correctly-spelled version (e.g. 'De Ketelaere'). Use the SAME word count as narration so the captions line up. Omit to caption exactly what's spoken." },
     headline: { type: "string", description: "Optional short on-screen headline for this beat (3-6 words)." },
     channel: { type: "string", description: "Optional source handle/credit, e.g. r/soccer." },
+    cutDensity: {
+      type: "object",
+      properties: {
+        minSec: { type: "number", description: "Shortest gap between rapid cuts within this beat (seconds)." },
+        maxSec: { type: "number", description: "Longest gap between rapid cuts within this beat (seconds)." },
+      },
+      description: "Optional RAPID-CUT cadence for THIS beat (jittered in [minSec,maxSec]). DECAY across the video: hook beats (first ~15s) {minSec:0.4,maxSec:0.9}; later beats {minSec:1.5,maxSec:2.5}. Omit to hold the beat's single clip (classic behavior).",
+    },
+    fillerAssets: {
+      type: "array",
+      items: { type: "string" },
+      description: "Optional uploads paths (from Scout download_clip/extract_segment) of extra clips to rapid-cut TO between this beat's words. Content is arbitrary — only the change matters. Give >=2 distinct assets for a dense beat. Pre-download them; raw URLs are rejected.",
+    },
+    punchline: {
+      type: "object",
+      properties: {
+        word: { type: "string", description: "A single word from THIS beat's narration to land the image on." },
+        asset: { type: "string", description: "Uploads path of the clip/image to cut to exactly on that word." },
+      },
+      description: "Optional word-synced sniper cut: `asset` lands on `word` (which MUST be spoken in this beat), 150ms early. Use a few per video, not every beat.",
+    },
+    holdMs: {
+      type: "number",
+      description: "Optional. If this beat shows something a viewer must READ (screenshot/meme), the milliseconds to hold before any filler cut is allowed.",
+    },
   },
   required: ["url", "narration"],
   additionalProperties: false,
@@ -118,7 +154,9 @@ const TOOLS = [
       "Render a finished Match Story 2.0 video from verified clips. Downloads each beat's clip into the render " +
       "pipeline (uploads paths from Scout's download_clip/extract_segment are used as-is and render fastest), " +
       "enqueues the render, and returns a clipId to poll with get_story. Pass 2-8 segments (each a real Scout " +
-      "clip URL or uploads path + a narration line), in play order. The server rejects a script under ~140 words.",
+      "clip URL or uploads path + a narration line), in play order. The server rejects a script under ~140 words. " +
+      "Each beat MAY also carry optional rapid-cut fields (cutDensity, fillerAssets, punchline, holdMs) that cut the " +
+      "visuals at attention speed — see the connector instructions; omit them for the classic one-clip-per-beat look.",
     inputSchema: {
       type: "object",
       properties: {
@@ -153,6 +191,29 @@ const TOOLS = [
 interface ToolResult { content: { type: "text"; text: string }[]; isError?: boolean }
 const textResult = (text: string): ToolResult => ({ content: [{ type: "text", text }] });
 
+// Normalize the optional cut-engine fields off a raw MCP segment (shape-only; the render route
+// re-validates asset paths against the uploads dir). Absent fields stay absent so a plain beat is
+// unchanged.
+function normCutFields(s: any): Record<string, any> {
+  const out: Record<string, any> = {};
+  const cd = s?.cutDensity;
+  if (cd && (cd.minSec != null || cd.maxSec != null)) {
+    const mn = Number(cd.minSec), mx = Number(cd.maxSec);
+    if (Number.isFinite(mn) && Number.isFinite(mx)) out.cutDensity = { minSec: mn, maxSec: mx };
+  }
+  const fa = Array.isArray(s?.fillerAssets)
+    ? s.fillerAssets.map((x: any) => String(x ?? "").trim()).filter(Boolean)
+    : [];
+  if (fa.length) out.fillerAssets = fa;
+  const p = s?.punchline;
+  if (p && String(p.word ?? "").trim() && String(p.asset ?? "").trim()) {
+    out.punchline = { word: String(p.word).trim(), asset: String(p.asset).trim() };
+  }
+  const h = Number(s?.holdMs);
+  if (Number.isFinite(h) && h > 0) out.holdMs = h;
+  return out;
+}
+
 function normSegments(raw: any): any[] {
   if (!Array.isArray(raw)) return [];
   return raw
@@ -162,6 +223,7 @@ function normSegments(raw: any): any[] {
       caption: String(s?.caption ?? "").trim(),
       headline: String(s?.headline ?? "").trim(),
       channel: String(s?.channel ?? "").trim(),
+      ...normCutFields(s),
     }))
     .filter((s) => s.url && s.narration);
 }
@@ -179,7 +241,35 @@ function validateStoryText(segments: any[]): string {
   // clip still only truly fails at render).
   const badUrls = segments.filter((s) => !/^(https?:\/\/|\/[^\s]*\/uploads\/)/i.test(String(s.url || "").trim())).length;
   if (badUrls > 0) problems.push(`${badUrls} beat(s) have a source that isn't a real URL or an uploads path (e.g. a placeholder) — fix it before create_match_story or that beat fails at render`);
-  const ok = n >= 2 && n <= 8 && words >= 150 && words <= 220 && badUrls === 0;
+  // Cut-engine preflight — warn early so the app fixes it BEFORE render (the render route silently drops
+  // bad assets; a missing punchline word or too-few fillers would otherwise just quietly under-perform).
+  const normWord = (w: string) => w.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+  segments.forEach((s, i) => {
+    const cd = s.cutDensity;
+    const fillers: string[] = Array.isArray(s.fillerAssets) ? s.fillerAssets : [];
+    const distinct = new Set(fillers).size;
+    if (cd) {
+      if (!(cd.minSec > 0) || !(cd.maxSec > 0) || cd.minSec > cd.maxSec)
+        problems.push(`beat ${i + 1}: cutDensity needs 0 < minSec <= maxSec`);
+      if (distinct === 0 && !s.punchline)
+        problems.push(`beat ${i + 1}: cutDensity set but no fillerAssets/punchline — nothing to cut to`);
+      else if (cd.maxSec < 1.5 && distinct < 2 && !s.punchline)
+        problems.push(`beat ${i + 1}: dense cuts (<=${cd.maxSec}s) but only ${distinct} distinct filler asset(s) — add >=2 so the picture doesn't repeat back-to-back`);
+    }
+    fillers.forEach((f) => {
+      if (/^https?:\/\//i.test(String(f)))
+        problems.push(`beat ${i + 1}: filler asset "${String(f).slice(0, 40)}" is a URL — filler must be a pre-downloaded uploads path (download_clip/extract_segment)`);
+    });
+    if (s.punchline) {
+      const said = new Set(String(s.narration || "").split(/\s+/).map(normWord).filter(Boolean));
+      const pw = normWord(String(s.punchline.word || ""));
+      if (pw && !said.has(pw))
+        problems.push(`beat ${i + 1}: punchline word "${s.punchline.word}" isn't spoken in this beat — it can't land; pick a word from the narration`);
+      if (/^https?:\/\//i.test(String(s.punchline.asset || "")))
+        problems.push(`beat ${i + 1}: punchline asset is a URL — use a pre-downloaded uploads path`);
+    }
+  });
+  const ok = n >= 2 && n <= 8 && words >= 150 && words <= 220 && problems.length === 0;
   const head = ok
     ? `Ready to render: ${n} beats · ~${words} words · ~${secs}s (inside the 60-90s target).`
     : `Not ideal yet: ${n} beats · ~${words} words · ~${secs}s.`;
@@ -221,6 +311,13 @@ async function runCreateMatchStory(args: any): Promise<ToolResult> {
   const norm = (t: string) => String(t || "").replace(/\s+/g, " ").trim().slice(0, 600);
   const capByLine = new Map<string, string>();
   segments.forEach((s) => { if (s.caption) capByLine.set(norm(s.narration), s.caption); });
+  // Re-attach each beat's optional cut-engine fields the same way (keyed on the narration line), since
+  // fetch-urls returns beats keyed only on narration. The render route re-validates the asset paths.
+  const cutByLine = new Map<string, Record<string, any>>();
+  segments.forEach((s) => {
+    const cf = normCutFields(s);
+    if (Object.keys(cf).length) cutByLine.set(norm(s.narration), cf);
+  });
   const body = {
     title: String(args?.title ?? "").slice(0, 120),
     frameStyle: "immersive",
@@ -240,6 +337,7 @@ async function runCreateMatchStory(args: any): Promise<ToolResult> {
       startTime: b.startTime, endTime: b.endTime,
       headline: b.headline, sourceChannel: b.sourceChannel, narrationLine: b.narrationLine,
       captionLine: capByLine.get(norm(b.narrationLine)) || "",
+      ...(cutByLine.get(norm(b.narrationLine)) || {}),
     })),
   };
   const clip = await apiFetch("/clips/matchstory", {

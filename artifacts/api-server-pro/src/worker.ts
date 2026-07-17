@@ -173,6 +173,14 @@ const server = http.createServer((req, res) => {
         const segments = (job.segments || []).map((s: any) => ({
           ...s,
           localFile: s.localFile ? path.join(extractDir, path.basename(s.localFile)) : undefined,
+          // Cut-engine assets were bundled as basenames alongside localFile — re-absolutize them into
+          // the extract dir the same way, or the cloud render can't find the filler/punchline clips.
+          ...(Array.isArray(s.fillerAssets)
+            ? { fillerAssets: s.fillerAssets.map((f: string) => path.join(extractDir, path.basename(f))) }
+            : {}),
+          ...(s.punchline && s.punchline.asset
+            ? { punchline: { word: s.punchline.word, asset: path.join(extractDir, path.basename(s.punchline.asset)) } }
+            : {}),
         }));
         const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
         const outName = `job_${jobId}.mp4`;

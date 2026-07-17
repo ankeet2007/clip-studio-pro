@@ -167,6 +167,39 @@ function sanitizeSegments(raw: unknown): StorySegment[] {
  * every beat carries its OWN source URL (multi-source montage) — rows without a URL or a
  * valid start/end are dropped. Capped at 8 (render-load guard on the phone).
  */
+// Story Mode 2.0 cut-engine fields (all optional). Asset PATHS are confined to the uploads dir (the
+// same guard as localFile) and must exist, so a bad/remote asset is dropped here rather than failing
+// mid-render. Scalar fields (density, punchline word, holdMs) are clamped to sane bounds.
+function sanitizeCutFields(seg: Record<string, unknown>, uploadsDir: string): Partial<StorySegment> {
+  const out: Partial<StorySegment> = {};
+  const cd = seg.cutDensity as { minSec?: unknown; maxSec?: unknown } | undefined;
+  if (cd && typeof cd === "object") {
+    const mn = Number(cd.minSec), mx = Number(cd.maxSec);
+    if (Number.isFinite(mn) && Number.isFinite(mx) && mn > 0 && mx >= mn) {
+      out.cutDensity = { minSec: Math.min(6, mn), maxSec: Math.min(6, mx) };
+    }
+  }
+  const confine = (p: unknown): string => {
+    const s = String(p ?? "").trim();
+    if (!s) return "";
+    const r = path.resolve(s);
+    return r.startsWith(uploadsDir + path.sep) && fs.existsSync(r) ? r : "";
+  };
+  if (Array.isArray(seg.fillerAssets)) {
+    const fa = (seg.fillerAssets as unknown[]).map(confine).filter(Boolean);
+    if (fa.length) out.fillerAssets = fa;
+  }
+  const p = seg.punchline as { word?: unknown; asset?: unknown } | undefined;
+  if (p && typeof p === "object") {
+    const word = String(p.word ?? "").trim().slice(0, 60);
+    const asset = confine(p.asset);
+    if (word && asset) out.punchline = { word, asset };
+  }
+  const h = Number(seg.holdMs);
+  if (Number.isFinite(h) && h > 0) out.holdMs = Math.min(10000, h);
+  return out;
+}
+
 function sanitizeMatchSegments(raw: unknown): StorySegment[] {
   if (!Array.isArray(raw)) return [];
   const timeRe = /^\d{1,2}:\d{2}(:\d{2})?$/;
@@ -195,6 +228,7 @@ function sanitizeMatchSegments(raw: unknown): StorySegment[] {
         sourceChannel: String(seg.sourceChannel ?? "").slice(0, 80),
         narrationLine: String(seg.narrationLine ?? "").slice(0, 600),
         captionLine: String(seg.captionLine ?? "").slice(0, 600),
+        ...sanitizeCutFields(seg, uploadsDir),
       });
       if (out.length >= 8) break;
       continue;
@@ -210,6 +244,7 @@ function sanitizeMatchSegments(raw: unknown): StorySegment[] {
       narrationLine: String(seg.narrationLine ?? "").slice(0, 600),
       zoomMoments: typeof seg.zoomMoments === "string" ? seg.zoomMoments : "",
       punchInEnabled: seg.punchInEnabled === true,
+      ...sanitizeCutFields(seg, uploadsDir),
     });
     if (out.length >= 8) break;
   }

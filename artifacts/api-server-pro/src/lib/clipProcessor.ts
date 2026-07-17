@@ -8,6 +8,7 @@ import https from "https";
 import { inArray, eq } from "drizzle-orm";
 import { db, clipsTable } from "@workspace/db-pro";
 import { logger } from "./logger";
+import { parseWhisperWords, planFillerCuts, findWordTime, type Word } from "./cutEngine";
 
 const execFileAsync = promisify(execFile);
 
@@ -1393,9 +1394,30 @@ async function tryCloudMultiSegment(
       const s = segs[i]!;
       const name = `seg_${i}.mp4`;
       const dest = path.join(bundleDir, name);
+      // Bundle this beat's cut-engine assets (filler + punchline) so the cloud worker can read them;
+      // rewrite each to a bundle-relative basename (the worker re-absolutizes it, same as localFile).
+      // Without this, cloud renders silently drop every filler/punchline visual.
+      const cutOverride: Record<string, unknown> = {};
+      if (Array.isArray(s.fillerAssets) && s.fillerAssets.length) {
+        const fills: string[] = [];
+        for (let f = 0; f < s.fillerAssets.length; f++) {
+          const fp = s.fillerAssets[f]!;
+          if (fp && fs.existsSync(fp)) {
+            const fn = `seg_${i}_fill_${f}${path.extname(fp) || ".mp4"}`;
+            fs.copyFileSync(fp, path.join(bundleDir, fn));
+            fills.push(fn);
+          }
+        }
+        cutOverride.fillerAssets = fills;
+      }
+      if (s.punchline && s.punchline.asset && fs.existsSync(s.punchline.asset)) {
+        const pn = `seg_${i}_punch${path.extname(s.punchline.asset) || ".mp4"}`;
+        fs.copyFileSync(s.punchline.asset, path.join(bundleDir, pn));
+        cutOverride.punchline = { word: s.punchline.word, asset: pn };
+      }
       if (s.localFile && fs.existsSync(s.localFile)) {
         fs.copyFileSync(s.localFile, dest);
-        outSegs.push({ ...s, localFile: name, youtubeUrl: "", sourceType: "local" });
+        outSegs.push({ ...s, localFile: name, youtubeUrl: "", sourceType: "local", ...cutOverride });
       } else {
         const url = (s.youtubeUrl && s.youtubeUrl.trim()) ? s.youtubeUrl : jobYoutubeUrl;
         if (!url) throw new Error(`Segment ${i + 1} has no source`);
@@ -1403,7 +1425,7 @@ async function tryCloudMultiSegment(
         fs.renameSync(tmp, dest);
         // the downloaded cut is 0-based on disk → the worker must seek from 0 for its real length
         const dur = Math.max(1, timeToSeconds(s.endTime) - timeToSeconds(s.startTime));
-        outSegs.push({ ...s, localFile: name, youtubeUrl: "", sourceType: "local", startTime: "00:00:00", endTime: formatHMS(dur) });
+        outSegs.push({ ...s, localFile: name, youtubeUrl: "", sourceType: "local", startTime: "00:00:00", endTime: formatHMS(dur), ...cutOverride });
       }
       onProgress(2 + ((i + 1) / segs.length) * 25);
     }
@@ -2266,6 +2288,14 @@ export interface StorySegment {
   // is NOT window-extended past the clip's real length.
   localFile?: string;
   sourceType?: "youtube" | "local";
+
+  // Story Mode 2.0 CUT ENGINE (all optional; a beat with none renders on the classic one-clip path,
+  // so existing stories are byte-identical). Consumed by processMatchStory to rapid-cut the beat's
+  // visuals at attention speed while the narration stays at story speed. See lib/cutEngine.ts.
+  cutDensity?: { minSec: number; maxSec: number }; // seconds between filler cuts within the beat (jittered)
+  fillerAssets?: string[];                          // uploads paths to rapid-cut TO between spoken words
+  punchline?: { word: string; asset: string };      // asset lands on `word` (spoken in this beat), 150ms early
+  holdMs?: number;                                   // readable content: suppress filler cuts for this long
 }
 
 // Pro-only: one ranked moment of a TOP 5 countdown (jobType "top5"). Superset of
@@ -2726,6 +2756,215 @@ async function stitchWithTransitions(parts: string[], partDurs: number[], fade: 
   }
 }
 
+// ---- Story Mode 2.0 CUT ENGINE (filler cuts) ------------------------------------------------------
+
+/**
+ * Whisper-transcribe a beat's narration WAV into word onsets, via the SAME DTW-full pipeline the
+ * captions use (generate_captions_pro.sh -> .json -> parseWhisperWords). Filler cuts land on these
+ * real word gaps. Returns [] on any failure so the caller falls back to the un-cut beat.
+ */
+async function transcribeNarrationWords(wavPath: string, outputDir: string, tag: string): Promise<Word[]> {
+  const captionScript = path.join(os.homedir(), "myapp/scripts/generate_captions_pro.sh");
+  if (!fs.existsSync(captionScript) || !fs.existsSync(wavPath)) return [];
+  const srtPath = path.join(outputDir, `cut_${tag}.srt`);
+  const txtPath = path.join(outputDir, `cut_${tag}.txt`);
+  const jsonPath = srtPath.replace(/\.srt$/, ".json");
+  try {
+    await new Promise<void>((resolve) => {
+      const cap = spawn("bash", [captionScript, wavPath, srtPath, txtPath], { timeout: 600_000 });
+      cap.on("close", () => resolve());
+      cap.on("error", () => resolve());
+    });
+    if (!fs.existsSync(jsonPath)) return [];
+    return parseWhisperWords(JSON.parse(fs.readFileSync(jsonPath, "utf8")));
+  } catch (e) {
+    logger.warn({ e, tag }, "Cut-engine narration transcription failed");
+    return [];
+  } finally {
+    for (const f of [srtPath, txtPath, jsonPath]) { try { fs.existsSync(f) && fs.unlinkSync(f); } catch { /* ignore */ } }
+  }
+}
+
+/**
+ * Canonicalize one cut asset (a filler or the punchline) to 1080x1920/30fps + a silent audio track.
+ * Images are looped. Returns { path, dur, isImg } or null on failure.
+ */
+async function canonicalizeCutAsset(src: string, outF: string, D: number): Promise<{ path: string; dur: number; isImg: boolean } | null> {
+  if (!fs.existsSync(src)) return null;
+  const isImg = /\.(jpe?g|png|webp|gif|bmp)$/i.test(src);
+  const cap = Math.max(2, Math.min(20, Math.ceil(D)));
+  const inArgs = isImg ? ["-loop", "1", "-t", String(cap), "-i", src] : ["-i", src];
+  const SCALE = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30";
+  try {
+    await spawnProcess("ffmpeg", [
+      "-y", ...inArgs, "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+      "-map", "0:v:0", "-map", "1:a", "-vf", SCALE, "-t", String(isImg ? cap : 20),
+      "-c:v", "libx264", "-preset", "veryfast", "-threads", "1", "-crf", "18", "-pix_fmt", "yuv420p", "-r", "30",
+      "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2", "-shortest", "-movflags", "+faststart", outF,
+    ], 0, () => {}, RENDER_STALL_MS, "render");
+    const dur = (await probeContentDuration(outF)) || 0;
+    return dur > 0.3 ? { path: outF, dur, isImg } : null;
+  } catch (e) {
+    logger.warn({ e, src }, "Cut-engine asset canonicalize failed");
+    return null;
+  }
+}
+
+/**
+ * Subdivide ONE beat into rapid FILLER cuts. Takes the beat's canonical composited video
+ * (`baseCanon`, 1080x1920/30fps, `D` seconds) and, on the narration word gaps (jittered per
+ * `density`), cuts away to curated `fillerPaths` and back — so the picture moves at attention speed
+ * while the beat's DURATION is preserved exactly (narration placement + captions downstream are
+ * untouched). One encode pass at -preset veryfast -threads 1, no heap bump. Returns the subdivided
+ * path, or null (no words / no cuts / any failure) so the caller keeps the un-cut beat.
+ */
+async function renderBeatWithFillerCuts(
+  baseCanon: string,
+  fillerPaths: string[],
+  narrationWav: string,
+  density: { minSec: number; maxSec: number },
+  holdMsBeat: number,
+  punchline: { word: string; asset: string } | undefined,
+  D: number,
+  ctx: { outputDir: string; clipId: number; tmpId: string; i: number },
+): Promise<string | null> {
+  const { outputDir, clipId, tmpId, i } = ctx;
+  if (D <= 0.5 || fillerPaths.length === 0) return null;
+
+  const words = await transcribeNarrationWords(narrationWav, outputDir, `${clipId}_${i}_${tmpId}`);
+  if (words.length === 0) return null;
+  // Duration floor #1: if the beat opens on something to READ (holdMsBeat), suppress filler cuts for
+  // that long so the viewer is never cut away mid-read.
+  const beatHolds = holdMsBeat > 0 ? [{ start: 0, end: Math.min(D, holdMsBeat / 1000) }] : [];
+  const cuts = planFillerCuts(words, 0, D, density, beatHolds)
+    .filter((c) => c > 0.15 && c < D - 0.15)
+    .slice(0, 80); // safety cap on filtergraph size
+  if (cuts.length === 0) return null;
+
+  // Canonicalize each filler once (1080x1920/30fps + silent audio).
+  const tmpFiles: string[] = [];
+  const fillerCanon: { path: string; dur: number; isImg: boolean }[] = [];
+  for (let f = 0; f < fillerPaths.length; f++) {
+    const outF = path.join(outputDir, `cutfill_${clipId}_${i}_${f}_${tmpId}.mp4`);
+    const c = await canonicalizeCutAsset(fillerPaths[f]!, outF, D);
+    if (c) { fillerCanon.push(c); tmpFiles.push(outF); }
+    else { try { fs.existsSync(outF) && fs.unlinkSync(outF); } catch { /* ignore */ } }
+  }
+  if (fillerCanon.length === 0) return null;
+
+  // Punchline (optional): land the punch asset on ONE spoken word, 150ms early. Its input sits AFTER
+  // the fillers and appears ONLY in its forced window — never in the base/filler rotation.
+  let punchCanon: { path: string; dur: number; isImg: boolean } | null = null;
+  let punchAt = -1;
+  if (punchline && punchline.word && punchline.asset) {
+    const pt = findWordTime(words, punchline.word, 0.15);
+    if (pt !== null && pt > 0.2 && pt < D - 0.3) {
+      const outP = path.join(outputDir, `cutpunch_${clipId}_${i}_${tmpId}.mp4`);
+      punchCanon = await canonicalizeCutAsset(punchline.asset, outP, D);
+      if (punchCanon) { tmpFiles.push(outP); punchAt = pt; }
+    }
+  }
+  const punchInputIdx = punchCanon ? 1 + fillerCanon.length : -1;
+  // input index -> its canonical clip (fillers are 1..K, punch is K+1); base (0) is the beat itself.
+  const canonByInput = new Map<number, { path: string; dur: number; isImg: boolean }>();
+  fillerCanon.forEach((fc, j) => canonByInput.set(j + 1, fc));
+  if (punchCanon) canonByInput.set(punchInputIdx, punchCanon);
+
+  // Interval plan (timeline coords first). Base + fillers rotate; the punch window is FORCED to the
+  // punch asset and kept a single uninterrupted interval (filler cuts inside it are dropped).
+  const PUNCH_HOLD = 1.3;
+  const punchEnd = punchAt >= 0 ? Math.min(D, punchAt + Math.min(PUNCH_HOLD, D - punchAt)) : -1;
+  const cutsForBounds = punchAt >= 0 ? cuts.filter((c) => c <= punchAt + 1e-6 || c >= punchEnd - 1e-6) : cuts;
+  const boundSet = new Set<number>([0, D, ...cutsForBounds]);
+  if (punchAt >= 0) { boundSet.add(punchAt); boundSet.add(punchEnd); }
+  const bounds = Array.from(boundSet).filter((x) => x >= 0 && x <= D).sort((a, b) => a - b);
+  const rotation: number[] = [0, ...fillerCanon.map((_, j) => j + 1)]; // 0 = base; j+1 = filler (punch excluded)
+  type Seg = { input: number; tStart: number; tEnd: number };
+  const raw: Seg[] = [];
+  let rotIdx = 0;
+  for (let k = 0; k + 1 < bounds.length; k++) {
+    const tStart = bounds[k]!, tEnd = bounds[k + 1]!;
+    if (tEnd - tStart <= 0.05) continue;
+    if (punchAt >= 0 && Math.abs(tStart - punchAt) < 1e-6) {
+      raw.push({ input: punchInputIdx, tStart, tEnd }); // forced punch window (outside the rotation)
+    } else {
+      raw.push({ input: rotation[rotIdx % rotation.length]!, tStart, tEnd });
+      rotIdx++;
+    }
+  }
+  // Duration floor #2: an image filler is a readable hold — never cut away from it before
+  // IMAGE_HOLD_SEC; absorb the following intervals that would have cut mid-read. (Punch is pre-sized.)
+  const IMAGE_HOLD_SEC = 1.4;
+  const merged: Seg[] = [];
+  for (let k = 0; k < raw.length; k++) {
+    const cur: Seg = { ...raw[k]! };
+    const c = canonByInput.get(cur.input);
+    if (cur.input !== punchInputIdx && c && c.isImg) {
+      while (k + 1 < raw.length && cur.tEnd - cur.tStart < IMAGE_HOLD_SEC) cur.tEnd = raw[++k]!.tEnd;
+    }
+    merged.push(cur);
+  }
+  if (merged.length < 2) return null;
+
+  // Convert to per-input trim windows (base = real timeline; filler/punch = rolling offset in the clip).
+  const plan: { input: number; a: number; b: number }[] = merged.map((s) => {
+    const L = s.tEnd - s.tStart;
+    if (s.input === 0) return { input: 0, a: s.tStart, b: s.tEnd };
+    const c = canonByInput.get(s.input)!;
+    const room = Math.max(0, c.dur - L);
+    const off = room > 0.05 ? (s.tStart % room) : 0;
+    return { input: s.input, a: off, b: off + L };
+  });
+
+  // An input pad can be consumed only ONCE, so split each used input into as many copies as needed.
+  const usage = new Map<number, number>();
+  for (const pl of plan) usage.set(pl.input, (usage.get(pl.input) ?? 0) + 1);
+  const splitDecls: string[] = [];
+  const splitLabels = new Map<number, string[]>();
+  for (const [inp, cnt] of usage) {
+    const labels = Array.from({ length: cnt }, (_, x) => `i${inp}s${x}`);
+    splitDecls.push(`[${inp}:v]split=${cnt}${labels.map((l) => `[${l}]`).join("")}`);
+    splitLabels.set(inp, labels);
+  }
+  const cursor = new Map<number, number>();
+  const vsegs: string[] = [];
+  const outLabels: string[] = [];
+  plan.forEach((pl, k) => {
+    const ci = cursor.get(pl.input) ?? 0;
+    cursor.set(pl.input, ci + 1);
+    const inLbl = splitLabels.get(pl.input)![ci]!;
+    const outLbl = `v${k}`;
+    vsegs.push(`[${inLbl}]trim=start=${pl.a.toFixed(3)}:end=${pl.b.toFixed(3)},setpts=PTS-STARTPTS,setsar=1[${outLbl}]`);
+    outLabels.push(`[${outLbl}]`);
+  });
+  const filter = [...splitDecls, ...vsegs].join(";") + `;${outLabels.join("")}concat=n=${outLabels.length}:v=1:a=0[vcat]`;
+
+  const inputs: string[] = ["-y", "-i", baseCanon];
+  for (const fc of fillerCanon) inputs.push("-i", fc.path);
+  if (punchCanon) inputs.push("-i", punchCanon.path);
+  const anullIdx = 1 + fillerCanon.length + (punchCanon ? 1 : 0);
+  inputs.push("-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo");
+
+  const outPath = path.join(outputDir, `cutbeat_${clipId}_${i}_${tmpId}.mp4`);
+  try {
+    await spawnProcess("ffmpeg", [
+      ...inputs, "-filter_complex", filter,
+      "-map", "[vcat]", "-map", `${anullIdx}:a`, "-t", String(D),
+      "-c:v", "libx264", "-preset", "veryfast", "-threads", "1", "-crf", "16", "-pix_fmt", "yuv420p", "-r", "30",
+      "-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-ac", "2", "-movflags", "+faststart", outPath,
+    ], 0, () => {}, RENDER_STALL_MS, "render");
+  } catch (e) {
+    logger.warn({ e, beat: i + 1 }, "Cut-engine filler concat failed — using un-cut beat");
+  } finally {
+    for (const f of tmpFiles) { try { fs.existsSync(f) && fs.unlinkSync(f); } catch { /* ignore */ } }
+  }
+  if (!fs.existsSync(outPath) || ((await probeContentDuration(outPath)) || 0) <= 0.3) {
+    try { fs.existsSync(outPath) && fs.unlinkSync(outPath); } catch { /* ignore */ }
+    return null;
+  }
+  return outPath;
+}
+
 /**
  * Renders a MATCH STORY (jobType "matchstory"): a research-driven, MULTI-SOURCE narrated
  * montage. Each beat is a StorySegment carrying its OWN youtubeUrl (different broadcast /
@@ -2890,8 +3129,24 @@ export async function processMatchStory(
       await canonicalizePart(rawPath, canonPath);
       try { fs.existsSync(rawPath) && fs.unlinkSync(rawPath); } catch { /* ignore */ }
       if (!fs.existsSync(canonPath)) throw new Error(`Match Story: normalize pass failed for beat #${i + 1}`);
-      parts.push(canonPath);
-      partDurs.push((await probeContentDuration(canonPath)) || 0);
+      // Story Mode 2.0 cut engine: if this beat carries cut fields, subdivide it into rapid filler
+      // cuts on the narration word gaps. Falls back to the un-cut beat on any failure — a beat with
+      // no cutDensity/fillerAssets is completely untouched (existing stories render byte-identical).
+      let beatPart = canonPath;
+      const cutFillers = seg.fillerAssets ?? [];
+      if (perBeat && seg.cutDensity && cutFillers.length > 0 && beatVo[i]?.wav) {
+        const beatDur = (await probeContentDuration(canonPath)) || 0;
+        const subdivided = await renderBeatWithFillerCuts(
+          canonPath, cutFillers, beatVo[i]!.wav, seg.cutDensity, seg.holdMs ?? 0, seg.punchline, beatDur, { outputDir, clipId, tmpId, i },
+        );
+        if (subdivided && fs.existsSync(subdivided)) {
+          try { fs.existsSync(canonPath) && fs.unlinkSync(canonPath); } catch { /* ignore */ }
+          beatPart = subdivided;
+          logger.info({ clipId, beat: i + 1, fillers: cutFillers.length }, "Beat subdivided with filler cuts");
+        }
+      }
+      parts.push(beatPart);
+      partDurs.push((await probeContentDuration(beatPart)) || 0);
       await updateProgress(5 + ((i + 1) / segs.length) * 58, true);
     }
 
