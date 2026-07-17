@@ -229,7 +229,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     with open(dst, 'w') as f:
         f.write(header)
         for ws, we, text in events:
-            f.write(f"Dialogue: 0,{ass_time(ws)},{ass_time(we)},Cap,,0,0,0,,{text}\n")
+            # Pin every line to an absolute bottom-center position so multi-line vs single-line
+            # captions never shift up/down (the reported "caption goes up then comes down").
+            f.write(f"Dialogue: 0,{ass_time(ws)},{ass_time(we)},Cap,,0,0,0,,{{\\pos({PLAY_W//2},{PLAY_H-MARGIN_V})}}{text}\n")
 
 
 if __name__ == "__main__":

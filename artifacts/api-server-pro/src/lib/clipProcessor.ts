@@ -2436,22 +2436,38 @@ async function mixNarrationOnFile(
   // Match Story: duck the footage with a sidechain COMPRESSOR keyed by the voice (attack/
   // release give smooth fades) instead of the hard volume gate, so there's no abrupt jump
   // in/out of each line. Ignored when the footage has no audio.
-  smoothDuck = false
+  smoothDuck = false,
+  // Match Story: reuse the per-beat WAVs already rendered in the beat loop instead of regenerating
+  // from the "sec | line" script — kills the WAV-length mismatch that left multi-second silence gaps,
+  // and halves Piper time. Each entry places its WAV at `sec` on the stitched timeline.
+  preRendered: { sec: number; wav: string }[] = [],
+  // Match Story mutes its footage, so the bed is SILENT — skip the sidechain duck (it only pumps on
+  // silence, the "echo") and mix the voice cleanly.
+  mutedBed = false
 ): Promise<void> {
   const outputDir = getOutputDir();
   try {
-    const lines = parseNarrationLines(narrationScript, duration, outroEnabled, maxLines);
     const wavPaths: string[] = [];
     const spoken: { start: number; end: number }[] = [];
-    for (const [i, ln] of lines.entries()) {
-      const wav = path.join(outputDir, `clip_${clipId}_snarr_${i}.wav`);
-      if (!(await generateNarrationWav(ln.text, wav, voice, speed))) {
-        logger.warn({ clipId, line: i }, "Story narration WAV not produced — skipping line");
-        continue;
+    if (preRendered.length) {
+      for (const pr of preRendered) {
+        if (!fs.existsSync(pr.wav)) continue;
+        const wdur = (await probeContentDuration(pr.wav)) || 3;
+        wavPaths.push(pr.wav);
+        spoken.push({ start: pr.sec, end: pr.sec + wdur + 0.4 });
       }
-      const wdur = (await probeContentDuration(wav)) || 3;
-      wavPaths.push(wav);
-      spoken.push({ start: ln.sec, end: ln.sec + wdur + 0.4 });
+    } else {
+      const lines = parseNarrationLines(narrationScript, duration, outroEnabled, maxLines);
+      for (const [i, ln] of lines.entries()) {
+        const wav = path.join(outputDir, `clip_${clipId}_snarr_${i}.wav`);
+        if (!(await generateNarrationWav(ln.text, wav, voice, speed))) {
+          logger.warn({ clipId, line: i }, "Story narration WAV not produced — skipping line");
+          continue;
+        }
+        const wdur = (await probeContentDuration(wav)) || 3;
+        wavPaths.push(wav);
+        spoken.push({ start: ln.sec, end: ln.sec + wdur + 0.4 });
+      }
     }
     if (spoken.length > 0) {
       let narrHasAudio = false;
@@ -2462,7 +2478,7 @@ async function mixNarrationOnFile(
       const ffInputs: string[] = ["-y", "-i", filePath];
       for (const w of wavPaths) ffInputs.push("-i", w);
       const anullIdx = 1 + wavPaths.length;
-      if (!narrHasAudio) ffInputs.push("-f", "lavfi", "-t", String(duration), "-i", "anullsrc=r=48000:cl=stereo");
+      if (!narrHasAudio || mutedBed) ffInputs.push("-f", "lavfi", "-t", String(duration), "-i", "anullsrc=r=48000:cl=stereo");
       const parts: string[] = [];
       // Delayed narration inputs [n1..nK] — shared by every ducking path.
       const narrLabels: string[] = [];
@@ -2472,7 +2488,7 @@ async function mixNarrationOnFile(
         parts.push(`[${inIdx}:a]adelay=${delayMs}:all=1,aresample=48000,aformat=channel_layouts=stereo[n${inIdx}]`);
         narrLabels.push(`[n${inIdx}]`);
       });
-      if (narrHasAudio && smoothDuck) {
+      if (narrHasAudio && smoothDuck && !mutedBed) {
         // Smooth sidechain duck: sum the voice into one key, compress the footage by it
         // (attack/release act as fades), then mix the voice back over the ducked footage.
         // NB: duration=LONGEST — with duration=first the sum would be truncated to the first
@@ -2491,6 +2507,12 @@ async function mixNarrationOnFile(
         parts.push(`[0:a]aresample=48000,aformat=channel_layouts=stereo,volume=${duckVolume}[foot]`);
         parts.push(`[foot][nkey]sidechaincompress=threshold=0.02:ratio=20:attack=5:release=260:makeup=1[duckfoot]`);
         parts.push(`[duckfoot][nmix]amix=inputs=2:duration=first:normalize=0,loudnorm=I=-14:TP=-1.5:LRA=11[aout]`);
+      } else if (mutedBed) {
+        // Muted footage bed (Match Story): mix the voice over pure silence — NO sidechain (nothing to
+        // duck) and NO dynamic loudnorm (it pumps/breathes across the silence between lines = the
+        // reported "echo"). A gentle fixed boost + peak limiter keeps a clean, consistent 48kHz level.
+        const mixLabels: string[] = [`[${anullIdx}:a]`, ...narrLabels];
+        parts.push(`${mixLabels.join("")}amix=inputs=${mixLabels.length}:duration=first:normalize=0,volume=1.7,alimiter=limit=0.95,aresample=48000,aformat=channel_layouts=stereo[aout]`);
       } else {
         // Hard-gate duck (Story / Top 5): footage drops to duckVolume only inside each window.
         if (narrHasAudio) {
@@ -3089,7 +3111,7 @@ export async function processMatchStory(
             beatVo[i] = { text: line, caption: (seg.captionLine ?? "").trim() || line, wav, dur: voDur };
           }
         }
-        const pad = 0.3 + 0.9 + (isLast && outroEnabled ? 2 : 0);
+        const pad = 0.3 + 0.4 + (isLast && outroEnabled ? 1 : 0);
         if (isLocalBeat(seg)) {
           // Scout/local beats: TRIM the downloaded clip down to its narration line (B-roll cut to
           // fit) so the story is NARRATION-DRIVEN and tight — not the full clip (playing whole scout
@@ -3183,6 +3205,7 @@ export async function processMatchStory(
     //    on the stitched (crossfade-shortened) timeline, so the voice lands on its own beat.
     //    Footage is smooth-ducked with a sidechain compressor (only the AI voice is heard).
     let effectiveNarration = narrationScript;
+    const preRenderedWavs: { sec: number; wav: string }[] = [];
     if (perBeat) {
       const beatPartOffset = parts.length > segs.length ? 1 : 0; // title card occupies parts[0]
       const lines: string[] = [];
@@ -3196,6 +3219,7 @@ export async function processMatchStory(
         // Land the line just after the beat is fully on screen (past the incoming crossfade).
         const sec = Math.max(0.3, startFinal + (partIdx > 0 ? usedFade : 0) + 0.3);
         lines.push(`${sec.toFixed(1)} | ${vo.text}`);
+        if (vo.wav && fs.existsSync(vo.wav)) preRenderedWavs.push({ sec, wav: vo.wav });
       }
       effectiveNarration = lines.join("\n");
     }
@@ -3203,7 +3227,7 @@ export async function processMatchStory(
     let narrTrackPath = "";
     if (effectiveNarration && effectiveNarration.trim() && totalDuration > 0) {
       narrTrackPath = path.join(outputDir, `match_${clipId}_narrtrack_${tmpId}.wav`);
-      await mixNarrationOnFile(clipId, finalOutputPath, totalDuration, outroEnabled, effectiveNarration, msVoice, msSpeed, 0.06, 16, narrTrackPath, true);
+      await mixNarrationOnFile(clipId, finalOutputPath, totalDuration, outroEnabled, effectiveNarration, msVoice, msSpeed, 0.06, 16, narrTrackPath, true, perBeat ? preRenderedWavs : [], perBeat);
       if (!fs.existsSync(narrTrackPath)) narrTrackPath = "";
     }
     await updateProgress(88, true);
