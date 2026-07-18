@@ -1084,7 +1084,7 @@ const KNOWN_VOICES = new Set([
 function resolveVoice(voice: string | undefined, kind: "top5" | "story" | "script" | "hook" | "matchstory"): string {
   const v = (voice ?? "").trim();
   if (v && KNOWN_VOICES.has(v)) return v;
-  if (kind === "matchstory") return "en_US-hfc_male-medium"; // Story Mode 2.0 / Scout default
+  if (kind === "matchstory") return "en_US-ryan-medium"; // Story Mode 2.0 / Scout default (warm voice)
   if (kind === "story" || kind === "script") return "en_GB-alan-medium";
   return "en_US-joe-medium"; // top5 + single-clip hook
 }

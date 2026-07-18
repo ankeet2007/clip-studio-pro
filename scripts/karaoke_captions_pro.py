@@ -22,7 +22,7 @@ Usage: python3 karaoke_captions_pro.py <whisper.json> <out.ass> [outro_start_sec
 `highlight_hex` (optional) is the spoken/active-word colour as "#RRGGBB" (or bare
 "RRGGBB"); blank/invalid falls back to the classic bright yellow.
 """
-import json, os, re, sys
+import json, os, re, sys, difflib
 
 # ---- style knobs (kept identical to karaoke_captions.py for a consistent look)
 FONT          = "DejaVu Sans"
@@ -168,6 +168,27 @@ def group_lines(words):
     return lines
 
 
+def _norm(s):
+    return re.sub(r'[^\w]', '', s.lower())
+
+
+def respell(words, known):
+    """Replace each whisper word's TEXT with the exact known-script word (onsets untouched), aligned by
+    difflib. Fixes ASR typos on hard names ('Yemel'->'Yamal'), casing ('goat'->'GOAT') and punctuation
+    so on-screen captions match the intended script. Robust to insert/delete (those keep whisper's text)."""
+    if not known:
+        return words
+    wn = [_norm(w[0]) for w in words]
+    kn = [_norm(k) for k in known]
+    out = [list(w) for w in words]
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, wn, kn, autojunk=False).get_opcodes():
+        if tag in ('equal', 'replace'):
+            for d in range(min(i2 - i1, j2 - j1)):
+                if _norm(known[j1 + d]):           # never overwrite a real word with pure punctuation
+                    out[i1 + d][0] = known[j1 + d]
+    return out
+
+
 def main():
     src, dst = sys.argv[1], sys.argv[2]
     outro_start = float(sys.argv[3]) if len(sys.argv) > 3 else 1e9
@@ -180,6 +201,17 @@ def main():
         words = extract_words(data.get("transcription", []))
     except Exception:
         words = []
+
+    # Hard-name / exact-script re-spell: argv[5] is a file with the known script; align whisper words
+    # to it (timing kept) so ASR typos like "Yemel"->"Yamal" and casing are fixed on screen.
+    if len(sys.argv) > 5 and sys.argv[5]:
+        try:
+            with open(sys.argv[5]) as kf:
+                known = kf.read().split()
+            if known:
+                words = respell(words, known)
+        except Exception:
+            pass
 
     # Apply outro cutoff.
     words = [w for w in words if w[1] < outro_start]

@@ -41,7 +41,7 @@ const INSTRUCTIONS = [
   "render trims each clip to its line but WON'T stretch a short clip, so a clip shorter than its narration",
   "freezes/bleeds at the tail. If your extract_segment window is too short, re-cut it a few seconds longer.",
   "",
-  "VOICE: leave voice unset for the default clean neutral US male narrator (en_US-hfc_male-medium) at",
+  "VOICE: leave voice unset for the default WARM US male narrator (en_US-ryan-medium) at",
   "natural pace, or pass voice/pace to override.",
   "",
   "CARDS: the intro title card and outro SUBSCRIBE card are OFF by default. Pass titleCard:true or",
@@ -56,6 +56,10 @@ const INSTRUCTIONS = [
   "  • punchline {word,asset}: a sniper cut landing an image exactly on ONE spoken word (150ms early). A few",
   "    per video. The word MUST appear in that beat's narration or it is dropped.",
   "  • holdMs: if a beat shows something to READ (screenshot/meme), ms to hold before any filler cut.",
+  "  RULE: the beat's MAIN clip must be at least as long as its spoken line (see CLIP LENGTH) — a shorter",
+  "  clip makes the voice overlap the next beat (an 'echo'). Fillers can be short (they roll). Give >=2",
+  "  DISTINCT fillers per rapid beat so the picture never repeats back-to-back, and pick fillers that fit",
+  "  what the line is about (Yamal footage on a Yamal line) — matched, not random, reads far better.",
   "  Omit all of these on a beat to keep the classic one-clip-per-beat look.",
   "",
   "HARD NAMES: if a name would be mispronounced by the TTS, spell the beat's `narration` PHONETICALLY",
@@ -162,7 +166,7 @@ const TOOLS = [
       properties: {
         title: { type: "string", description: "4-7 word title (shown on the title card only if titleCard:true)." },
         segments: { type: "array", items: SEGMENT_SCHEMA, description: "The beats, in play order (2-8)." },
-        voice: { type: "string", description: "Optional Piper voice id (e.g. en_US-hfc_male-medium, en_GB-alan-medium, en_US-joe-medium). Omit to use the default clean neutral US male narrator (en_US-hfc_male-medium)." },
+        voice: { type: "string", description: "Optional Piper voice id (e.g. en_US-ryan-medium, en_GB-alan-medium, en_US-joe-medium). Omit to use the default warm US male narrator (en_US-ryan-medium)." },
         pace: { type: "string", description: "Narration pace: 'normal' (default, natural human speed), 'slightly-slow', 'slow', or a Piper length_scale 0.7-1.6." },
         captions: { type: "boolean", description: "Burn karaoke captions (default true)." },
         titleCard: { type: "boolean", description: "Show the opening title card (default false). Pass true to add an intro title card." },
@@ -330,7 +334,7 @@ async function runCreateMatchStory(args: any): Promise<ToolResult> {
     captionColor: /^#?[0-9a-fA-F]{6}$/.test(String(args?.captionColor ?? "")) ? String(args?.captionColor).replace(/^#?/, "#") : "#FFF400",
     // Default to the clean, neutral US male narrator (HFC male) at normal (1.0) pace. Callers
     // can override with `voice` / `pace`.
-    voiceoverVoice: String(args?.voice || "en_US-hfc_male-medium"),
+    voiceoverVoice: String(args?.voice || "en_US-ryan-medium"),
     voiceoverSpeed: resolvePace(args?.pace ?? "normal"),
     segments: beats.map((b) => ({
       sourceType: "local", localFile: b.localFile,
