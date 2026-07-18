@@ -410,7 +410,7 @@ async function runUnderstandVideo(args: any): Promise<ToolResult> {
   const res = u.width ? ` · ${u.width}x${u.height}` : "";
   const windowed = startSec != null || windowSec != null;
   const lines = [`Video from ${u.platform} · ${Math.round(u.durationSec)}s${res}${windowed ? ` (analysed ${u.windowStart.toFixed(0)}s–${u.windowEnd.toFixed(0)}s)` : ""}.`];
-  if (u.transcript) lines.push(`\nSpoken/commentary transcript${u.transcriptTruncated ? " (first 60s)" : ""}:\n${u.transcript}`);
+  if (u.transcript) lines.push(`\nSpoken/commentary transcript${u.transcriptTruncated ? " (truncated — clip longer than the transcribed window)" : ""}:\n${u.transcript}`);
   else lines.push("\nNo speech transcript (the clip is silent or transcription was unavailable).");
   if (u.scenes.length) lines.push(`\nScene cuts (real source timecodes, seconds) — use as extract_segment in/out anchors: ${u.scenes.map((s) => s.toFixed(1)).join(", ")}`);
   if (u.notes.length) lines.push(`\nNotes: ${u.notes.join("; ")}`);

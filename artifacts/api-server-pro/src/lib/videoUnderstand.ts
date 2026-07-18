@@ -25,10 +25,23 @@ const WHISPER_BIN = process.env["WHISPER_BIN"] || path.join(HOME, "whisper.cpp/b
 const WHISPER_LIB = path.dirname(WHISPER_BIN);
 // tiny.en, not small.en: on the low-end phone CPU, small.en took >90s for a 6s clip (unusable
 // interactively) while tiny.en does it in ~9s incl. model load. Quality is lower but it's only for
-// gist/commentary — the keyframes carry the visual understanding. Override via env if desired.
+// gist/commentary — the keyframes carry the visual understanding. Override via env if desired
+// (UNDERSTAND_WHISPER_MODEL=…/ggml-small.en.bin trades speed for accuracy — only when the budget allows).
 const WHISPER_MODEL = process.env["UNDERSTAND_WHISPER_MODEL"] || path.join(HOME, "whisper.cpp/models/ggml-tiny.en.bin");
-const TRANSCRIBE_CAP_SEC = 60; // only transcribe the first minute — bounds whisper time on long clips
-const OVERALL_BUDGET_MS = 45_000; // keep the whole call under the ~35-45s an MCP client will wait for
+const TRANSCRIBE_CAP_SEC = 60;           // cloud (async medium.en) may transcribe up to the first minute
+// The whole synchronous call. Bumped 45s → 70s so the local tiny.en fallback reliably gets to run even
+// after a download + a (bounded) cloud attempt — still well under mcp.ts's 130s hard ceiling. Env-tunable.
+const OVERALL_BUDGET_MS = Number(process.env["UNDERSTAND_BUDGET_MS"]) || 70_000;
+// ALWAYS keep at least this much of the budget for the local tiny.en fallback so a slow OR unreachable
+// cloud can NEVER starve it — that starvation was the bug that made every call report "medium.en was cold".
+const LOCAL_RESERVE_MS = Number(process.env["UNDERSTAND_LOCAL_RESERVE_MS"]) || 27_000;
+// The cloud medium.en pass is ASYNC and here only OPPORTUNISTIC: poll it just long enough to win on a
+// fast (GPU) box, then fall back to local. On a slow CPU box it runs ~4 min — far past any interactive
+// wait — so we must never block on it.
+const CLOUD_POLL_CAP_MS = Number(process.env["UNDERSTAND_CLOUD_POLL_MS"]) || 12_000;
+// Cap the LOCAL window: the phone's tiny.en is ~1x realtime, so transcribing much more than this would
+// blow the interactive budget. The cloud pass (when it wins) still covers the full TRANSCRIBE_CAP_SEC.
+const LOCAL_TRANSCRIBE_CAP_SEC = Number(process.env["UNDERSTAND_LOCAL_CAP_SEC"]) || 22;
 
 export type UnderstandPlatform = "reddit" | "x" | "instagram" | "facebook" | "youtube" | "local";
 
@@ -223,8 +236,10 @@ export async function extractSegment(src: string, start: string | number, end: s
 // When winStart>0 we input-seek (-ss before -i), which resets output pts to ~0 at the seek point,
 // so we add winStart back to recover the true SOURCE timecode (accurate to within a keyframe — good
 // enough to anchor an extract_segment; Claude confirms the exact moment from the keyframes).
-// Best-effort — any failure/timeout yields [] (→ evenly-spaced frames).
-async function sceneTimestamps(file: string, winStart: number, scanLen: number, budgetMs: number): Promise<number[]> {
+// Returns the cuts, or NULL when the pass was skipped/failed/timed out (motion UNKNOWN — distinct from
+// an empty array, which means it ran and the window genuinely has no cuts). The caller must not report
+// a null result as "static". Frames fall back to evenly-spaced on null/[].
+async function sceneTimestamps(file: string, winStart: number, scanLen: number, budgetMs: number): Promise<number[] | null> {
   try {
     const preArgs = winStart > 0 ? ["-ss", String(winStart)] : [];
     const { stderr } = await execFileAsync("ffmpeg", [
@@ -242,7 +257,7 @@ async function sceneTimestamps(file: string, winStart: number, scanLen: number, 
     }
     return ts;
   } catch {
-    return [];
+    return null;
   }
 }
 
@@ -307,17 +322,36 @@ async function localTranscribe(wav: string, dir: string, budgetMs: number): Prom
   return fs.readFileSync(`${ofPrefix}.txt`, "utf8").replace(/\s+/g, " ").trim();
 }
 
-// When the render cloud is ON, transcribe on the worker's medium.en (much sharper on names / scores
-// / minute-marks than the phone's tiny.en). ASYNC submit→poll (each request short, so the cloud's
-// ~100s tunnel timeout never cuts a long medium.en pass). Health-gated; ANY problem (cloud off/
-// unreachable/error/deadline) returns null so the caller falls back to the phone's local tiny.en.
-// `maxWaitMs` caps the poll so the SYNCHRONOUS understand_video call can't run past the MCP client's
-// wait — a COLD medium.en load is ~30s, so an unbounded wait made watching the pipeline's own render
-// output time out. On a bail the worker still finishes in the background; the caller uses local tiny.en.
-async function cloudTranscribe(wav: string, maxWaitMs = 90_000): Promise<string | null> {
+// Why the cloud transcript didn't come back — surfaced to the caller so the user-facing note can be
+// HONEST instead of masking a hard failure behind a generic "cold" message.
+//   off          — the render cloud isn't configured (no CLOUD_RENDER_URL)
+//   unreachable  — health/network failed (tunnel or box down)
+//   submit_failed— the box answered health but /worker/transcribe-job rejected the upload (endpoint broken)
+//   job_error    — the worker ran whisper and it errored / produced nothing
+//   timeout      — the job was still running when our (short, opportunistic) poll window ended
+type CloudFailReason = "off" | "unreachable" | "submit_failed" | "job_error" | "timeout";
+type CloudResult = { ok: true; transcript: string } | { ok: false; reason: CloudFailReason };
+
+function cloudFailNote(reason: CloudFailReason): string {
+  switch (reason) {
+    case "timeout": return "cloud medium.en too slow this call — ~4 min on the current CPU box";
+    case "unreachable": return "cloud unreachable — render tunnel/box down";
+    case "submit_failed": return "cloud transcribe endpoint error";
+    case "job_error": return "cloud transcription errored";
+    case "off": return "cloud off";
+  }
+}
+
+// When the render cloud is ON, transcribe on the worker's medium.en (much sharper on names / scores /
+// minute-marks than the phone's tiny.en). ASYNC submit→poll. Returns the transcript OR a typed reason so
+// the caller can fall back to local tiny.en AND tell the user the truth. `maxWaitMs` bounds the WHOLE
+// call (health + submit + poll) — on a fast GPU box medium.en returns inside it and wins; on a slow CPU
+// box it returns { reason: "timeout" } quickly and the worker keeps finishing in the background unused.
+async function cloudTranscribe(wav: string, maxWaitMs = 90_000): Promise<CloudResult> {
   const base = process.env["CLOUD_RENDER_URL"];
-  if (!base) return null;
+  if (!base) return { ok: false, reason: "off" };
   const secret = process.env["CLOUD_RENDER_SECRET"] || "";
+  const cloudStart = Date.now();
   const fetchT = async (u: URL, init: RequestInit, ms: number): Promise<Response | null> => {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), ms);
@@ -326,30 +360,34 @@ async function cloudTranscribe(wav: string, maxWaitMs = 90_000): Promise<string 
     finally { clearTimeout(timer); }
   };
   try {
-    // Fast health gate → cloud off/unreachable ⇒ null ⇒ caller uses local tiny.en in ~3.5s.
+    // Fast health gate → cloud off/unreachable ⇒ caller uses local tiny.en in ~3.5s.
     const health = await fetchT(new URL("/health", base), {}, 3500);
-    if (!health || !health.ok) return null;
+    if (!health || !health.ok) return { ok: false, reason: "unreachable" };
     // Submit the wav; the worker runs medium.en in the background and hands back a jobId.
     const submit = await fetchT(new URL("/worker/transcribe-job", base), {
       method: "POST", headers: { "content-type": "audio/wav", "x-worker-secret": secret }, body: fs.readFileSync(wav),
     }, 30_000);
-    if (!submit || !submit.ok) return null;
+    if (!submit || !submit.ok) return { ok: false, reason: "submit_failed" };
     const { jobId } = (await submit.json()) as { jobId?: string };
-    if (!jobId) return null;
-    // Poll (short requests) until done, but only for the caller's budget (below the MCP client wait).
+    if (!jobId) return { ok: false, reason: "submit_failed" };
+    // Poll (short requests) until done, but only within the caller's budget (measured from entry so
+    // health+submit count against it, keeping the whole cloud attempt under the reserved-local guard).
     const statusUrl = new URL(`/worker/transcribe-job/${encodeURIComponent(jobId)}`, base);
-    const deadline = Date.now() + Math.max(8_000, maxWaitMs);
+    const deadline = cloudStart + Math.max(6_000, maxWaitMs);
     while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 4000));
-      const st = await fetchT(statusUrl, { headers: { "x-worker-secret": secret } }, 15_000);
+      await new Promise((r) => setTimeout(r, 3000));
+      const st = await fetchT(statusUrl, { headers: { "x-worker-secret": secret } }, 12_000);
       if (!st || !st.ok) continue;
       const j = (await st.json()) as { status?: string; transcript?: string };
-      if (j.status === "done") return (j.transcript ?? "").replace(/\s+/g, " ").trim() || null;
-      if (j.status === "error") return null;
+      if (j.status === "done") {
+        const t = (j.transcript ?? "").replace(/\s+/g, " ").trim();
+        return t ? { ok: true, transcript: t } : { ok: false, reason: "job_error" };
+      }
+      if (j.status === "error") return { ok: false, reason: "job_error" };
     }
-    return null;
+    return { ok: false, reason: "timeout" };
   } catch {
-    return null;
+    return { ok: false, reason: "unreachable" };
   }
 }
 
@@ -394,60 +432,97 @@ export async function understandVideo(src: string, maxFrames = 5, startSec?: num
     // overall budget remains to still leave room for the transcript; otherwise fall back cleanly to
     // evenly-spaced frames (scenes = []). Normal clips cap the scan at 45s (phone budget); an
     // explicit window may scan up to 120s.
-    let scenes: number[] = [];
+    let scenes: number[] | null = null;   // null ⇒ scan skipped/timed out (motion UNKNOWN, NOT static)
+    let sceneScanCoveredSec = 0;           // how much of the window we actually scene-scanned
     if (dur >= 3) {
-      const sceneBudget = Math.min(15_000, OVERALL_BUDGET_MS - (Date.now() - started) - 22_000);
+      const sceneBudget = Math.min(18_000, OVERALL_BUDGET_MS - (Date.now() - started) - LOCAL_RESERVE_MS - 8_000);
       if (sceneBudget >= 5000) {
         const scanLen = explicitWindow ? Math.min(winLen, 40) : Math.min(winLen, 45);
+        sceneScanCoveredSec = scanLen;
         scenes = await sceneTimestamps(file, winStart, scanLen, sceneBudget);
       }
     }
+    const sceneList = scenes ?? [];
     // Bound frame extraction so the whole call still returns within the client's wait window even when
-    // the source is slow to decode (AV1 / long HD / a 1080x1920 render output): finish frames by ~22s in,
-    // leaving the rest of the budget for the transcript (a cold cloud medium.en load is ~30s on its own).
-    const frameDeadline = started + 22_000;
+    // the source is slow to decode (AV1 / long HD / a 1080x1920 render output): finish frames by ~30s in,
+    // leaving the rest of the (70s) budget for the transcript.
+    const frameDeadline = started + 30_000;
     const frames = dur >= 2
-      ? await extractFramesAt(file, pickFrameTimes(scenes, winStart, winLen, n), dir, frameDeadline)
+      ? await extractFramesAt(file, pickFrameTimes(sceneList, winStart, winLen, n), dir, frameDeadline)
       : await extractFramesAt(file, [Math.max(0, dur / 2)], dir, frameDeadline);
-    if (scenes.length >= 5) notes.push(`action-heavy: ${scenes.length} scene changes detected — the keyframes target those moments`);
-    else if (winLen > 6 && scenes.length <= 1) notes.push("low visual motion (few/no scene changes) — likely static, a talking-head, or a graphic; verify it shows real action before using");
+    // HONEST motion note. Only claim "static" when the scan actually RAN and covered (nearly) the whole
+    // window — a skipped/timed-out scan (scenes===null) or a partial scan of a long clip must NOT be
+    // misread as static (that mislabelled action-heavy footage as a talking-head and misled beat picks).
+    if (scenes === null) {
+      const hint = explicitWindow
+        ? "the keyframes are still valid — re-try with a SHORTER windowSec (e.g. 15-20s) to get scene-cut timecodes"
+        : "the keyframes are still valid — pass startSec + a short windowSec (e.g. 15-20s) to scene-scan a specific part";
+      notes.push(`scene scan didn't finish this call (HD/long source vs. time budget) — motion UNKNOWN, NOT static; ${hint}`);
+    } else if (sceneList.length >= 5) {
+      notes.push(`action-heavy: ${sceneList.length} scene changes detected — the keyframes target those moments`);
+    } else if (winLen > 6 && sceneList.length <= 1) {
+      if (sceneScanCoveredSec >= winLen - 1) {
+        notes.push("low visual motion (few/no scene changes) — likely static, a talking-head, or a graphic; verify it shows real action before using");
+      } else {
+        notes.push(`scene scan covered only the first ${toHMS(sceneScanCoveredSec)} of a ${toHMS(winLen)} clip — motion later is UNKNOWN; pass startSec/windowSec to scan a later window`);
+      }
+    }
 
     let transcript: string | null = null;
     let transcriptTruncated = false;
     if (meta.hasAudio) {
       try {
-        const wavLen = explicitWindow ? winLen : Math.min(TRANSCRIBE_CAP_SEC, dur || TRANSCRIBE_CAP_SEC);
-        const wav = await extractWav(file, dir, winStart, wavLen);
-        transcriptTruncated = !explicitWindow && dur > TRANSCRIBE_CAP_SEC;
-        // Prefer the cloud worker's medium.en when the render cloud is on, but only give it the time
-        // left in the overall budget — otherwise a cold ~30s model load pushes the whole call past the
-        // ~45s an MCP client waits (this is why self-QC'ing the pipeline's own render output aborted,
-        // NOT any codec quirk). If the cloud can't finish in time it returns null and we fall back to
-        // the phone's fast local tiny.en right below, so the clip still gets a transcript.
-        const cloudBudget = OVERALL_BUDGET_MS - (Date.now() - started) - 3_000;
-        const cloud = cloudBudget >= 8_000 ? await cloudTranscribe(wav, cloudBudget) : null;
-        if (cloud) {
-          transcript = cloud;
-          notes.push("transcript via cloud medium.en (sharper names/numbers)");
-        } else {
-          const remaining = OVERALL_BUDGET_MS - (Date.now() - started) - 2000;
-          const budget = Math.min(30_000, remaining);
-          if (budget >= 8000 && fs.existsSync(WHISPER_BIN) && fs.existsSync(WHISPER_MODEL)) {
-            transcript = (await localTranscribe(wav, dir, budget)) || null;
-          } else if (budget < 8000) {
-            notes.push("transcript omitted this call (cloud medium.en was cold / clip long) — the keyframes are still valid; re-run understand_video for the transcript (the model is now warm and returns fast)");
+        const cloudOn = !!process.env["CLOUD_RENDER_URL"];
+        let cloudReason: CloudFailReason | null = null;
+        // 1) OPPORTUNISTIC cloud medium.en, but ALWAYS reserve LOCAL_RESERVE_MS so it can never starve the
+        //    local fallback (the exact bug behind the perpetual "medium.en was cold" note). A fast GPU box
+        //    returns inside CLOUD_POLL_CAP_MS and wins; a slow CPU box (~4 min) bails and we use local.
+        const cloudBudget = Math.min(CLOUD_POLL_CAP_MS, OVERALL_BUDGET_MS - (Date.now() - started) - LOCAL_RESERVE_MS - 2_000);
+        if (cloudOn && cloudBudget >= 6_000) {
+          const cloudWavLen = explicitWindow ? winLen : Math.min(TRANSCRIBE_CAP_SEC, dur || TRANSCRIBE_CAP_SEC);
+          const cloudWav = await extractWav(file, dir, winStart, cloudWavLen);
+          const c = await cloudTranscribe(cloudWav, cloudBudget);
+          if (c.ok) {
+            transcript = c.transcript;
+            transcriptTruncated = !explicitWindow && dur > TRANSCRIBE_CAP_SEC;
+            notes.push("transcript via cloud medium.en (sharper names/numbers)");
           } else {
-            notes.push("transcript unavailable (whisper not found on server)");
+            cloudReason = c.reason;
           }
         }
+        // 2) LOCAL tiny.en fallback — fast + reliable ("a transcript beats nothing"). Adapt the window to
+        //    the time actually left (tiny.en is ~1x realtime on the phone) so it never overruns the call.
+        if (!transcript && fs.existsSync(WHISPER_BIN) && fs.existsSync(WHISPER_MODEL)) {
+          const localBudget = OVERALL_BUDGET_MS - (Date.now() - started) - 1_500;
+          const affordableSec = Math.floor((localBudget - 4_000) / 1_100); // ~1.1x realtime + ~4s model load
+          const wantSec = explicitWindow ? winLen : Math.min(LOCAL_TRANSCRIBE_CAP_SEC, dur || LOCAL_TRANSCRIBE_CAP_SEC);
+          const localCap = Math.max(4, Math.min(wantSec, LOCAL_TRANSCRIBE_CAP_SEC, affordableSec));
+          if (localBudget >= 8_000 && affordableSec >= 4) {
+            const localWav = await extractWav(file, dir, winStart, localCap);
+            transcript = (await localTranscribe(localWav, dir, Math.min(localBudget, 40_000))
+              .catch((e) => { logger.warn({ e }, "understand: local transcribe failed"); return ""; })) || null;
+            if (transcript) {
+              transcriptTruncated = transcriptTruncated || dur > localCap + 0.5;
+              notes.push(cloudReason ? `transcript via local tiny.en (${cloudFailNote(cloudReason)})` : "transcript via local tiny.en");
+            }
+          }
+        }
+        // 3) Nothing worked — say WHY, honestly, and whether a retry / different box helps.
+        if (!transcript) {
+          if (cloudReason === "timeout") notes.push("transcript unavailable — cloud medium.en didn't return in time (it runs ~4 min on the current CPU box) and no budget was left for local whisper; use a GPU render box, or re-run understand_video on a SHORTER window (startSec/windowSec)");
+          else if (cloudReason === "unreachable") notes.push("transcript unavailable — the render cloud is unreachable (tunnel/box down); run `cloud status`. Local whisper couldn't run either");
+          else if (cloudReason === "submit_failed" || cloudReason === "job_error") notes.push("transcript unavailable — the cloud transcription endpoint errored, and local whisper couldn't run this call");
+          else if (!fs.existsSync(WHISPER_BIN) || !fs.existsSync(WHISPER_MODEL)) notes.push("transcript unavailable (local whisper model not found on the server)");
+          else notes.push("transcript unavailable (not enough time budget this call) — re-run understand_video, or scan a SHORTER window with startSec/windowSec");
+        }
       } catch (e) {
-        notes.push("audio transcript unavailable (transcription timed out or failed)");
+        notes.push("audio transcript unavailable (transcription failed unexpectedly)");
         logger.warn({ e }, "understand: transcription failed");
       }
     }
 
-    logger.info({ platform, duration: dur, window: explicitWindow ? [winStart, winLen] : null, frames: frames.length, scenes: scenes.length, transcript: transcript ? transcript.length : 0 }, "understand: done");
-    return { platform, durationSec: dur, width: meta.width, height: meta.height, hasAudio: meta.hasAudio, transcript, transcriptTruncated, frames, notes, scenes, windowStart: winStart, windowEnd: winStart + winLen };
+    logger.info({ platform, duration: dur, window: explicitWindow ? [winStart, winLen] : null, frames: frames.length, scenes: sceneList.length, sceneScan: scenes === null ? "skipped" : "ran", transcript: transcript ? transcript.length : 0 }, "understand: done");
+    return { platform, durationSec: dur, width: meta.width, height: meta.height, hasAudio: meta.hasAudio, transcript, transcriptTruncated, frames, notes, scenes: sceneList, windowStart: winStart, windowEnd: winStart + winLen };
   } finally {
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* */ }
   }
