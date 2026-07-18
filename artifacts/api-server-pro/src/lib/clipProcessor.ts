@@ -17,6 +17,9 @@ const UPLOADS_DIR = process.env.UPLOADS_DIR ?? path.join(os.homedir(), "myapp", 
 const FONTS_DIR = path.join(findWorkspaceRoot(), "assets", "fonts");
 const WATERMARK_FONT = path.join(FONTS_DIR, "Sora-SemiBold.ttf");
 const ANTON_FONT = path.join(FONTS_DIR, "Anton-Regular.ttf");
+// Light, low-center watermark burned on EVERY frame of a finished clip (deters reposting of scraped
+// YouTube uploads). Drawn in the caption-burn re-encode so it costs no extra pass.
+const WATERMARK_HANDLE = "@theycallmeashot";
 const COOKIES_FILE = path.join(os.tmpdir(), "youtube_cookies.txt");
 
 /**
@@ -2327,7 +2330,9 @@ async function burnCaptionsOnFile(
   captionSourceOverride = "",
   // Match Story passes the EXACT spoken narration text here; the karaoke step re-spells
   // whisper's words to it (timing kept) so captions never carry an ASR typo.
-  knownCaptionText = ""
+  knownCaptionText = "",
+  // Optional watermark @handle burned low-center on every frame (deters reposting).
+  watermark = ""
 ): Promise<void> {
   const outputDir = getOutputDir();
   try {
@@ -2385,18 +2390,25 @@ async function burnCaptionsOnFile(
         }
       }
       const srtHasContent = (() => { try { return fs.readFileSync(srtPath, "utf8").trim().length > 0; } catch { return false; } })();
-      if (haveAss || srtHasContent) {
+      // Watermark: light @handle low-center on every frame (deters reposting), drawn in the SAME
+      // re-encode as the captions. Whichever filter(s) exist run in one pass.
+      const wmFilter = watermark
+        ? `drawtext=fontfile='${ANTON_FONT}':text='${escapeDrawtext(watermark)}':fontsize=62:fontcolor=white@0.42:x=(w-text_w)/2:y=h*0.80:shadowx=2:shadowy=2:shadowcolor=black@0.4`
+        : "";
+      const capFilter = (haveAss || srtHasContent) ? subFilter : "";
+      const vf = [capFilter, wmFilter].filter(Boolean).join(",");
+      if (vf) {
         await spawnProcess("ffmpeg", [
-          "-y", "-i", filePath, "-vf", subFilter,
+          "-y", "-i", filePath, "-vf", vf,
           "-c:v", "libx264", "-preset", "veryfast", "-crf", "14", "-threads", "1",
           "-c:a", "copy", captionedPath,
         ], 0, () => {}, RENDER_STALL_MS, "render");
         if (fs.existsSync(captionedPath)) {
           fs.renameSync(captionedPath, filePath);
-          logger.info({ filePath, mode: haveAss ? "dtw-karaoke" : "srt" }, "Story captions burned in");
+          logger.info({ filePath, mode: haveAss ? "dtw-karaoke" : (capFilter ? "srt" : "watermark-only"), watermark: !!watermark }, "Captions/watermark burned in");
         }
       } else {
-        logger.info({ clipId }, "No speech detected — skipping story caption burn");
+        logger.info({ clipId }, "No captions or watermark — skipping burn");
       }
       fs.existsSync(srtPath) && fs.unlinkSync(srtPath);
       fs.existsSync(assPath) && fs.unlinkSync(assPath);
@@ -2676,7 +2688,7 @@ export async function processStory(
       const knownCaptionText = narrTrackPath
         ? parseNarrationLines(narrationScript, storyDuration, outroEnabled, 8).map((l) => l.text).join(" ")
         : "";
-      await burnCaptionsOnFile(clipId, finalOutputPath, storyDuration, outroEnabled, captionColor, narrTrackPath, knownCaptionText);
+      await burnCaptionsOnFile(clipId, finalOutputPath, storyDuration, outroEnabled, captionColor, narrTrackPath, knownCaptionText, WATERMARK_HANDLE);
     }
     try { narrTrackPath && fs.existsSync(narrTrackPath) && fs.unlinkSync(narrTrackPath); } catch { /* ignore */ }
     await updateProgress(99, true);
@@ -3237,7 +3249,7 @@ export async function processMatchStory(
     //    per-beat mode we also hand over the exact script so captions carry zero ASR typos.
     if (captionsEnabled && totalDuration > 0) {
       const knownCaptionText = perBeat ? beatVo.filter((v) => v && v.caption).map((v) => v!.caption).join(" ") : "";
-      await burnCaptionsOnFile(clipId, finalOutputPath, totalDuration, outroEnabled, captionColor, narrTrackPath, knownCaptionText);
+      await burnCaptionsOnFile(clipId, finalOutputPath, totalDuration, outroEnabled, captionColor, narrTrackPath, knownCaptionText, WATERMARK_HANDLE);
     }
     try { narrTrackPath && fs.existsSync(narrTrackPath) && fs.unlinkSync(narrTrackPath); } catch { /* ignore */ }
     await updateProgress(99, true);
@@ -3418,7 +3430,7 @@ export async function processTop5(
 
     // 5) Captions once over the whole stitched countdown.
     if (captionsEnabled && totalDuration > 0) {
-      await burnCaptionsOnFile(clipId, finalOutputPath, totalDuration, outroEnabled, captionColor);
+      await burnCaptionsOnFile(clipId, finalOutputPath, totalDuration, outroEnabled, captionColor, "", "", WATERMARK_HANDLE);
     }
     await updateProgress(85, true);
 
