@@ -76,3 +76,54 @@ export function reputationScore(tier: SourceTier): number {
     case "deny": return 0;
   }
 }
+
+// ── CLAIM RISK ─────────────────────────────────────────────────────────────────────────────
+//
+// Added 2026-07-19 after the user flagged copyright/claims as the reason to move off YouTube.
+// This is a SECOND, independent axis and conflating it with reputation was a real design error:
+//
+//   reputation answers "is this real, sharp, correctly-dated footage?"  → official is BEST
+//   claim risk answers "will this get the Short claimed or taken down?" → official is WORST
+//
+// Optimising reputation alone actively steers toward broadcast rips, which are exactly the
+// footage most likely to be matched. Note also that claims match the FOOTAGE fingerprint on
+// upload, not the platform it was downloaded from — so sourcing a broadcast clip from X rather
+// than YouTube changes nothing. What actually helps is preferring genuinely ORIGINAL footage.
+
+export type ClaimRisk = "high" | "medium" | "low";
+
+/** Titles that advertise a broadcast rip. */
+const BROADCAST_TITLE = /\b(full\s*match|extended\s*highlights?|match\s*highlights?|full\s*time\s*highlights?|all\s*goals)\b/i;
+/** Signals of original, user-shot footage — the safest material. */
+const FAN_SHOT_TITLE = /\b(fan\s*cam|fancam|from\s*the\s*stands?|in\s*the\s*stadium|my\s*view|pov|crowd\s*reaction|live\s*from)\b/i;
+
+/**
+ * Estimate takedown/claim exposure. `width`/`height` come from the pre-download probe when
+ * available — a VERTICAL or square frame is strong evidence of phone footage, since broadcast
+ * is always 16:9.
+ */
+export function claimRisk(uploader: string | undefined, title: string, width?: number, height?: number): ClaimRisk {
+  const tier = classifyUploader(uploader);
+  const t = title ?? "";
+  const vertical = width != null && height != null && height >= width;
+
+  if (vertical || FAN_SHOT_TITLE.test(t)) return "low";        // original footage
+  if (tier === "official" || BROADCAST_TITLE.test(t)) return "high";  // broadcast rip
+  if (tier === "suspect") return "high";                        // recap farms repost broadcast
+  return "medium";
+}
+
+/**
+ * Source score combining authenticity with claim exposure.
+ *
+ * `preferClaimSafe` (default TRUE) is the mode for a channel that publishes to YouTube: it
+ * inverts the official-broadcaster preference, because that footage is the most likely to be
+ * claimed. Set false to rank purely on authenticity (e.g. sourcing for private reference).
+ */
+export function sourceScore(tier: SourceTier, risk: ClaimRisk, preferClaimSafe = true): number {
+  const authenticity = reputationScore(tier);
+  if (!preferClaimSafe) return authenticity;
+  const safety = risk === "low" ? 1 : risk === "medium" ? 0.6 : 0.15;
+  // Weighted toward safety, but authenticity still matters — a claim-safe cat video is useless.
+  return 0.6 * safety + 0.4 * authenticity;
+}

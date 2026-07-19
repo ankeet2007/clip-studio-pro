@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { scoreOne, sharpnessScore, engagementScore, rankCandidates, WEIGHTS } from "./score.ts";
 import { parseTopic, scoreRelevance } from "./relevance.ts";
-import { classifyUploader } from "./sources.ts";
+import { classifyUploader, claimRisk, sourceScore } from "./sources.ts";
 import { parseProbeLine, bitsPerPixel, parseUploadDate } from "./probe.ts";
 import type { RawCandidate } from "./types.ts";
 
@@ -168,4 +168,30 @@ test("rankCandidates: dedupes and sorts, facebook bypasses the topic gate", () =
   );
   assert.equal(out.filter((c) => c.platform === "youtube").length, 1, "near-identical hits collapse");
   assert.ok(out.some((c) => c.platform === "facebook"), "user-supplied URLs are trusted");
+});
+
+// ─── claim risk (added after the copyright decision) ─────────────────────────────────────
+
+test("claimRisk: official broadcast is HIGH exposure, fan-shot is LOW", () => {
+  assert.equal(claimRisk("FIFA", "England vs France Extended Highlights"), "high");
+  assert.equal(claimRisk("Some Guy", "Full Match Replay"), "high");
+  // Vertical frame = phone footage = genuinely original.
+  assert.equal(claimRisk("some_user", "Bellingham goal from the stands", 720, 1280), "low");
+  assert.equal(claimRisk("some_user", "fan cam of the winner"), "low");
+});
+
+test("⭐ claim-safe mode INVERTS the official-broadcaster preference", () => {
+  // The design error this fixes: ranking on authenticity alone steers straight at the footage
+  // most likely to be claimed. Same clip quality, opposite conclusions by mode.
+  const officialBroadcast = sourceScore("official", "high", true);
+  const fanShot = sourceScore("neutral", "low", true);
+  assert.ok(fanShot > officialBroadcast, "claim-safe mode must prefer original footage");
+
+  // With the flag off it ranks purely on authenticity, and official wins again.
+  assert.ok(sourceScore("official", "high", false) > sourceScore("neutral", "low", false));
+});
+
+test("claim-safe mode still rejects junk — safety alone is not enough", () => {
+  // A claim-safe recap farm must not beat a claim-safe reputable source.
+  assert.ok(sourceScore("trusted", "low", true) > sourceScore("suspect", "low", true));
 });

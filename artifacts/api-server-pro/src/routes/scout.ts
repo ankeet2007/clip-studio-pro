@@ -9,6 +9,12 @@ import { logger } from "../lib/logger";
 
 const router: IRouter = Router();
 const ALL_PLATFORMS: Platform[] = ["reddit", "x", "instagram", "facebook", "youtube"];
+/**
+ * Searched when the caller does not name platforms. YouTube is deliberately EXCLUDED (user
+ * decision, 2026-07-19: copyright/claim exposure) — it is still reachable by asking for it
+ * explicitly, since it remains the only place long-form broadcast footage exists.
+ */
+const DEFAULT_PLATFORMS: Platform[] = ["reddit", "x", "instagram", "facebook"];
 
 // Strip filesystem paths from a job before returning it; expose a thumbUrl instead.
 function publicJob(job: ScoutJob) {
@@ -45,11 +51,11 @@ router.post("/scout", (req, res): void => {
   const body = req.body as { topic?: string; platforms?: string[]; subreddits?: string[]; maxCandidates?: number; maxAgeHours?: number; minDurationSec?: number };
   const topic = (body.topic ?? "").trim();
   if (topic.length < 2) { res.status(400).json({ error: "Enter a topic to scout for." }); return; }
-  const platforms = (Array.isArray(body.platforms) ? body.platforms : ALL_PLATFORMS).filter((p): p is Platform => (ALL_PLATFORMS as string[]).includes(p));
+  const platforms = (Array.isArray(body.platforms) ? body.platforms : DEFAULT_PLATFORMS).filter((p): p is Platform => (ALL_PLATFORMS as string[]).includes(p));
   const maxAgeHours = Number(body.maxAgeHours);
   const minDurationSec = Number(body.minDurationSec);
   const opts: ScoutOptions = {
-    platforms: platforms.length ? platforms : ["reddit"],
+    platforms: platforms.length ? platforms : DEFAULT_PLATFORMS,
     subreddits: Array.isArray(body.subreddits) ? body.subreddits.slice(0, 6).map(String) : undefined,
     maxCandidates: Math.min(200, Math.max(10, Number(body.maxCandidates) || 40)),
     maxPerPlatform: 100,

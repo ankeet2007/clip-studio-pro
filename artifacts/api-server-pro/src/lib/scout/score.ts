@@ -19,18 +19,29 @@
 
 import type { RawCandidate, ScoredCandidate, ScoutOptions } from "./types.ts";
 import { parseTopic, scoreRelevance, type TopicSpec } from "./relevance.ts";
-import { classifyUploader, reputationScore } from "./sources.ts";
+import { classifyUploader, claimRisk, sourceScore } from "./sources.ts";
 import type { ProbeResult } from "./probe.ts";
 
 export const WEIGHTS = {
   relevance: 0.30,   // structured entity match; also hard-gates
   sharpness: 0.28,   // MEASURED bits-per-pixel (was duration-derived "quality")
-  reputation: 0.22,  // uploader tier (was not scored at all)
+  reputation: 0.22,  // uploader tier AND claim exposure — see sourceScore()
   recency: 0.12,
   engagement: 0.08,  // was 0.34 — the only signal anti-correlated with the goal
 };
 
 const RELEVANCE_FLOOR = 0.15;
+
+/**
+ * Rank for CLAIM SAFETY as well as quality (default on).
+ *
+ * The channel publishes to YouTube, where Content ID matches the footage fingerprint on upload
+ * — regardless of which platform the clip was downloaded from. So a broadcast rip is exposed
+ * whether it came from YouTube or a repost on X, and the only real mitigation is preferring
+ * genuinely original (fan-shot) footage. Set CLIP_PREFER_CLAIM_SAFE=0 to rank purely on
+ * authenticity instead.
+ */
+const PREFER_CLAIM_SAFE = process.env.CLIP_PREFER_CLAIM_SAFE !== "0";
 
 /**
  * Rank-time sharpness floors, deliberately LOOSER than the render gate in footageQuality.ts
@@ -105,10 +116,15 @@ export function scoreOne(
     return { total: 0, parts: { relevance: rel.score, sharpness: 0, reputation: 0, recency: 0, engagement: 0 }, reasons: [], drop: `unusably soft (${probe.bitsPerPixel.toFixed(4)} bits/pixel)` };
   }
 
+  // Claim exposure is scored alongside authenticity. For a channel publishing to YouTube these
+  // pull in OPPOSITE directions — official broadcast footage is the most trustworthy and the
+  // most likely to be claimed — so sourceScore() resolves them explicitly instead of letting
+  // "reputation" quietly mean only one of the two.
+  const risk = claimRisk(probe?.uploader ?? c.author, c.title, probe?.width, probe?.height);
   const parts = {
     relevance: rel.score,
     sharpness: sharpnessScore(probe?.bitsPerPixel, shortSide),
-    reputation: reputationScore(tier),
+    reputation: sourceScore(tier, risk, PREFER_CLAIM_SAFE),
     recency: recencyScore(probe?.uploadedAt || c.createdAt),
     engagement: engagementScore(engPct),
   };
@@ -127,7 +143,7 @@ export function scoreOne(
     probe?.bitsPerPixel != null
       ? `sharpness ${(parts.sharpness * 100) | 0}% (${probe.bitsPerPixel.toFixed(4)} bpp${probe.bppApprox ? " approx" : ""}${probe.width ? `, ${probe.width}x${probe.height}` : ""})`
       : "sharpness unmeasured (neutral)",
-    `source ${tier}`,
+    `source ${tier} · claim-risk ${risk}`,
     `engagement ${(parts.engagement * 100) | 0}% (${c.engagement})`,
   ];
   if (isMusicMontage) reasons.push("likely music montage — no commentary");

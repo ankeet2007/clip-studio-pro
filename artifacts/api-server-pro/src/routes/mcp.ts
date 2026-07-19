@@ -16,7 +16,7 @@ import { getReceipt, putReceipt } from "../lib/verify/receipt";
 import { buildSpine, searchSpine, cutBeats, SPINE_MIN_DURATION_SEC } from "../lib/spine";
 import { understandVideo, downloadClipToUploads, extractSegment } from "../lib/videoUnderstand";
 
-const SERVER_INFO = { name: "clip-studio-scout", version: "1.2.0" };
+const SERVER_INFO = { name: "clip-studio-scout", version: "1.3.0" };
 // Protocol versions we understand; we echo the client's if it's one of these, else use the latest.
 const SUPPORTED_PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 const DEFAULT_PROTOCOL = "2025-06-18";
@@ -108,6 +108,22 @@ const INSTRUCTIONS = [
   "CLIPS:",
   "1 | <clip url OR uploads path> | <on-screen headline, 3-6 words>",
   "2 | ...",
+  "",
+  "PLATFORMS + COPYRIGHT (read before sourcing anything):",
+  "Search Reddit, X, Instagram and Facebook by default. Do NOT use YouTube unless the user asks —",
+  "its footage is overwhelmingly broadcast rips, and this channel publishes to YouTube where",
+  "Content ID matches the FOOTAGE, not the platform you took it from. Sourcing a broadcast clip",
+  "from a repost on X does not make it safe; it is the same fingerprint.",
+  "The rule is therefore about the KIND of footage, not the site: strongly PREFER genuinely",
+  "original material — fan-shot phone video, vertical/portrait clips, 'from the stands', crowd",
+  "reactions, original creator uploads. AVOID 'extended highlights', 'full match', official",
+  "broadcaster channels (FIFA/Sky/ESPN) and recap-farm re-uploads. A vertical frame is a good",
+  "positive signal; 16:9 with a broadcaster bug in the corner is a bad one. The ranker scores this",
+  "now, but you see the thumbnails and keyframes — use them.",
+  "",
+  "SPINE (build_spine): only worth it when a topic genuinely has a long ORIGINAL source. It needs",
+  "180s+, which social clips almost never are, and official highlights carry the claim risk above.",
+  "For most topics, hunt per beat and verify each one.",
   "",
   "FOOTAGE SHARPNESS (hard gate — soft clips are REJECTED at render, not fixed): resolution alone",
   "does NOT mean sharp. AI-recap channels, 'highlights' re-uploads and news rips routinely publish a",
