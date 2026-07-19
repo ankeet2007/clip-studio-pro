@@ -1826,13 +1826,13 @@ export async function processClip(
       // over the blurred backdrop.
       `[composedv]drawbox=x=0:y=0:w=${canvasW}:h=${videoY}:color=black@0.30:t=fill[scrimtop]`,
       `[scrimtop]drawbox=x=0:y=${videoY + videoH}:w=${canvasW}:h=${canvasH - videoY - videoH}:color=black@0.30:t=fill[composedsc]`,
-      `[composedsc]drawbox=x=0:y=${videoY - 3}:w=${canvasW}:h=3:color=FF0000:t=fill[composedac]`,
-      // Credit line, bottom-LEFT of the video frame. Left (not right) so it never clashes
-      // with the source creator's own logo/handle, which almost always sits bottom-centre/
-      // right. Rendered "Credit:- <name>" (name in its natural case). The colon must be
-      // backslash-escaped INSIDE the single-quoted value or ffmpeg's filtergraph parser
-      // treats it as an option separator (verified: only text='Credit\:- x' parses).
-      sourceChannel && sourceChannel.trim() ? `[composedac]drawtext=text='Credit\\:- ${sourceChannel.trim().replace(/['\\]/g,"")}':fontsize=24:fontcolor=white@0.85:x=16:y=${videoY + videoH - 36}:shadowx=1:shadowy=1:shadowcolor=black@0.9[composed]` : `[composedac]null[composed]`,
+      // REMOVED (user decision, 2026-07-19), deliberately and permanently:
+      //   • the 3px red rule that used to sit on top of the video frame at y=videoY-3
+      //   • the bottom-left "Credit:- <sourceChannel>" line
+      // Both were chrome the user does not want on any clip. `sourceChannel` is still
+      // threaded through the pipeline (stored on the clip + shown in the app) — it is simply
+      // no longer BURNED into the picture. Do not reinstate either without being asked.
+      `[composedsc]null[composed]`,
     ];
     let prevLabel = "composed";
 
@@ -2334,7 +2334,8 @@ export interface StorySegment {
 // StorySegment — each moment carries its own `rank` (5→1), an optional per-moment
 // source `youtubeUrl` (multi-source top-5s pull each rank from a different video;
 // empty ⇒ single-source, the route fills it from the job URL), the `sourceChannel`
-// for its "Credit:" line, and one spoken countdown `narrationLine` ("Number five: …").
+// (kept as metadata — the burned-in "Credit:" line was removed 2026-07-19), and one
+// spoken countdown `narrationLine` ("Number five: …").
 export interface Top5Segment extends StorySegment {
   rank: number;
   youtubeUrl?: string;
