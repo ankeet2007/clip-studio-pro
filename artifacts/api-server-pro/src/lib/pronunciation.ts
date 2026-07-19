@@ -43,6 +43,19 @@ const PRONUNCIATION_MAP: Record<string, string> = {
   // ("The UK Osaka"), which is itself a caption-alignment hazard; the respelling stays at 2.
   bukayo: "Bookiyo",
   saka: "Sahka",
+  // Measured: plain "Michael Olise" -> "Michael ALWAYS" (a real English word, so the viewer
+  // hears a grammatical sentence with the wrong meaning — the worst failure mode here).
+  // "Ohleezay" -> "Olizé". Same word count, clean.
+  olise: "Ohleezay",
+  // SURNAME-ONLY fixes. Both first names (Ousmane / Lamine) resisted every candidate, but
+  // their surnames fix cleanly and independently, so map only what measures better:
+  //   "Ousmane Dembele"  -> "Al Smein Dembeau"   ...  + Dembelay -> "Als mein DEMBELE"  (exact)
+  //   "Lamine Yamal"     -> "Lamain Yamel"       ...  + Yamaal   -> "Lamain YAMAL"      (exact)
+  dembele: "Dembelay",
+  yamal: "Yamaal",
+  // Fixes a SPLIT as well as the sound: plain "Tchouameni" -> "T Tuomini" (2 tokens from 1);
+  // "Twahmeni" -> "Tuomini" / "Tuomine", stably one token, and "Aurelien" then lands exactly.
+  tchouameni: "Twahmeni",
 };
 
 /**
@@ -58,6 +71,23 @@ const PRONUNCIATION_MAP: Record<string, string> = {
  *   yamal:   "Yamahl"    -> heard as "Niemal"        (plain -> "Lamain Yammel")
  *   ousmane: "Oosmahn"   -> heard as "Guzman"        (plain -> "Alsmane Denbel")
  *   dembele: "Dombelay"  -> heard as "d'Amelie"      (plain -> "Denbel")
+ *   lamine:  "Lammeen"   -> heard as "Lamy and"     ⚠️ SPLIT again — same bug, 2nd candidate.
+ *   lamine:  "Lahmean"   -> "Lamy and Yam all"     ⚠️ WORSE — 4 tokens from 2. 3rd candidate.
+ *   tchouameni: "Chwahmeni" -> "C.H.Wamany"          (espeak spelled the letters out)
+ *   konate:  "Konnatay"  -> "Akanate"                (identical to plain — no gain, pure risk)
+ *   konate:  "Kohnahtay" -> "Akonate"                (still merges Ibrahima's trailing 'a')
+ *   ousmane: "Oosman"/"Oozman" -> "Guzman" alone but "FUSEMAN" mid-sentence — CONTEXT
+ *            UNSTABLE. A respelling whose output changes with its neighbours cannot be
+ *            trusted; rejected even though it did remove the plain spelling's split.
+ *
+ * "Ousmane" and "Lamine" resisted every candidate, so they stay PLAIN while their surnames
+ * are fixed independently — mapping only what measurably improves is the whole discipline.
+ *
+ * MEASURED AS ALREADY CORRECT — never add these, a respelling could only make them worse:
+ *   "Antoine Griezmann" -> "Antoine Griezmann"       (exact)
+ *   "Lionel Scaloni"    -> "Lionel Scalloni"         (same sound)
+ *   "Jude Bellingham"   -> "Jude Bellingham"         (exact)
+ *   "Lionel Messi"      -> "Lionel Messi"            (exact)
  *
  * The two ⚠️ cases matter beyond sounding wrong: captions are aligned to the narration by
  * word index, so a respelling Piper splits into two spoken words desynchronises every

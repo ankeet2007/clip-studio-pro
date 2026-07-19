@@ -24,7 +24,7 @@ test("carries NO unmeasured entries", () => {
   // Guards the rule in pronunciation.ts: a respelling Piper splits into two spoken words
   // corrupts caption alignment, so unmeasured guesses must never sit in the map.
   // "Sakka" -> "sack a" and "Lameen" -> "Lamy" were caught exactly this way.
-  for (const name of ["Ousmane Dembele", "Lamine Yamal", "Tchouameni", "Griezmann"]) {
+  for (const name of ["Konate", "Barcola", "Vinicius"]) {
     assert.equal(applyPronunciation(name), name, `${name} must stay plain until measured`);
   }
 });
@@ -60,9 +60,31 @@ test("PRESERVES WORD COUNT — captions align by word index", () => {
 });
 
 test("leaves already-correct names untouched", () => {
-  // Verified correct by the synth+transcribe probe — respelling them would only add risk.
+  // All four measured as already correct by the synth+transcribe probe. Respelling a name
+  // Piper ALREADY says right can only make it worse, so these must never enter the map.
   assert.equal(applyPronunciation("Jude Bellingham"), "Jude Bellingham");
   assert.equal(applyPronunciation("Lionel Messi"), "Lionel Messi");
+  assert.equal(applyPronunciation("Antoine Griezmann"), "Antoine Griezmann");
+  assert.equal(applyPronunciation("Lionel Scaloni"), "Lionel Scaloni");
+});
+
+test("fixes surnames independently where the first name resisted every candidate", () => {
+  // "Ousmane"/"Lamine" stay PLAIN — every respelling either split them or was context
+  // unstable — while their surnames, which DID measure better, are fixed.
+  assert.equal(applyPronunciation("Ousmane Dembele"), "Ousmane Dembelay");
+  assert.equal(applyPronunciation("Lamine Yamal"), "Lamine Yamaal");
+});
+
+test("fixes Tchouameni, which plain-spelled splits into two tokens", () => {
+  // plain -> "T Tuomini" (2 tokens from 1); "Twahmeni" -> "Tuomini", stably one token.
+  assert.equal(applyPronunciation("Tchouameni"), "Twahmeni");
+  assert.equal(words(applyPronunciation("Aurelien Tchouameni")), 2);
+});
+
+test("fixes Olise, which Piper turns into a real English word", () => {
+  // Measured: "Michael Olise" -> "Michael ALWAYS". A wrong-but-nonsense name is recoverable;
+  // a wrong REAL word makes a grammatical sentence with the wrong meaning.
+  assert.equal(applyPronunciation("Michael Olise"), "Michael Ohleezay");
 });
 
 test("preserves surrounding punctuation and unrelated text", () => {
