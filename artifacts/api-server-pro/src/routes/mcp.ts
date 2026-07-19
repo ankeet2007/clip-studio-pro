@@ -13,6 +13,7 @@ import { Router, type IRouter, type Request, type Response } from "express";
 import { logger } from "../lib/logger";
 import { verifyMoments, type VerifyRequest } from "../lib/verify/verifier";
 import { getReceipt, putReceipt } from "../lib/verify/receipt";
+import { buildSpine, searchSpine, cutBeats, SPINE_MIN_DURATION_SEC } from "../lib/spine";
 import { understandVideo, downloadClipToUploads, extractSegment } from "../lib/videoUnderstand";
 
 const SERVER_INFO = { name: "clip-studio-scout", version: "1.2.0" };
@@ -262,6 +263,74 @@ const TOOLS = [
     },
   },
   {
+    name: "build_spine",
+    description:
+      "PREFERRED OPENING MOVE for any single-fixture topic. Finds ONE official broadcast highlight of the " +
+      "match, downloads it, visually verifies it, and indexes its commentary into a searchable moment " +
+      "index. Every beat is then CUT from that one source, so era, match identity and sharpness are " +
+      "correct by construction for all beats at once — instead of six independent chances to get a wrong " +
+      "match, a wrong year, or a blurry re-upload. Runs in the background (download + index takes a few " +
+      "minutes); poll with get_media_result. Returns a spineId. If no official highlight qualifies it " +
+      "says so, and you fall back to per-beat clip hunting.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        topic: { type: "string", description: "The fixture, e.g. 'England vs France 6-4 World Cup 2026 third place playoff'." },
+      },
+      required: ["topic"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "find_moment",
+    description:
+      "Locate a described moment inside a built spine by searching its commentary transcript. Instant and " +
+      "free — no download, no model call. Returns ranked {start, end, confidence, transcriptSnippet}, with " +
+      "the start already snapped back to the preceding scene cut (commentary lags the action, so cutting " +
+      "on the spoken timestamp starts mid-celebration). LOW CONFIDENCE means the moment probably is not in " +
+      "this highlight — hunt for that ONE beat separately rather than forcing a bad cut.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        spineId: { type: "string", description: "From build_spine." },
+        description: { type: "string", description: "The moment, e.g. 'Bellingham seals it in stoppage time'. Use names — the search is by name." },
+      },
+      required: ["spineId", "description"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "cut_beats",
+    description:
+      "Cut several beats out of a spine in ONE call. For each beat give a description (it will be located " +
+      "automatically) or an explicit start/end from find_moment. Returns an uploads path AND a verifyId per " +
+      "beat — spine cuts are pre-verified, because the spine itself was visually inspected and the window " +
+      "came from its own transcript, so you do NOT need to call verify_moment on them. Pass those verifyIds " +
+      "straight to create_match_story.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        spineId: { type: "string", description: "From build_spine." },
+        beats: {
+          type: "array",
+          description: "One entry per beat, in story order.",
+          items: {
+            type: "object",
+            properties: {
+              description: { type: "string", description: "What this beat should show — normally its narration line." },
+              start: { type: "string", description: "Optional explicit start (seconds or HH:MM:SS) from find_moment." },
+              end: { type: "string", description: "Optional explicit end." },
+            },
+            required: ["description"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["spineId", "beats"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "verify_moment",
     description:
       "LOOK at the frames of a clip window and report what it actually shows. REQUIRED before a beat " +
@@ -492,7 +561,7 @@ async function runUnderstandVideo(args: any): Promise<ToolResult> {
 // briefly inline, then hands back a mediaJobId for get_media_result. Evicted after 2h.
 // ---------------------------------------------------------------------------
 
-interface MediaJob { id: string; kind: "download" | "segment"; status: "running" | "done" | "error"; text?: string; error?: string; createdAt: number }
+interface MediaJob { id: string; kind: "download" | "segment" | "spine"; status: "running" | "done" | "error"; text?: string; error?: string; createdAt: number }
 const mediaJobs = new Map<string, MediaJob>();
 
 function startMediaJob(kind: MediaJob["kind"], work: () => Promise<string>): MediaJob {
@@ -563,6 +632,76 @@ async function runGetMediaResult(args: any): Promise<ToolResult> {
   const job = mediaJobs.get(id);
   if (!job) throw new Error("That media job wasn't found (it may have expired after 2h). Re-run download_clip / extract_segment.");
   return pollMediaJob(job, 20_000);
+}
+
+// ---------------------------------------------------------------------------
+// Spine-first sourcing — one verified official source, every beat cut out of it.
+
+async function runBuildSpine(args: any): Promise<ToolResult> {
+  const topic = String(args?.topic ?? "").trim();
+  if (!topic) throw new Error("Provide a `topic` — the fixture to find an official highlight of.");
+
+  const job = startMediaJob("spine", async () => {
+    // Long-form only: a spine must be able to contain the WHOLE story, not one moment.
+    const started = await apiFetch("/scout", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ topic, platforms: ["youtube"], minDurationSec: SPINE_MIN_DURATION_SEC, maxCandidates: 40 }),
+    });
+    let jobState = started;
+    for (let i = 0; i < 40 && jobState?.status !== "ready" && jobState?.status !== "error"; i++) {
+      await sleep(3000);
+      jobState = await apiFetch(`/scout/${encodeURIComponent(started.id)}`);
+    }
+    const cands = (jobState?.candidates ?? []).map((c: any) => ({ url: c.sourceUrl, title: c.title, author: c.author }));
+    if (cands.length === 0) throw new Error("No long-form candidates found for that topic.");
+
+    const res = await buildSpine(cands, topic);
+    if (!res.ok) throw new Error(res.reason);
+    const sp = res.spine;
+    const head = sp.index.entries.slice(0, 6).map((e) => `  ${e.t.toFixed(0)}s — ${e.text}`).join("\n");
+    return [
+      `spineId: ${sp.spineId}`,
+      `source: ${sp.uploader} — ${sp.sourceUrl}`,
+      `duration: ${Math.round(sp.durationSec)}s · ${sp.index.entries.length} transcript entries · ${sp.index.scenes.length} scene cuts`,
+      res.warnings.length ? `\n⚠️ ${res.warnings.join("\n⚠️ ")}` : "",
+      sp.index.entries.length ? `\nTranscript begins:\n${head}` : "",
+      `\nNow call find_moment / cut_beats against this spineId. Cuts come back pre-verified.`,
+    ].filter(Boolean).join("\n");
+  });
+
+  return pollMediaJob(job, 30_000);
+}
+
+async function runFindMoment(args: any): Promise<ToolResult> {
+  const spineId = String(args?.spineId ?? "").trim();
+  const description = String(args?.description ?? "").trim();
+  if (!spineId || !description) throw new Error("Provide `spineId` and `description`.");
+  const hits = searchSpine(spineId, description);
+  if (hits.length === 0) {
+    return textResult(`No match for "${description}" in this spine. Either the spineId expired, or this highlight does not contain that moment — hunt for THIS beat separately with search_clips.`);
+  }
+  return textResult(hits.map((h, i) =>
+    `${i + 1}. ${h.start.toFixed(1)}-${h.end.toFixed(1)}s · confidence ${(h.confidence * 100) | 0}%\n   "${h.transcriptSnippet}"`
+    + (h.confidence < 0.5 ? "\n   ⚠️ low confidence — consider hunting this beat separately" : ""),
+  ).join("\n"));
+}
+
+async function runCutBeats(args: any): Promise<ToolResult> {
+  const spineId = String(args?.spineId ?? "").trim();
+  const beats = Array.isArray(args?.beats) ? args.beats : [];
+  if (!spineId || beats.length === 0) throw new Error("Provide `spineId` and a `beats` array.");
+  const reqs = beats.slice(0, 10).map((b: any) => ({
+    description: String(b?.description ?? ""),
+    start: b?.start != null ? vSec(b.start) : undefined,
+    end: b?.end != null ? vSec(b.end) : undefined,
+  }));
+  const out = await cutBeats(spineId, reqs);
+  return textResult(out.map((r, i) =>
+    r.error
+      ? `Beat ${i + 1}: ⛔ ${r.error}`
+      : `Beat ${i + 1}: ${r.path}\n   window ${r.start.toFixed(1)}-${r.end.toFixed(1)}s · verifyId ${r.verifyId} (pre-verified — no verify_moment needed)`
+      + (r.snippet ? `\n   "${r.snippet}"` : ""),
+  ).join("\n"));
 }
 
 // ---------------------------------------------------------------------------
@@ -641,6 +780,9 @@ async function callTool(name: string, args: any): Promise<ToolResult> {
     case "understand_video": return runUnderstandVideo(args);
     case "download_clip": return runDownloadClip(args);
     case "extract_segment": return runExtractSegment(args);
+    case "build_spine": return runBuildSpine(args);
+    case "find_moment": return runFindMoment(args);
+    case "cut_beats": return runCutBeats(args);
     case "verify_moment": return runVerifyMoment(args);
     case "confirm_moment": return runConfirmMoment(args);
     case "get_media_result": return runGetMediaResult(args);
