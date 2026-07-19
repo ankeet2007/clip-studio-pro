@@ -109,9 +109,9 @@ async function runScout(job: ScoutJob): Promise<void> {
 
 /** Download the KEPT candidates NOW (only what the user chose) and build Match Story beats.
  * Runs at approve time; failed/too-long downloads are skipped. thumbUrl is the remote thumb for UI. */
-export async function buildBeatsFromJob(jobId: string): Promise<{ localFile: string; sourceType: "local"; startTime: string; endTime: string; headline: string; sourceChannel: string; narrationLine: string; thumbUrl: string | null }[]> {
+export async function buildBeatsFromJob(jobId: string): Promise<{ beats: FetchedBeat[]; rejected: RejectedBeat[] }> {
   const job = jobs.get(jobId);
-  if (!job) return [];
+  if (!job) return { beats: [], rejected: [] };
   const kept = job.candidates.filter((c) => c.status === "keep");
   const uploads = getUploadsDir();
   const cfg = readScoutConfig();
@@ -119,26 +119,46 @@ export async function buildBeatsFromJob(jobId: string): Promise<{ localFile: str
     const t = Math.max(1, Math.round(s));
     return [Math.floor(t / 3600), Math.floor((t % 3600) / 60), t % 60].map((n) => String(n).padStart(2, "0")).join(":");
   };
-  const beats: { localFile: string; sourceType: "local"; startTime: string; endTime: string; headline: string; sourceChannel: string; narrationLine: string; thumbUrl: string | null }[] = [];
+  const beats: { localFile: string; sourceType: "local"; startTime: string; endTime: string; headline: string; sourceChannel: string; narrationLine: string; thumbUrl: string | null; width: number | null; height: number | null; bitsPerPixel: number | null }[] = [];
+  const rejected: RejectedBeat[] = [];
   for (let i = 0; i < kept.length; i++) {
     const c = kept[i]!;
+    const shortUrl = c.sourceUrl.slice(0, 80);
     const file = path.join(uploads, `scout_${job.id}_${i}_${Date.now()}.mp4`);
     try {
       if (c.downloadKind === "hls" && c.downloadUrl) await downloadHlsClip(c.downloadUrl, file);
       else await downloadSocialClip(c.downloadUrl || c.sourceUrl, file, cookieForPlatform(cfg, c.platform));
       const meta = await probeFootage(file);
-      if (meta.duration < 1 || meta.duration > 180) { try { fs.unlinkSync(file); } catch { /**/ } continue; }
+      if (meta.duration < 1 || meta.duration > 180) {
+        try { fs.unlinkSync(file); } catch { /**/ }
+        rejected.push({ url: shortUrl, reason: `duration ${Math.round(meta.duration)}s outside 1-180s` });
+        continue;
+      }
+      // Same sharpness gate the connector path uses. This was MISSING here, so the in-app Scout
+      // grid could pull soft footage into beats while /scout/fetch-urls rejected it — the
+      // 1920x1080@519kbps (0.008 bpp) re-upload that shipped came in through a path like this.
+      // Rejections are REPORTED, not silent: a kept candidate vanishing with no reason is how
+      // the gap survived unnoticed.
+      const verdict = judgeFootage(meta);
+      if (!verdict.ok) {
+        try { fs.unlinkSync(file); } catch { /**/ }
+        rejected.push({ url: shortUrl, reason: verdict.reason });
+        logger.warn({ url: shortUrl, width: meta.width, height: meta.height, bpp: meta.bitsPerPixel }, "Scout beat rejected by sharpness gate at approve");
+        continue;
+      }
       beats.push({
         localFile: file, sourceType: "local", startTime: "00:00:00", endTime: toHMS(meta.duration),
         headline: c.title.replace(/\s+/g, " ").slice(0, 80), sourceChannel: c.author, narrationLine: "",
         thumbUrl: c.thumbnail ?? null,
+        width: meta.width ?? null, height: meta.height ?? null, bitsPerPixel: meta.bitsPerPixel ?? null,
       });
     } catch (e) {
-      logger.warn({ e, url: c.sourceUrl.slice(0, 80) }, "Scout clip download failed at approve");
+      logger.warn({ e, url: shortUrl }, "Scout clip download failed at approve");
+      rejected.push({ url: shortUrl, reason: "download failed" });
       try { fs.existsSync(file) && fs.unlinkSync(file); } catch { /**/ }
     }
   }
-  return beats;
+  return { beats, rejected };
 }
 
 /** Match Story 2.0 (Claude-driven): turn a PASTED list of beats (the ones Claude picked via the MCP

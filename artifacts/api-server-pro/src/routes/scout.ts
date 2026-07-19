@@ -81,9 +81,20 @@ router.post("/scout/:id/candidate", (req, res): void => {
 
 // POST /scout/:id/approve — download the KEPT candidates now, then build Match Story beats.
 router.post("/scout/:id/approve", async (req, res): Promise<void> => {
-  const beats = await buildBeatsFromJob(req.params.id);
-  if (beats.length < 2) { res.status(400).json({ error: "Keep at least 2 clips (that download successfully) before building." }); return; }
-  res.json({ beats });
+  const { beats, rejected } = await buildBeatsFromJob(req.params.id);
+  if (beats.length < 2) {
+    // Report WHY kept candidates vanished. Previously they were dropped silently, which is how
+    // a missing sharpness gate on this path went unnoticed while the connector path enforced it.
+    const soft = rejected.filter((r) => r.reason.startsWith("too soft") || r.reason.startsWith("too small")).length;
+    res.status(400).json({
+      error: soft > 0
+        ? `Only ${beats.length} clip(s) usable — ${soft} were rejected as too low-quality to composite. Keep sharper clips (real broadcast footage, not recap re-uploads).`
+        : "Keep at least 2 clips (that download successfully) before building.",
+      rejected,
+    });
+    return;
+  }
+  res.json({ beats, rejected });
 });
 
 // POST /scout/fetch-urls — Match Story 2.0 (Claude-driven): download a pasted list of social clip
