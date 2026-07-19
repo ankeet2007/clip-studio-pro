@@ -64,11 +64,16 @@ const ttsJobs = new Map<string, { status: "running" | "done" | "error"; wavBase6
 /**
  * Pick the best whisper model actually PRESENT on this box.
  *
- * The old hardcoded default was `ggml-medium.en.bin`, but colab-boot.sh installs the
- * quantised `ggml-medium.en-q5_0.bin` — so on a Colab worker the default pointed at a file
- * that does not exist and every transcribe job failed with a bare "Command failed", which
- * reads like a crash rather than a missing model. Prefer sharper models first and fall back
- * to whatever is installed.
+ * Defence in depth, NOT a bug fix — colab-boot.sh already symlinks
+ * `ggml-medium.en.bin -> ggml-medium.en-q5_0.bin` (see its step 5), so the canonical name
+ * resolves there today. This only stops a silent break if that symlink ever goes away or a
+ * box installs a different variant.
+ *
+ * ⚠️ It does NOT fix transcribe failures. Those are a TIMEOUT, not a missing model: Colab's
+ * 2-core CPU cannot run medium.en on several clips at once, so a parallel batch has every
+ * job hit the 280s ceiling and report a bare "Command failed" — which reads like a crash.
+ * Measured 2026-07-19: six jobs submitted together failed at 280.9/280.7/280.5s while the
+ * same audio submitted ONE AT A TIME finished in 51-53s. SUBMIT TRANSCRIBE JOBS SEQUENTIALLY.
  */
 function resolveWhisperModel(): string {
   const dir = path.join(os.homedir(), "whisper.cpp/models");
