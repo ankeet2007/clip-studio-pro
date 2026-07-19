@@ -59,6 +59,32 @@ const jobs = new Map<string, JobRec>();
 
 // Async transcribe jobs (understand_video's cloud path, medium.en). Kept separate from render jobs.
 const trJobs = new Map<string, { status: "running" | "done" | "error"; transcript?: string; error?: string }>();
+const ttsJobs = new Map<string, { status: "running" | "done" | "error"; wavBase64?: string; error?: string }>();
+
+/**
+ * Pick the best whisper model actually PRESENT on this box.
+ *
+ * The old hardcoded default was `ggml-medium.en.bin`, but colab-boot.sh installs the
+ * quantised `ggml-medium.en-q5_0.bin` — so on a Colab worker the default pointed at a file
+ * that does not exist and every transcribe job failed with a bare "Command failed", which
+ * reads like a crash rather than a missing model. Prefer sharper models first and fall back
+ * to whatever is installed.
+ */
+function resolveWhisperModel(): string {
+  const dir = path.join(os.homedir(), "whisper.cpp/models");
+  const preferred = [
+    "ggml-medium.en.bin",
+    "ggml-medium.en-q5_0.bin",
+    "ggml-small.en.bin",
+    "ggml-base.en.bin",
+    "ggml-tiny.en.bin",
+  ];
+  for (const m of preferred) {
+    const p = path.join(dir, m);
+    try { if (fs.existsSync(p)) return p; } catch { /* */ }
+  }
+  return path.join(dir, "ggml-medium.en.bin"); // nothing found — fail with the canonical name
+}
 
 function decodeParams(h: string | string[] | undefined): Record<string, unknown> {
   try { return JSON.parse(Buffer.from(String(h || ""), "base64").toString("utf8") || "{}"); }
@@ -235,7 +261,7 @@ const server = http.createServer((req, res) => {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ jobId }));
       const bin = process.env.WORKER_WHISPER_BIN || path.join(os.homedir(), "whisper.cpp/build/bin/whisper-cli");
-      const model = process.env.WORKER_WHISPER_MODEL || path.join(os.homedir(), "whisper.cpp/models/ggml-medium.en.bin");
+      const model = process.env.WORKER_WHISPER_MODEL || resolveWhisperModel();
       const ofPrefix = wavPath.replace(/\.wav$/, "");
       const started = Date.now();
       // Generous ceiling (a few minutes) so even a long clip's medium.en pass completes; the phone's
@@ -256,6 +282,71 @@ const server = http.createServer((req, res) => {
           setTimeout(() => trJobs.delete(jobId), 120_000);
         });
     });
+    return;
+  }
+
+  // POST /worker/tts-job -> body = JSON { text, voice?, speed? } ; returns { jobId } and runs
+  // Piper in the BACKGROUND. Exists so PRONUNCIATION WORK NEVER TOUCHES THE PHONE: the phone
+  // (armv7, low RAM) OOM-kills batched Piper+whisper probes and takes sshd down with them, so
+  // measuring a name respelling there costs an hour and usually dies. Deliberately shells out
+  // to the SAME scripts/generate_voiceover.sh the renderer uses, so what we measure is exactly
+  // what a render will speak — a separate Piper invocation here could drift from production.
+  if (req.method === "POST" && url === "/worker/tts-job") {
+    if (!SECRET || req.headers["x-worker-secret"] !== SECRET) {
+      res.writeHead(401, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "unauthorized" }));
+      req.resume();
+      return;
+    }
+    let body = "";
+    req.setEncoding("utf8");
+    req.on("data", (c) => { body += c; if (body.length > 200_000) req.destroy(); });
+    req.on("end", () => {
+      let text = "", voice = "en_US-ryan-medium", speed = "1.0";
+      try {
+        const j = JSON.parse(body || "{}") as { text?: string; voice?: string; speed?: string | number };
+        text = String(j.text ?? "").trim();
+        if (j.voice) voice = String(j.voice);
+        if (j.speed != null && j.speed !== "") speed = String(j.speed);
+      } catch { /* fall through to the empty-text check */ }
+      if (!text) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "text is required" }));
+        return;
+      }
+      const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      ttsJobs.set(jobId, { status: "running" });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ jobId }));
+
+      const outWav = path.join(os.tmpdir(), `wk_tts_${jobId}.wav`);
+      const script = path.join(os.homedir(), "myapp/scripts/generate_voiceover.sh");
+      const started = Date.now();
+      execFile("bash", [script, text, outWav, voice, speed], { timeout: 120_000, maxBuffer: 4 * 1024 * 1024 }, (err) => {
+        const rec = ttsJobs.get(jobId);
+        let wavBase64 = "";
+        try { if (fs.existsSync(outWav)) wavBase64 = fs.readFileSync(outWav).toString("base64"); } catch { /* */ }
+        try { fs.unlinkSync(outWav); } catch { /* */ }
+        if (rec) {
+          if (!wavBase64) { rec.status = "error"; rec.error = String(err?.message || "piper produced no audio"); }
+          else { rec.status = "done"; rec.wavBase64 = wavBase64; }
+        }
+        console.log(`[worker] tts ${jobId} ${wavBase64 ? "done" : "failed"} in ${((Date.now() - started) / 1000).toFixed(1)}s`);
+        setTimeout(() => ttsJobs.delete(jobId), 120_000);
+      });
+    });
+    return;
+  }
+
+  // GET /worker/tts-job/<id> -> { status, wavBase64?, error? }
+  if (req.method === "GET" && url.startsWith("/worker/tts-job/")) {
+    if (!SECRET || req.headers["x-worker-secret"] !== SECRET) {
+      res.writeHead(401, { "content-type": "application/json" }); res.end(JSON.stringify({ error: "unauthorized" })); return;
+    }
+    const rec = ttsJobs.get(url.slice("/worker/tts-job/".length));
+    if (!rec) { res.writeHead(404, { "content-type": "application/json" }); res.end(JSON.stringify({ error: "unknown job" })); return; }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ status: rec.status, wavBase64: rec.wavBase64, error: rec.error }));
     return;
   }
 
