@@ -4,16 +4,26 @@ import { applyPronunciation } from "./pronunciation.ts";
 
 const words = (s: string) => s.split(/\s+/).filter(Boolean).length;
 
-test("respells names Piper mispronounces", () => {
-  // Measured failures: "Kylian Mbappe" -> "Kylie and Mbapp", "Bukayo Saka" -> "The UK Osaka".
+test("respells the names verified to need it", () => {
+  // Measured: plain "Kylian Mbappe" synthesized as "Kylie and Mbapp"; the respelling
+  // "Keelian Embappay" transcribes back as "Kylian Mbappe".
   assert.notEqual(applyPronunciation("Kylian Mbappe"), "Kylian Mbappe");
-  assert.notEqual(applyPronunciation("Bukayo Saka"), "Bukayo Saka");
+});
+
+test("carries NO unmeasured entries", () => {
+  // Guards the rule in pronunciation.ts: a respelling Piper splits into two spoken words
+  // corrupts caption alignment, so unmeasured guesses must never sit in the map.
+  // "Sakka" -> "sack a" and "Lameen" -> "Lamy" were caught exactly this way.
+  for (const name of ["Bukayo Saka", "Ousmane Dembele", "Lamine Yamal", "Tchouameni", "Griezmann"]) {
+    assert.equal(applyPronunciation(name), name, `${name} must stay plain until measured`);
+  }
 });
 
 test("matches regardless of accents", () => {
-  // "Mbappé" and "Mbappe" must fold to the same entry.
+  // "Mbappé" and "Mbappe" must fold to the same entry. (Only mapped names can be asserted
+  // this way — an unmapped name is returned verbatim, accent and all.)
   assert.equal(applyPronunciation("Mbappé"), applyPronunciation("Mbappe"));
-  assert.equal(applyPronunciation("Dembélé"), applyPronunciation("Dembele"));
+  assert.equal(applyPronunciation("Kylian Mbappé"), applyPronunciation("Kylian Mbappe"));
 });
 
 test("matches regardless of case", () => {
@@ -32,7 +42,7 @@ test("PRESERVES WORD COUNT — captions align by word index", () => {
     "France fell short against England, but Kylian Mbappe turned a chaotic match into his personal history book.",
     "Bukayo Saka bagged a stunning hat-trick, and Jude Bellingham sealed a six-four win.",
     "Ousmane Dembele and Lamine Yamal both scored; Lionel Messi watched on.",
-    "Tchouameni, Konate, Barcola, Olise, Scaloni, Oyarzabal, Griezmann.",
+    "Kylian Mbappé and Kylian Mbappe and MBAPPE, all in one line.",
   ];
   for (const line of lines) {
     assert.equal(words(applyPronunciation(line)), words(line), `word count changed for: ${line}`);

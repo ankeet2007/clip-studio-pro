@@ -34,20 +34,29 @@
 const PRONUNCIATION_MAP: Record<string, string> = {
   kylian: "Keelian",
   mbappe: "Embappay",
-  bukayo: "Bookayo",
-  saka: "Sakka",
-  ousmane: "Oosmahn",
-  dembele: "Dombelay",
-  lamine: "Lameen",
-  yamal: "Yamahl",
-  tchouameni: "Chowameni",
-  konate: "Konatay",
-  barcola: "Barcola",
-  olise: "Oleezay",
-  scaloni: "Scalonee",
-  oyarzabal: "Oyarthabal",
-  griezmann: "Greezmann",
 };
+
+/**
+ * MEASURED AND REJECTED — do not re-add these without a better candidate and a fresh
+ * measurement. Each was synthesized and transcribed back; none beat the plain spelling,
+ * and two were actively harmful:
+ *
+ *   saka:    "Sakka"     -> heard as "sack a"       ⚠️ ONE token became TWO spoken words.
+ *   bukayo:  "Bookayo"   -> heard as "Gocayo"        (plain "Bukayo Saka" -> "The UK Osaka")
+ *   lamine:  "Lameen"    -> heard as "Lamy"          ⚠️ "Lamy" is the old caption-desync bug.
+ *   yamal:   "Yamahl"    -> heard as "Niemal"        (plain -> "Lamain Yammel")
+ *   ousmane: "Oosmahn"   -> heard as "Guzman"        (plain -> "Alsmane Denbel")
+ *   dembele: "Dombelay"  -> heard as "d'Amelie"      (plain -> "Denbel")
+ *
+ * The two ⚠️ cases matter beyond sounding wrong: captions are aligned to the narration by
+ * word index, so a respelling Piper splits into two spoken words desynchronises every
+ * caption after it. The word-count test below guards the TEXT we send, but it cannot see
+ * Piper splitting a token in the AUDIO — so a candidate is only safe once measured.
+ *
+ * Tchouaméni / Konaté / Barcola / Olise / Scaloni / Oyarzabal / Griezmann were never
+ * measured at all and so are deliberately absent. An unfixed name merely sounds wrong;
+ * a bad respelling can corrupt the captions, which is worse.
+ */
 
 /** Strip diacritics so "Mbappé" and "Mbappe" hit the same map entry. */
 function foldAccents(s: string): string {
