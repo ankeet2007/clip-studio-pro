@@ -36,6 +36,9 @@ export interface ScoredCandidate extends RawCandidate {
   id: string;
   scores: CandidateScores;
   reasons: string[];        // human-readable "why this clip" for the review UI
+  /** Pre-download measurement, when the probe pass reached this candidate. Absent = unmeasured
+   *  (scored neutral), which is NOT the same as measured-and-poor. */
+  probe?: { width?: number; height?: number; fps?: number; bitsPerPixel?: number; uploader?: string };
 }
 
 /** A ranked candidate as SHOWN in the review grid — search metadata only, NOT yet downloaded.
@@ -62,7 +65,7 @@ export interface ScoutJob {
   id: string;
   topic: string;
   options: ScoutOptions;
-  status: "searching" | "downloading" | "ready" | "error";
+  status: "searching" | "probing" | "downloading" | "ready" | "error";
   progress: number;         // 0-100
   message?: string;
   candidates: ReviewCandidate[];

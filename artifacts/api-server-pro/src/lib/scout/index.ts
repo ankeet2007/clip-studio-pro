@@ -7,7 +7,7 @@ import fs from "fs";
 import path from "path";
 import { execFile } from "child_process";
 import { promisify } from "util";
-import { getUploadsDir, downloadSocialClip, downloadHlsClip } from "../clipProcessor";
+import { getUploadsDir, downloadSocialClip, downloadHlsClip, findYtDlp } from "../clipProcessor";
 import { downloadSocialUrl, localUploadPath } from "../videoUnderstand";
 import { logger } from "../logger";
 import { probeFootage, judgeFootage, MIN_BEAT_SHORT_SIDE, MIN_BEAT_BITS_PER_PIXEL } from "../footageQuality";
@@ -19,6 +19,7 @@ import { facebookAdapter } from "./facebook";
 import { youtubeAdapter } from "./youtube";
 import { buildQueryPlan } from "./query";
 import { rankCandidates } from "./score";
+import { probeAll, type ProbeResult } from "./probe";
 import { readScoutConfig, cookieFileFor, type ScoutConfig } from "./config";
 import type { ScoutAdapter, ScoutJob, ScoutOptions, RawCandidate, Platform } from "./types";
 
@@ -29,6 +30,15 @@ const execFileAsync = promisify(execFile);
 const ADAPTERS: ScoutAdapter[] = [redditAdapter, xAdapter, instagramAdapter, facebookAdapter, youtubeAdapter];
 
 const jobs = new Map<string, ScoutJob>();
+
+/** How many ranked candidates get the pre-download probe.
+ *
+ *  MEASURED cost: 13-32s per probe on this phone, so 24 at concurrency 4 is ~2 minutes. That
+ *  is affordable ONLY because it runs inside the background job — the connector's inline poll
+ *  has already returned by then, and a caller that polls early simply gets the unmeasured
+ *  ranking and a better one on the next poll. Deep enough that anything realistically picked
+ *  has been measured; shallow enough not to hammer one home IP into throttling. */
+const PROBE_TOP_N = 24;
 
 export function listAdapters(): { platform: Platform; configured: boolean }[] {
   return ADAPTERS.map((a) => ({ platform: a.platform, configured: a.isConfigured() }));
@@ -73,6 +83,7 @@ export function startScout(topic: string, opts: ScoutOptions): ScoutJob {
 }
 
 async function runScout(job: ScoutJob): Promise<void> {
+  const cfg0 = readScoutConfig();
   try {
     const plan = buildQueryPlan(job.topic, job.options.subreddits);
     const enabled = ADAPTERS.filter((a) => job.options.platforms.includes(a.platform) && a.isConfigured());
@@ -92,11 +103,35 @@ async function runScout(job: ScoutJob): Promise<void> {
       } catch (e) {
         logger.warn({ e, platform: enabled[i]!.platform }, "Scout adapter search failed");
       }
-      job.candidates = rankCandidates(raw, plan.terms, job.options).slice(0, cap).map((c) => ({ ...c, status: "candidate" as const }));
+      job.candidates = rankCandidates(raw, plan.terms, job.options, undefined, job.topic).slice(0, cap).map((c) => ({ ...c, status: "candidate" as const }));
       job.progress = 5 + ((i + 1) / enabled.length) * 90;
     }
 
-    job.candidates = rankCandidates(raw, plan.terms, job.options).slice(0, cap).map((c) => ({ ...c, status: "candidate" as const }));
+    // First ranking on METADATA ONLY. Sharpness is unmeasured here and therefore scored
+    // neutral, so this ordering is provisional — but it is what the connector's ~24s inline
+    // poll returns, so it must be usable on its own.
+    job.candidates = rankCandidates(raw, plan.terms, job.options, undefined, job.topic).slice(0, cap).map((c) => ({ ...c, status: "candidate" as const }));
+
+    // ── PROBE PASS ────────────────────────────────────────────────────────────────────────
+    // Measure the shortlist's real resolution / framerate / bitrate / uploader WITHOUT
+    // downloading, then re-rank. This runs INSIDE the existing background job — the inline
+    // poll has already returned — so mandatory measurement costs ZERO added tunnel latency.
+    // Only the top slice is probed: ~1-3s each, and the tail is never picked anyway.
+    try {
+      job.status = "probing";
+      const shortlist = job.candidates.slice(0, PROBE_TOP_N);
+      const probes = await probeAll(
+        shortlist.map((c) => ({ url: c.sourceUrl, cookieFile: cookieForPlatform(cfg0, c.platform) })),
+        findYtDlp(),
+      );
+      logger.info({ jobId: job.id, shortlist: shortlist.length, probed: probes.size }, "Scout probe pass complete");
+      job.candidates = rankCandidates(raw, plan.terms, job.options, probes, job.topic).slice(0, cap).map((c) => ({ ...c, status: "candidate" as const }));
+    } catch (e) {
+      // A probe failure must never sink the search — unmeasured candidates simply keep their
+      // neutral sharpness score.
+      logger.warn({ e, jobId: job.id }, "Scout probe pass failed — falling back to unmeasured ranking");
+    }
+
     job.status = "ready";
     job.progress = 100;
     if (job.candidates.length === 0) job.message = "No matching video clips found. Try a broader topic, add platforms, or check the platform cookies.";

@@ -136,7 +136,7 @@ export function getUploadFilePath(filename: string): string {
   return path.join(getUploadsDir(), filename);
 }
 
-function findYtDlp(): string {
+export function findYtDlp(): string {
   const candidates = [
     "/home/runner/workspace/.pythonlibs/bin/yt-dlp",
     "/usr/local/bin/yt-dlp",

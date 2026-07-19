@@ -26,8 +26,11 @@ function publicJob(job: ScoutJob) {
       sourceUrl: c.sourceUrl,
       engagement: c.engagement,
       durationSec: c.durationSec ?? null,
-      width: null,
-      height: null,
+      // Measured by the pre-download probe when it ran; null means unmeasured (scored neutral),
+      // NOT low quality.
+      width: c.probe?.width ?? null,
+      height: c.probe?.height ?? null,
+      bitsPerPixel: c.probe?.bitsPerPixel ?? null,
       score: Math.round(c.scores.total * 100),
       reasons: c.reasons,
       status: c.status,
