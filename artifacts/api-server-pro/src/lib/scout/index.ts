@@ -50,16 +50,37 @@ function cookieForPlatform(_cfg: ScoutConfig, p: Platform): string | undefined {
   return cookieFileFor(p);
 }
 
-async function probeMedia(file: string): Promise<{ duration: number; width?: number; height?: number; hasAudio: boolean }> {
+/** Parse ffprobe's "30000/1001" style rational into fps. */
+function parseFps(r: string | undefined): number {
+  if (!r) return 0;
+  const [n, d] = r.split("/").map(Number);
+  if (!n || !d) return Number(r) || 0;
+  return n / d;
+}
+
+async function probeMedia(file: string): Promise<{ duration: number; width?: number; height?: number; hasAudio: boolean; bitsPerPixel?: number }> {
   try {
     const { stdout } = await execFileAsync("ffprobe", [
-      "-v", "error", "-show_entries", "format=duration:stream=codec_type,width,height",
+      "-v", "error",
+      "-show_entries", "format=duration,bit_rate:stream=codec_type,width,height,bit_rate,avg_frame_rate",
       "-of", "json", file,
     ], { timeout: 30_000 });
-    const j = JSON.parse(stdout) as { format?: { duration?: string }; streams?: { codec_type: string; width?: number; height?: number }[] };
+    const j = JSON.parse(stdout) as {
+      format?: { duration?: string; bit_rate?: string };
+      streams?: { codec_type: string; width?: number; height?: number; bit_rate?: string; avg_frame_rate?: string }[];
+    };
     const v = (j.streams ?? []).find((s) => s.codec_type === "video");
     const hasAudio = (j.streams ?? []).some((s) => s.codec_type === "audio");
-    return { duration: parseFloat(j.format?.duration ?? "0") || 0, width: v?.width, height: v?.height, hasAudio };
+    // Bits per pixel per frame — the only reliable "is it ACTUALLY sharp" signal. Resolution
+    // alone lies: an AI-recap re-upload can be a nominal 1920x1080 at 519 kbps (bpp ~0.008)
+    // and look like mush, while real broadcast 1080p runs ~2.8 Mbps (bpp ~0.046). Measured on
+    // the first Mbappé render, where every soft beat was "HD" by resolution.
+    const vBitrate = Number(v?.bit_rate) || Number(j.format?.bit_rate) || 0;
+    const fps = parseFps(v?.avg_frame_rate);
+    const bitsPerPixel = v?.width && v?.height && vBitrate && fps
+      ? vBitrate / (v.width * v.height * fps)
+      : undefined;
+    return { duration: parseFloat(j.format?.duration ?? "0") || 0, width: v?.width, height: v?.height, hasAudio, bitsPerPixel };
   } catch {
     return { duration: 0, hasAudio: false };
   }
@@ -159,32 +180,101 @@ export async function buildBeatsFromJob(jobId: string): Promise<{ localFile: str
  * OR an uploads path already fetched/segmented by the connector's download_clip / extract_segment
  * (used in place — the precise moment Claude cut). Each whole clip is one beat; failed/too-long
  * downloads are skipped. Mirrors buildBeatsFromJob but starts from bare URLs/paths. */
-export async function buildBeatsFromUrls(items: { url: string; headline?: string; sourceChannel?: string; narrationLine?: string }[]): Promise<{ localFile: string; sourceType: "local"; startTime: string; endTime: string; headline: string; sourceChannel: string; narrationLine: string; thumbUrl: string | null }[]> {
+/**
+ * Sharpness floor for a sourced beat, measured on the SHORT side (min(width,height)).
+ * Short-side is the right metric because a beat can be landscape or vertical: a 720x816
+ * phone-shot clip is genuinely sharp, while 640x360 is mush once it's scaled into the
+ * 1080-wide Short frame. Mirrors the YouTube path's MIN_VIDEO_HEIGHT=720 policy, which
+ * previously guarded ONLY YouTube — Reddit/X/Instagram downloads bypassed it entirely
+ * and were the source of the soft footage in the first Mbappé render.
+ */
+export const MIN_BEAT_SHORT_SIDE = 720;
+
+/**
+ * Detail floor in bits-per-pixel-per-frame. This is the gate that actually catches "fake HD":
+ * upscaled / heavily re-encoded re-uploads that report 1920x1080 but carry no detail.
+ *
+ * Measured on the beats of the first Mbappé render:
+ *     AI-recap re-upload   1920x1080 @  519 kbps  -> 0.008   (visibly mush — the one that shipped)
+ *     news broadcast rip   1920x1080 @  868 kbps  -> 0.017   (soft)
+ *     720p highlight reel  1280x720  @  878 kbps  -> 0.032   (fine)
+ *     real broadcast 1080p 1920x1080 @ 2733 kbps  -> 0.044   (sharp)
+ *
+ * 0.02 sits in the gap between the soft and the sharp. Deliberately conservative: efficient
+ * codecs (AV1/HEVC) look fine below this on LOW-motion video, but football is high-motion,
+ * which is exactly where a starved bitrate falls apart.
+ */
+export const MIN_BEAT_BITS_PER_PIXEL = 0.02;
+
+export type FetchedBeat = {
+  localFile: string; sourceType: "local"; startTime: string; endTime: string;
+  headline: string; sourceChannel: string; narrationLine: string; thumbUrl: string | null;
+  width: number | null; height: number | null; bitsPerPixel: number | null;
+};
+export type RejectedBeat = { url: string; reason: string };
+
+export async function buildBeatsFromUrls(
+  items: { url: string; headline?: string; sourceChannel?: string; narrationLine?: string }[],
+  opts: { minShortSide?: number; minBitsPerPixel?: number } = {},
+): Promise<{ beats: FetchedBeat[]; rejected: RejectedBeat[] }> {
   const uploads = getUploadsDir();
+  // 0 disables a floor entirely (for topics where no sharp footage exists at all).
+  const minShort = opts.minShortSide ?? MIN_BEAT_SHORT_SIDE;
+  const minBpp = opts.minBitsPerPixel ?? MIN_BEAT_BITS_PER_PIXEL;
   const toHMS = (s: number) => {
     const t = Math.max(1, Math.round(s));
     return [Math.floor(t / 3600), Math.floor((t % 3600) / 60), t % 60].map((n) => String(n).padStart(2, "0")).join(":");
   };
-  const beats: { localFile: string; sourceType: "local"; startTime: string; endTime: string; headline: string; sourceChannel: string; narrationLine: string; thumbUrl: string | null }[] = [];
+  const beats: FetchedBeat[] = [];
+  const rejected: RejectedBeat[] = [];
   for (let i = 0; i < items.length && i < 8; i++) {
     const it = items[i]!;
+    const shortUrl = it.url.slice(0, 80);
     // A clip already downloaded/segmented via the connector → its `url` is an uploads path; use it
     // directly (no re-download, and never delete it on reject — it's not ours to remove).
     const preExisting = localUploadPath(it.url);
     const file = preExisting ?? path.join(uploads, `ms2url_${Date.now()}_${i}.mp4`);
+    const drop = () => { if (!preExisting) { try { fs.existsSync(file) && fs.unlinkSync(file); } catch { /**/ } } };
     try {
       if (!preExisting) await downloadSocialUrl(it.url, file);
       const meta = await probeMedia(file);
-      if (meta.duration < 1 || meta.duration > 300) { if (!preExisting) { try { fs.unlinkSync(file); } catch { /**/ } } continue; }
+      if (meta.duration < 1 || meta.duration > 300) {
+        drop();
+        rejected.push({ url: shortUrl, reason: `duration ${Math.round(meta.duration)}s outside 1-300s` });
+        continue;
+      }
+      // Sharpness gate, in two parts. Unknown values are KEPT (a failed probe is not proof of
+      // low quality) — the same "unknown is not a reason to drop" stance the duration and
+      // recency filters take.
+      const shortSide = meta.width && meta.height ? Math.min(meta.width, meta.height) : null;
+      if (minShort > 0 && shortSide != null && shortSide < minShort) {
+        drop();
+        rejected.push({ url: shortUrl, reason: `too small — ${meta.width}x${meta.height} (short side ${shortSide}px, floor ${minShort}px)` });
+        logger.warn({ url: shortUrl, width: meta.width, height: meta.height, minShort }, "MS2 beat rejected below resolution floor");
+        continue;
+      }
+      // "Fake HD" gate — nominally 1080p but starved of bitrate, so it renders as mush.
+      // Resolution passes this footage; only bits-per-pixel catches it.
+      if (minBpp > 0 && meta.bitsPerPixel != null && meta.bitsPerPixel < minBpp) {
+        drop();
+        rejected.push({
+          url: shortUrl,
+          reason: `too soft — ${meta.width}x${meta.height} but only ${meta.bitsPerPixel.toFixed(4)} bits/pixel (floor ${minBpp}); upscaled or heavily re-encoded re-upload`,
+        });
+        logger.warn({ url: shortUrl, width: meta.width, height: meta.height, bpp: meta.bitsPerPixel, minBpp }, "MS2 beat rejected below detail floor");
+        continue;
+      }
       beats.push({
         localFile: file, sourceType: "local", startTime: "00:00:00", endTime: toHMS(meta.duration),
         headline: (it.headline ?? "").replace(/\s+/g, " ").slice(0, 80), sourceChannel: (it.sourceChannel ?? "").slice(0, 80),
         narrationLine: (it.narrationLine ?? "").replace(/\s+/g, " ").slice(0, 600), thumbUrl: null,
+        width: meta.width ?? null, height: meta.height ?? null, bitsPerPixel: meta.bitsPerPixel ?? null,
       });
     } catch (e) {
-      logger.warn({ e, url: it.url.slice(0, 80) }, "MS2 pasted-URL download failed");
-      if (!preExisting) { try { fs.existsSync(file) && fs.unlinkSync(file); } catch { /**/ } }
+      logger.warn({ e, url: shortUrl }, "MS2 pasted-URL download failed");
+      rejected.push({ url: shortUrl, reason: "download failed" });
+      drop();
     }
   }
-  return beats;
+  return { beats, rejected };
 }

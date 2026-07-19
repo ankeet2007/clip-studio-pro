@@ -19,7 +19,7 @@ const hmsToSec = (t: unknown): number => {
   return Number(t) || 0;
 };
 
-const SERVER_INFO = { name: "clip-studio-story", version: "1.0.0" };
+const SERVER_INFO = { name: "clip-studio-story", version: "1.2.0" };
 const SUPPORTED_PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 const DEFAULT_PROTOCOL = "2025-06-18";
 
@@ -44,8 +44,9 @@ const INSTRUCTIONS = [
   "VOICE: leave voice unset for the default WARM US male narrator (en_US-ryan-medium) at",
   "natural pace, or pass voice/pace to override.",
   "",
-  "CARDS: the intro title card and outro SUBSCRIBE card are OFF by default. Pass titleCard:true or",
-  "outro:true to add them.",
+  "CARDS: NEVER add an intro title card. A black card in front of a Short kills the scroll-stop —",
+  "the first frame must be moving footage. titleCard defaults to false; do not pass true. The outro",
+  "SUBSCRIBE card is also off by default; leave it off unless the user explicitly asks.",
   "",
   "RAPID CUTS (retention): a clip held still for >2s bleeds viewers. Keep the PICTURE moving at attention",
   "speed while the STORY moves at story speed — give beats these optional fields:",
@@ -62,9 +63,17 @@ const INSTRUCTIONS = [
   "  what the line is about (Yamal footage on a Yamal line) — matched, not random, reads far better.",
   "  Omit all of these on a beat to keep the classic one-clip-per-beat look.",
   "",
-  "HARD NAMES: if a name would be mispronounced by the TTS, spell the beat's `narration` PHONETICALLY",
-  "(e.g. 'day-KETT-el-ah-reh') and put the correctly-spelled version in `caption` (same word count) — the",
-  "voice then says it right while the on-screen captions stay correct.",
+  "HARD NAMES: write every name PLAINLY and correctly spelled in `narration` ('Kylian Mbappé',",
+  "'Bukayo Saka'). Do NOT hand-write phonetic respellings — the server holds its own measured",
+  "pronunciation map and respells for the TTS internally, so your phonetics would fight it and can",
+  "leak into the on-screen captions. Use `caption` only when the on-screen text should genuinely",
+  "differ from the spoken words (e.g. digits: say 'twenty-two', caption '22').",
+  "",
+  "FOOTAGE SHARPNESS: beats are quality-gated after download and a soft clip is REJECTED, not fixed.",
+  "Resolution alone is not enough — AI-recap and re-upload channels publish nominal 1080p at a",
+  "starved bitrate that renders as mush. Prefer real broadcast footage and official highlight",
+  "uploads. If create_match_story reports clips rejected as too soft, find sharper sources rather",
+  "than lowering minShortSide/minBitsPerPixel — those overrides are a last resort.",
 ].join("\n");
 
 // ---- Loopback client to this same app's HTTP API ----
@@ -104,8 +113,8 @@ const SEGMENT_SCHEMA = {
   type: "object",
   properties: {
     url: { type: "string", description: "The beat's source: a real clip URL from Scout (reddit/x/instagram/facebook/youtube) OR an uploads path from Scout's download_clip / extract_segment." },
-    narration: { type: "string", description: "This beat's SPOKEN narration line (the render voices this over the muted clip). May be phonetic for hard names (e.g. 'day-KETT-el-ah-reh') to fix TTS pronunciation." },
-    caption: { type: "string", description: "Optional on-screen CAPTION text when it must differ from what's spoken — the correctly-spelled version (e.g. 'De Ketelaere'). Use the SAME word count as narration so the captions line up. Omit to caption exactly what's spoken." },
+    narration: { type: "string", description: "This beat's SPOKEN narration line (the render voices this over the muted clip). Write names PLAINLY and correctly spelled ('Kylian Mbappé', 'Bukayo Saka') — do NOT write phonetic respellings. The server keeps its own measured pronunciation map and respells for the TTS internally; hand-written phonetics fight it and leak into the captions." },
+    caption: { type: "string", description: "Optional on-screen CAPTION text when it must differ from what's spoken — e.g. digits for clarity ('22' where you say 'twenty-two'). Use the SAME word count as narration so the captions line up. Omit to caption exactly what's spoken. You do NOT need this just to fix pronunciation — that is handled server-side." },
     headline: { type: "string", description: "Optional short on-screen headline for this beat (3-6 words)." },
     channel: { type: "string", description: "Optional source handle/credit, e.g. r/soccer." },
     cutDensity: {
@@ -169,7 +178,9 @@ const TOOLS = [
         voice: { type: "string", description: "Optional Piper voice id (e.g. en_US-ryan-medium, en_GB-alan-medium, en_US-joe-medium). Omit to use the default warm US male narrator (en_US-ryan-medium)." },
         pace: { type: "string", description: "Narration pace: 'normal' (default, natural human speed), 'slightly-slow', 'slow', or a Piper length_scale 0.7-1.6." },
         captions: { type: "boolean", description: "Burn karaoke captions (default true)." },
-        titleCard: { type: "boolean", description: "Show the opening title card (default false). Pass true to add an intro title card." },
+        titleCard: { type: "boolean", description: "DEPRECATED — leave unset. Intro title cards are disabled by design (a black card in front of a Short kills retention). Default false." },
+        minShortSide: { type: "number", description: "Override the footage RESOLUTION floor in pixels on the short side (default 720). Last resort — pass 0 to disable. Prefer finding sharper clips." },
+        minBitsPerPixel: { type: "number", description: "Override the footage DETAIL floor in bits-per-pixel-per-frame (default 0.02). Catches 'fake HD': nominal 1080p at a starved bitrate. Last resort — pass 0 to disable." },
         outro: { type: "boolean", description: "Show the outro SUBSCRIBE card (default false). Pass true to add an end card." },
         crossfades: { type: "boolean", description: "Crossfade between beats (default true)." },
         captionColor: { type: "string", description: "Hex color for the karaoke caption highlight, e.g. #FFF400 (default, bright yellow)." },
@@ -302,12 +313,26 @@ async function runCreateMatchStory(args: any): Promise<ToolResult> {
 
   // 1) Download each beat's clip into the render pipeline (uploads paths are reused, not re-downloaded).
   const items = segments.slice(0, 8).map((s) => ({ url: s.url, headline: s.headline, sourceChannel: s.channel, narrationLine: s.narration }));
+  const minShortSide = Number.isFinite(args?.minShortSide) && Number(args.minShortSide) >= 0
+    ? Number(args.minShortSide) : undefined;
+  const minBitsPerPixel = Number.isFinite(args?.minBitsPerPixel) && Number(args.minBitsPerPixel) >= 0
+    ? Number(args.minBitsPerPixel) : undefined;
   const fetched = await apiFetch("/scout/fetch-urls", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ items }),
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ items, minShortSide, minBitsPerPixel }),
   }, 150_000);
   const beats: any[] = Array.isArray(fetched?.beats) ? fetched.beats : [];
+  const rejected: { url: string; reason: string }[] = Array.isArray(fetched?.rejected) ? fetched.rejected : [];
   if (beats.length < 2) {
-    throw new Error(`Only ${beats.length} of ${items.length} clips could be fetched (the rest may be full-highlight/watch URLs or blocked). In Scout, extract_segment each moment into an uploads path, then pass those paths.`);
+    // Tell Claude WHY each clip was dropped — a sharpness rejection needs a different remedy
+    // (find a better source) than a download failure (extract_segment into an uploads path).
+    const why = rejected.length ? ` Rejected: ${rejected.map((r) => `${r.url} — ${r.reason}`).join("; ")}.` : "";
+    const soft = rejected.filter((r) => r.reason.startsWith("too soft") || r.reason.startsWith("too small")).length;
+    throw new Error(
+      `Only ${beats.length} of ${items.length} clips could be used.${why}` +
+      (soft > 0
+        ? ` ${soft} were rejected as too low-resolution — find sharper sources (prefer 1080p broadcast footage), or pass minShortSide to lower the bar.`
+        : ` The rest may be full-highlight/watch URLs or blocked. In Scout, extract_segment each moment into an uploads path, then pass those paths.`)
+    );
   }
 
   // 2) Enqueue the render. Re-attach each beat's optional CAPTION (P4) — beats come back from

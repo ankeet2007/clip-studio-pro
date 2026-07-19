@@ -324,7 +324,7 @@ function dispatchMatchStoryJob(
   voiceoverSpeed = "",
   title = "",
   transitionsEnabled = true,
-  titleCardEnabled = true
+  titleCardEnabled = false
 ) {
   const { channelHandle } = readSettings();
   enqueueClipJob(async () => {

@@ -9,6 +9,7 @@ import { inArray, eq } from "drizzle-orm";
 import { db, clipsTable } from "@workspace/db-pro";
 import { logger } from "./logger";
 import { parseWhisperWords, planFillerCuts, findWordTime, type Word } from "./cutEngine";
+import { applyPronunciation } from "./pronunciation";
 
 const execFileAsync = promisify(execFile);
 
@@ -707,7 +708,18 @@ export async function downloadSocialClip(url: string, outPath: string, cookiesFi
   const ytDlp = findYtDlp();
   const args = [
     "--no-playlist", "--no-warnings", "--no-part",
-    "-f", "bv*[height<=1080]+ba/b[height<=1080]/b",
+    // Prefer a REAL HD variant (720-1080) before settling for whatever exists. The old selector
+    // only capped the ceiling, so a post with a 360p variant listed first came back soft — that
+    // was a source of the blurry B-roll. The trailing un-floored fallbacks stay so a genuinely
+    // SD-only clip still downloads; buildBeatsFromUrls' MIN_BEAT_SHORT_SIDE gate is what
+    // actually decides whether it's sharp enough to use.
+    "-f", [
+      "bv*[height<=1080][height>=720]+ba",
+      "b[height<=1080][height>=720]",
+      "bv*[height<=1080]+ba",
+      "b[height<=1080]",
+      "b",
+    ].join("/"),
     "--merge-output-format", "mp4",
     "-o", outPath,
   ];
@@ -1108,8 +1120,12 @@ function resolveSpeed(speed: string | undefined): string {
 async function generateNarrationWav(text: string, outWav: string, voice: string, speed: string): Promise<boolean> {
   const voiceScript = path.join(os.homedir(), "myapp/scripts/generate_voiceover.sh");
   if (!fs.existsSync(voiceScript)) return false;
+  // THE choke point: every narration line in every mode (story / matchstory / top5 / hook)
+  // reaches Piper through here, so respelling here fixes pronunciation everywhere at once.
+  // Captions are built from a separate string and are NOT affected — see PRONUNCIATION_MAP.
+  const spoken = applyPronunciation(text);
   await new Promise<void>((resolve) => {
-    const v = spawn("bash", [voiceScript, text, outWav, voice, speed], { timeout: 120_000 });
+    const v = spawn("bash", [voiceScript, spoken, outWav, voice, speed], { timeout: 120_000 });
     v.on("close", () => resolve());
     v.on("error", () => resolve());
   });
@@ -1837,7 +1853,19 @@ export async function processClip(
       prevLabel = "after_rank";
     }
 
-    // Channel handle watermark: small white text with shadow near the bottom of the video frame
+    // Channel handle watermark: small white text with shadow near the bottom of the video frame.
+    //
+    // ⚠️ WATERMARK OWNERSHIP — there are TWO systems, and only ONE may fire per render:
+    //   • SINGLE-clip renders (routes/clips.ts → processClip directly) burn their captions
+    //     inline below and NEVER call burnCaptionsOnFile, so this drawtext is their only
+    //     watermark. It must keep working.
+    //   • MULTI-segment modes (processStory / processMatchStory / processTop5) finish with
+    //     burnCaptionsOnFile(..., WATERMARK_HANDLE), which stamps the canonical low-center
+    //     watermark over the whole video. Those modes therefore pass channelHandle="" into
+    //     their per-beat processClip calls — otherwise every beat gets this bold handle AND
+    //     the final pass adds the light one, which shipped as a visible double watermark.
+    // If you re-introduce channelHandle to a multi-segment call site, remove the
+    // WATERMARK_HANDLE burn for that mode, or you will double-stamp again.
     if (channelHandle && channelHandle.trim()) {
       // Watermark uses Anton (bold condensed display face, same as the headline) in
       // uppercase so it reads strongly. It lives in the black bar below the video, so
@@ -2633,9 +2661,12 @@ export async function processStory(
       const isLast = i === segs.length - 1;
       const segFilename = `story_${clipId}_seg_${i}_${tmpId}.mp4`;
       logger.info({ clipId, segment: i + 1, of: segs.length }, "Rendering story segment");
+      // Per-beat handle is BLANK on purpose — see the watermark note on processClip's
+      // channelHandle drawtext. This mode finishes with burnCaptionsOnFile(WATERMARK_HANDLE),
+      // so passing the handle here too would stamp the clip twice.
       await processClip(
         seg.localFile ? null : youtubeUrl, seg.startTime, seg.endTime, seg.headline ?? "",
-        segFilename, "edited", channelHandle, 0, seg.localFile || undefined, frameStyle, sourceChannel,
+        segFilename, "edited", "", 0, seg.localFile || undefined, frameStyle, sourceChannel,
         false, isLast && outroEnabled, false, "",
         seg.punchInEnabled ?? false, seg.zoomMoments ?? "", "", "hook", ""
       );
@@ -3027,7 +3058,9 @@ export async function processMatchStory(
   voiceOpts: VoiceOpts = {},
   title = "",
   transitionsEnabled = true,
-  titleCardEnabled = true
+  // Intro title cards are OPT-IN. A black card in front of a Short is a scroll-killer — the
+  // first frame must be footage. Never flip this default back to true.
+  titleCardEnabled = false
 ): Promise<void> {
   const outputDir = getOutputDir();
   const finalOutputPath = path.join(outputDir, outputFilename);
@@ -3149,7 +3182,7 @@ export async function processMatchStory(
       try {
         await processClip(
           isLocalBeat(seg) ? null : seg.youtubeUrl!, seg.startTime, endTime, seg.headline ?? "",
-          rawFile, "edited", channelHandle, 0, isLocalBeat(seg) ? seg.localFile : undefined, frameStyle, seg.sourceChannel || sourceChannel,
+          rawFile, "edited", "", 0, isLocalBeat(seg) ? seg.localFile : undefined, frameStyle, seg.sourceChannel || sourceChannel,
           false, isLast && outroEnabled, false, "",
           seg.punchInEnabled ?? false, seg.zoomMoments ?? "", "", "hook", ""
         );
@@ -3381,7 +3414,7 @@ export async function processTop5(
       try {
         await processClip(
           seg.localFile ? null : seg.youtubeUrl!, seg.startTime, seg.endTime, seg.headline ?? "",
-          rawFile, "edited", channelHandle, 0, seg.localFile || undefined, frameStyle, seg.sourceChannel || sourceChannel,
+          rawFile, "edited", "", 0, seg.localFile || undefined, frameStyle, seg.sourceChannel || sourceChannel,
           false, isLast && outroEnabled, false, "",
           seg.punchInEnabled ?? false, seg.zoomMoments ?? "", "", "hook", "", {}, seg.rank
         );

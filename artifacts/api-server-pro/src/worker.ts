@@ -42,7 +42,7 @@ async function runBundledJob(mode: string, j: any, segments: any[], outName: str
     await processMatchStory(outName, j.channelHandle || "", clipId, j.frameStyle || "immersive",
       j.sourceChannel || "", j.captionsEnabled !== false, !!j.outroEnabled, j.captionColor || "",
       j.narrationScript || "", segments, j.voiceOpts || {}, j.title || "",
-      j.transitionsEnabled !== false, j.titleCardEnabled !== false);
+      j.transitionsEnabled !== false, j.titleCardEnabled === true);
   } else {
     throw new Error(`unknown mode: ${mode}`);
   }

@@ -89,17 +89,32 @@ router.post("/scout/:id/approve", async (req, res): Promise<void> => {
 // POST /scout/fetch-urls — Match Story 2.0 (Claude-driven): download a pasted list of social clip
 // URLs (the beats Claude picked via the MCP connector) into local Match Story beats.
 router.post("/scout/fetch-urls", async (req, res): Promise<void> => {
-  const body = req.body as { items?: { url?: string; headline?: string; sourceChannel?: string; narrationLine?: string }[] };
+  const body = req.body as { items?: { url?: string; headline?: string; sourceChannel?: string; narrationLine?: string }[]; minShortSide?: number; minBitsPerPixel?: number };
   const items = (Array.isArray(body.items) ? body.items : [])
     .filter((x) => x && typeof x.url === "string" && x.url.trim())
     .map((x) => ({ url: String(x.url).trim(), headline: String(x.headline ?? ""), sourceChannel: String(x.sourceChannel ?? ""), narrationLine: String(x.narrationLine ?? "") }))
     .slice(0, 8);
   if (items.length < 2) { res.status(400).json({ error: "Provide at least 2 clip URLs (Reddit / X / Instagram / Facebook)." }); return; }
+  // Sharpness floor is on by default; callers can lower it (or pass 0 to disable) when a topic
+  // genuinely has no HD footage and soft B-roll beats no B-roll.
+  const minShortSide = Number.isFinite(body.minShortSide as number) && (body.minShortSide as number) >= 0
+    ? Math.min(2160, Number(body.minShortSide)) : undefined;
+  const minBitsPerPixel = Number.isFinite(body.minBitsPerPixel as number) && (body.minBitsPerPixel as number) >= 0
+    ? Math.min(1, Number(body.minBitsPerPixel)) : undefined;
   try {
-    const beats = await buildBeatsFromUrls(items);
-    if (beats.length < 2) { res.status(400).json({ error: "Couldn't download at least 2 of those clips — the platform cookies may be missing/expired, or the links aren't downloadable videos." }); return; }
-    logger.info({ requested: items.length, got: beats.length }, "MS2 fetch-urls");
-    res.json({ beats });
+    const { beats, rejected } = await buildBeatsFromUrls(items, { minShortSide, minBitsPerPixel });
+    if (beats.length < 2) {
+      const softCount = rejected.filter((r) => r.reason.startsWith("too soft") || r.reason.startsWith("too small")).length;
+      res.status(400).json({
+        error: softCount > 0
+          ? `Only ${beats.length} clip(s) cleared the sharpness floor — ${softCount} were too low-resolution to use. Pick sharper sources, or retry with a lower minShortSide.`
+          : "Couldn't download at least 2 of those clips — the platform cookies may be missing/expired, or the links aren't downloadable videos.",
+        rejected,
+      });
+      return;
+    }
+    logger.info({ requested: items.length, got: beats.length, rejected: rejected.length }, "MS2 fetch-urls");
+    res.json({ beats, rejected });
   } catch (e) {
     logger.error({ e }, "MS2 fetch-urls failed");
     res.status(500).json({ error: e instanceof Error ? e.message : "Failed to fetch clips." });

@@ -13,7 +13,7 @@ import { Router, type IRouter, type Request, type Response } from "express";
 import { logger } from "../lib/logger";
 import { understandVideo, downloadClipToUploads, extractSegment } from "../lib/videoUnderstand";
 
-const SERVER_INFO = { name: "clip-studio-scout", version: "1.1.0" };
+const SERVER_INFO = { name: "clip-studio-scout", version: "1.2.0" };
 // Protocol versions we understand; we echo the client's if it's one of these, else use the latest.
 const SUPPORTED_PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 const DEFAULT_PROTOCOL = "2025-06-18";
@@ -105,6 +105,16 @@ const INSTRUCTIONS = [
   "CLIPS:",
   "1 | <clip url OR uploads path> | <on-screen headline, 3-6 words>",
   "2 | ...",
+  "",
+  "FOOTAGE SHARPNESS (hard gate — soft clips are REJECTED at render, not fixed): resolution alone",
+  "does NOT mean sharp. AI-recap channels, 'highlights' re-uploads and news rips routinely publish a",
+  "nominal 1920x1080 at a starved bitrate that renders as visible mush in the finished Short. Prefer",
+  "real broadcast footage, official league/club uploads and original fan video; be suspicious of",
+  "channels whose titles are auto-generated or whose clips look upscaled. understand_video reports each",
+  "clip's resolution — treat anything under 720p on the short side as unusable, and judge apparent",
+  "detail from the keyframes themselves rather than trusting the stated resolution.",
+  "",
+  "NEVER propose an intro title card. The first frame of a Short must be moving footage.",
 ].join("\n");
 
 // ---------------------------------------------------------------------------
