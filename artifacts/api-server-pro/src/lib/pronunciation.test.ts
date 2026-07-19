@@ -8,13 +8,23 @@ test("respells the names verified to need it", () => {
   // Measured: plain "Kylian Mbappe" synthesized as "Kylie and Mbapp"; the respelling
   // "Keelian Embappay" transcribes back as "Kylian Mbappe".
   assert.notEqual(applyPronunciation("Kylian Mbappe"), "Kylian Mbappe");
+  // Measured: plain "Bukayo Saka" -> "The UK Osaka"; "Bookiyo Sahka" -> "Bookyo Saka".
+  assert.equal(applyPronunciation("Bukayo Saka"), "Bookiyo Sahka");
+});
+
+test("rejects the respellings measured as harmful", () => {
+  // "Bukyo" synthesized as audio transcribing to "Fuck I"; "Sakka" split into "sack a".
+  // Neither may ever reappear in the map.
+  const out = applyPronunciation("Bukayo Saka");
+  assert.ok(!/Bukyo/.test(out), "Bukyo produced profanity-sounding audio");
+  assert.ok(!/Sakka/.test(out), "Sakka split one token into two spoken words");
 });
 
 test("carries NO unmeasured entries", () => {
   // Guards the rule in pronunciation.ts: a respelling Piper splits into two spoken words
   // corrupts caption alignment, so unmeasured guesses must never sit in the map.
   // "Sakka" -> "sack a" and "Lameen" -> "Lamy" were caught exactly this way.
-  for (const name of ["Bukayo Saka", "Ousmane Dembele", "Lamine Yamal", "Tchouameni", "Griezmann"]) {
+  for (const name of ["Ousmane Dembele", "Lamine Yamal", "Tchouameni", "Griezmann"]) {
     assert.equal(applyPronunciation(name), name, `${name} must stay plain until measured`);
   }
 });

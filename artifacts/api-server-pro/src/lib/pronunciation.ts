@@ -34,6 +34,15 @@
 const PRONUNCIATION_MAP: Record<string, string> = {
   kylian: "Keelian",
   mbappe: "Embappay",
+  // PARTIAL fix, measured on two ASRs against a same-model control:
+  //   plain "Bukayo Saka"    -> "The UK Osaka"  (both small.en and medium.en)
+  //   resp. "Bookiyo Sahka"  -> "Bookyo Saka"   (small.en)  /  "Buki Osaka"  (medium.en)
+  // The first name improves clearly on both — espeak was parsing "Bukayo" as the letters
+  // U-K. The surname still leans "Osaka" on the sharper model, so this is better, not solved.
+  // It also removes a SPLIT: the plain spelling turns 2 written tokens into 3 spoken words
+  // ("The UK Osaka"), which is itself a caption-alignment hazard; the respelling stays at 2.
+  bukayo: "Bookiyo",
+  saka: "Sahka",
 };
 
 /**
@@ -43,6 +52,8 @@ const PRONUNCIATION_MAP: Record<string, string> = {
  *
  *   saka:    "Sakka"     -> heard as "sack a"       ⚠️ ONE token became TWO spoken words.
  *   bukayo:  "Bookayo"   -> heard as "Gocayo"        (plain "Bukayo Saka" -> "The UK Osaka")
+ *   bukayo:  "Bukyo"     -> heard as "Fuck I"       🚨 SEE THE WARNING BELOW.
+ *   bukayo:  "Bookyeo"   -> heard as "Bookie O'"     (with saka:"Sackah" -> "Sacabod")
  *   lamine:  "Lameen"    -> heard as "Lamy"          ⚠️ "Lamy" is the old caption-desync bug.
  *   yamal:   "Yamahl"    -> heard as "Niemal"        (plain -> "Lamain Yammel")
  *   ousmane: "Oosmahn"   -> heard as "Guzman"        (plain -> "Alsmane Denbel")
@@ -56,6 +67,21 @@ const PRONUNCIATION_MAP: Record<string, string> = {
  * Tchouaméni / Konaté / Barcola / Olise / Scaloni / Oyarzabal / Griezmann were never
  * measured at all and so are deliberately absent. An unfixed name merely sounds wrong;
  * a bad respelling can corrupt the captions, which is worse.
+ *
+ * 🚨 NEVER ADD AN UNMEASURED RESPELLING. The candidate "Bukyo" for Bukayo synthesized as
+ * audio that transcribes as "Fuck I Osaka". It looked entirely reasonable on paper. Had it
+ * shipped, a published Short would have opened with what sounds like profanity over the
+ * user's channel handle. Respellings steer a phoneme engine, and neighbouring letters
+ * interact in ways you cannot predict by reading them — the ONLY way to know what a
+ * candidate says is to synthesize it and listen to (or transcribe) the result.
+ *
+ * HOW TO MEASURE (the harness used for every entry above):
+ *   1. Synthesize the candidate IN A SENTENCE, not bare — whisper is unreliable on ~1s clips:
+ *        bash ~/myapp/scripts/generate_voiceover.sh "<line>" out.wav en_US-ryan-medium 1.0
+ *   2. ffmpeg -i out.wav -ar 16000 -ac 1 out.16k.wav
+ *   3. Transcribe it back (whisper small.en or better) and compare against the real name.
+ *   4. Accept ONLY if it (a) transcribes closer to the true name than the plain spelling,
+ *      (b) keeps the same word count, and (c) contains nothing embarrassing.
  */
 
 /** Strip diacritics so "Mbappé" and "Mbappe" hit the same map entry. */
