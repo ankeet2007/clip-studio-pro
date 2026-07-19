@@ -11,6 +11,8 @@
 
 import { Router, type IRouter, type Request, type Response } from "express";
 import { logger } from "../lib/logger";
+import { verifyMoments, type VerifyRequest } from "../lib/verify/verifier";
+import { getReceipt, putReceipt } from "../lib/verify/receipt";
 import { understandVideo, downloadClipToUploads, extractSegment } from "../lib/videoUnderstand";
 
 const SERVER_INFO = { name: "clip-studio-scout", version: "1.2.0" };
@@ -256,6 +258,59 @@ const TOOLS = [
         },
       },
       required: ["url"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "verify_moment",
+    description:
+      "LOOK at the frames of a clip window and report what it actually shows. REQUIRED before a beat " +
+      "can be rendered: create_match_story rejects any beat without a matching verifyId from this tool. " +
+      "Pass ALL your beats in one call — 6 beats is one round trip, not six. Returns per-beat " +
+      "{verifyId, verdict, depicts, onScreenText, flags}. onScreenText is read verbatim from burned-in " +
+      "scoreboards/chyrons/tickers: if it names a team or scoreline your narration line never mentions, " +
+      "the clip is almost certainly from a different match — that exact failure shipped once. flags mark " +
+      "footage that is technically right but unusable (slow-motion-replay, studio-talking-head, " +
+      "gameplay-render, static-graphic). If no server-side vision model is configured, the frames are " +
+      "returned to YOU as images and you must send your own verdict back via confirm_moment.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        beats: {
+          type: "array",
+          description: "Every beat you intend to render. Batch them — this is one model call regardless of count.",
+          items: {
+            type: "object",
+            properties: {
+              url: { type: "string", description: "The beat's clip: an uploads path (preferred — fast local seek) or a source URL." },
+              start: { type: "string", description: "Window start in seconds or HH:MM:SS. Must be the window you will ACTUALLY render." },
+              end: { type: "string", description: "Window end. Verifying a different window than you render is rejected at create_match_story." },
+              expect: { type: "string", description: "What this beat claims to show — normally its narration line." },
+            },
+            required: ["url", "start", "end", "expect"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["beats"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "confirm_moment",
+    description:
+      "Record YOUR verdict for a pending verifyId, when verify_moment returned frames because no " +
+      "server-side vision model is configured. Look at the frames it gave you, then send the verdict " +
+      "plus every string of on-screen text you can read. Only needed in that fallback case.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        verifyId: { type: "string", description: "The pending verifyId from verify_moment." },
+        matches: { type: "boolean", description: "Do the frames show what the beat claims? false BLOCKS the beat." },
+        depicts: { type: "string", description: "One line describing what the frames actually show." },
+        onScreenText: { type: "array", items: { type: "string" }, description: "Every legible burned-in string — scoreboards, chyrons, tickers." },
+      },
+      required: ["verifyId", "matches"],
       additionalProperties: false,
     },
   },
@@ -510,6 +565,74 @@ async function runGetMediaResult(args: any): Promise<ToolResult> {
   return pollMediaJob(job, 20_000);
 }
 
+// ---------------------------------------------------------------------------
+// verify_moment / confirm_moment — the verification PRECONDITION.
+//
+// "Verify every beat" lived in INSTRUCTIONS prose for months and was skipped; the cat meme and
+// the "ARGENTINA 1-2 IN THE SEMIFINAL" chyron are what skipping looks like. These tools mint
+// receipts that create_match_story then REQUIRES, so the check cannot be quietly dropped.
+
+/** Seconds or HH:MM:SS -> seconds. */
+function vSec(t: unknown): number {
+  const parts = String(t ?? "").split(":").map(Number);
+  if (parts.length === 3) return (parts[0] || 0) * 3600 + (parts[1] || 0) * 60 + (parts[2] || 0);
+  if (parts.length === 2) return (parts[0] || 0) * 60 + (parts[1] || 0);
+  return Number(t) || 0;
+}
+
+async function runVerifyMoment(args: any): Promise<ToolResult> {
+  const raw = Array.isArray(args?.beats) ? args.beats : [];
+  if (raw.length === 0) throw new Error("Pass `beats`: [{url, start, end, expect}]. Batch ALL your beats in one call.");
+  const reqs: VerifyRequest[] = raw.slice(0, 12).map((b: any) => {
+    const asset = localUploadPath(String(b?.url ?? "")) ?? String(b?.url ?? "");
+    const start = vSec(b?.start), end = vSec(b?.end);
+    if (!asset) throw new Error("Each beat needs a `url` (uploads path or source URL).");
+    if (!(end > start)) throw new Error(`Beat window must have end > start (got ${b?.start}-${b?.end}).`);
+    return { asset, start, end, expect: String(b?.expect ?? "") };
+  });
+
+  const outcomes = await verifyMoments(reqs);
+  const content: ContentBlock[] = [];
+  const lines: string[] = [];
+
+  outcomes.forEach((o, i) => {
+    const r = o.receipt;
+    lines.push(
+      `Beat ${i + 1} — verifyId: ${r.verifyId} · verdict: ${r.verdict}` +
+      (r.depicts ? `\n  depicts: ${r.depicts}` : "") +
+      (r.onScreenText.length ? `\n  on-screen text: ${r.onScreenText.map((t) => `"${t}"`).join(", ")}` : "") +
+      (r.flags.length ? `\n  flags: ${r.flags.join(", ")}` : "") +
+      (r.verdict === "rejected" ? "\n  ⛔ BLOCKED — this beat cannot be rendered. Find different footage." : "") +
+      (r.verdict === "unverified" ? "\n  ⚠️ No server-side vision model answered — LOOK at the frames below and call confirm_moment with this verifyId." : ""),
+    );
+    if (o.frames?.length) for (const f of o.frames) content.push({ type: "image", data: f.b64, mimeType: f.mime });
+  });
+
+  return { content: [{ type: "text", text: lines.join("\n\n") }, ...content] };
+}
+
+async function runConfirmMoment(args: any): Promise<ToolResult> {
+  const verifyId = String(args?.verifyId ?? "").trim();
+  const pending = getReceipt(verifyId);
+  if (!pending) throw new Error("Unknown or expired verifyId — call verify_moment again for that beat.");
+  const matches = args?.matches !== false;
+  const updated = putReceipt({
+    verifyId,
+    asset: pending.asset,
+    windowStart: pending.windowStart,
+    windowEnd: pending.windowEnd,
+    verdict: matches ? "confirmed" : "rejected",
+    depicts: String(args?.depicts ?? pending.depicts),
+    onScreenText: Array.isArray(args?.onScreenText) ? args.onScreenText.map(String) : pending.onScreenText,
+    flags: pending.flags,
+    backend: "connector",
+  });
+  return textResult(
+    `Recorded ${updated.verdict} for ${verifyId}.` +
+    (updated.verdict === "rejected" ? " This beat is now BLOCKED — find different footage." : " This beat may now be rendered."),
+  );
+}
+
 async function callTool(name: string, args: any): Promise<ToolResult> {
   switch (name) {
     case "list_platforms": return textResult(await runListPlatforms());
@@ -518,6 +641,8 @@ async function callTool(name: string, args: any): Promise<ToolResult> {
     case "understand_video": return runUnderstandVideo(args);
     case "download_clip": return runDownloadClip(args);
     case "extract_segment": return runExtractSegment(args);
+    case "verify_moment": return runVerifyMoment(args);
+    case "confirm_moment": return runConfirmMoment(args);
     case "get_media_result": return runGetMediaResult(args);
     default: throw new Error(`Unknown tool: ${name}`);
   }

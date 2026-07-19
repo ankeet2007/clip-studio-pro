@@ -10,6 +10,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { logger } from "../lib/logger";
 import { getUploadsDir, getOutputFilePath } from "../lib/clipProcessor";
+import { getReceipt, matchesReceipt } from "../lib/verify/receipt";
 
 // HH:MM:SS (or seconds) -> seconds.
 const hmsToSec = (t: unknown): number => {
@@ -115,6 +116,7 @@ const SEGMENT_SCHEMA = {
     url: { type: "string", description: "The beat's source: a real clip URL from Scout (reddit/x/instagram/facebook/youtube) OR an uploads path from Scout's download_clip / extract_segment." },
     narration: { type: "string", description: "This beat's SPOKEN narration line (the render voices this over the muted clip). Write names PLAINLY and correctly spelled ('Kylian Mbappé', 'Bukayo Saka') — do NOT write phonetic respellings. The server keeps its own measured pronunciation map and respells for the TTS internally; hand-written phonetics fight it and leak into the captions." },
     caption: { type: "string", description: "Optional on-screen CAPTION text when it must differ from what's spoken — e.g. digits for clarity ('22' where you say 'twenty-two'). Use the SAME word count as narration so the captions line up. Omit to caption exactly what's spoken. You do NOT need this just to fix pronunciation — that is handled server-side." },
+    verifyId: { type: "string", description: "REQUIRED. The verifyId returned by Scout's verify_moment for THIS beat's clip and the window you are rendering. A beat without a matching receipt is rejected — the server will not render footage nobody looked at." },
     headline: { type: "string", description: "Optional short on-screen headline for this beat (3-6 words)." },
     channel: { type: "string", description: "Optional source handle/credit, e.g. r/soccer." },
     cutDensity: {
@@ -310,6 +312,45 @@ async function runCreateMatchStory(args: any): Promise<ToolResult> {
   if (segments.length > 8) throw new Error(`You passed ${segments.length} beats, but a Match Story renders at most 8 — beats 9-${segments.length} (often the payoff) would be dropped. Merge or trim to 8 beats and resend.`);
   const words = totalWords(segments);
   if (words < 140) throw new Error(`Narration is only ~${words} words (~${Math.round(words / 2.4)}s) — a Story needs ~150-220 words (60-90s). Lengthen the beats, then retry.`);
+
+  // ── VERIFICATION PRECONDITION ─────────────────────────────────────────────────────────────
+  // Every beat must carry a verifyId whose receipt covers the SAME clip and an OVERLAPPING
+  // window. This is what makes verification structural rather than advisory: "verify every
+  // beat" was INSTRUCTIONS prose for months and got skipped, which is how a cat meme and an
+  // "ARGENTINA 1-2 IN THE SEMIFINAL" chyron reached a finished video.
+  //
+  // Asymmetric by design: a REJECTED verdict is a hard block with no override (a model verdict
+  // is evidence about the footage), while an UNVERIFIED receipt — meaning the vision backend
+  // was unreachable — passes with a warning (an outage is not evidence about the footage).
+  {
+    const problems: string[] = [];
+    const unverified: string[] = [];
+    segments.forEach((sg: any, i: number) => {
+      const rec = getReceipt(String(sg?.verifyId ?? ""));
+      // Window bounds are 0..∞ here ON PURPOSE, and it is worth being precise about what that
+      // does and does not enforce. What IS enforced: the receipt exists, is unexpired, is not a
+      // rejection, and is for THIS asset. The window-overlap arm is inert at this call site
+      // because a beat sourced from extract_segment is a NEW file containing only that window —
+      // the asset identity already pins the window, so re-checking it would be theatre.
+      // RESIDUAL GAP, stated plainly: if a caller passes a long un-cut highlight URL directly as
+      // a beat, a receipt covering only part of it will satisfy this check. The fix for that is
+      // Stage 3 (cut moments out of a spine), not a bound we cannot compute here — we do not
+      // know the beat's rendered duration until after download.
+      const m = matchesReceipt(rec, { asset: String(sg?.url ?? ""), start: 0, end: Number.MAX_SAFE_INTEGER });
+      if (!m.ok) problems.push(`Beat ${i + 1}: ${m.reason}`);
+      else if (rec?.verdict === "unverified") unverified.push(`Beat ${i + 1}`);
+    });
+    if (problems.length) {
+      throw new Error(
+        `${problems.length} beat(s) are not verified, so the render was refused:\n` +
+        problems.map((p) => `  • ${p}`).join("\n") +
+        `\nCall Scout's verify_moment with ALL your beats in one batch, then pass each returned verifyId here.`,
+      );
+    }
+    if (unverified.length) {
+      logger.warn({ unverified }, "Story rendering with UNVERIFIED beats (vision backend unreachable)");
+    }
+  }
 
   // 1) Download each beat's clip into the render pipeline (uploads paths are reused, not re-downloaded).
   const items = segments.slice(0, 8).map((s) => ({ url: s.url, headline: s.headline, sourceChannel: s.channel, narrationLine: s.narration }));
