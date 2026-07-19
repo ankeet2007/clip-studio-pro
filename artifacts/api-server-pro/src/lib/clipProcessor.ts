@@ -10,6 +10,7 @@ import { db, clipsTable } from "@workspace/db-pro";
 import { logger } from "./logger";
 import { parseWhisperWords, planFillerCuts, findWordTime, type Word } from "./cutEngine";
 import { applyPronunciation } from "./pronunciation";
+import { probeFootage, judgeFootage } from "./footageQuality";
 
 const execFileAsync = promisify(execFile);
 
@@ -3072,6 +3073,46 @@ export async function processMatchStory(
   const segs = (segments ?? []).slice(0, 8);
   if (segs.length < 2) throw new Error("A Match Story needs at least 2 beats.");
 
+  const isLocalBeat = (s: StorySegment) => !!(s.localFile && s.localFile.trim());
+  for (let i = 0; i < segs.length; i++) {
+    const s = segs[i]!;
+    if (isLocalBeat(s)) {
+      if (!fs.existsSync(s.localFile!)) throw new Error(`Beat #${i + 1}: downloaded clip is missing — re-scout.`);
+    } else if (!s.youtubeUrl || !s.youtubeUrl.trim()) {
+      throw new Error(`Beat #${i + 1} is missing a source video URL.`);
+    }
+  }
+
+  // FOOTAGE SHARPNESS — enforced HERE, at the renderer, not only at the sourcing step.
+  //
+  // Scout's /scout/fetch-urls gates clips as it downloads them, but that only covers beats
+  // that arrived through Scout. A hand-built tar bundle POSTed to the cloud worker goes
+  // straight to runBundledJob -> here, bypassing that gate entirely — which is exactly how
+  // a 1920x1080-at-519kbps recap re-upload shipped as visibly soft B-roll. Checking at the
+  // renderer means EVERY path (app route, connector, bundled cloud job) is covered by one
+  // rule. Costs one ffprobe per beat and fails before any encoding starts.
+  //
+  // Overridable per job for topics with genuinely no sharp footage (0 disables a floor).
+  const qOpts = {
+    minShortSide: Number.isFinite(Number(process.env.MIN_BEAT_SHORT_SIDE)) ? Number(process.env.MIN_BEAT_SHORT_SIDE) : undefined,
+    minBitsPerPixel: Number.isFinite(Number(process.env.MIN_BEAT_BITS_PER_PIXEL)) ? Number(process.env.MIN_BEAT_BITS_PER_PIXEL) : undefined,
+  };
+  const softBeats: string[] = [];
+  for (let i = 0; i < segs.length; i++) {
+    const s = segs[i]!;
+    if (!isLocalBeat(s)) continue; // YouTube beats are HD-floored at download time
+    const verdict = judgeFootage(await probeFootage(s.localFile!), qOpts);
+    if (!verdict.ok) softBeats.push(`Beat #${i + 1} (${path.basename(s.localFile!)}): ${verdict.reason}`);
+  }
+  if (softBeats.length) {
+    throw new Error(
+      `${softBeats.length} beat(s) failed the footage sharpness check, so the render was stopped before wasting an encode:\n`
+      + softBeats.map((b) => `  • ${b}`).join("\n")
+      + `\nReplace them with sharper sources (real broadcast footage, not AI-recap/re-upload channels). `
+      + `To override for a topic that genuinely has no sharp footage, set MIN_BEAT_SHORT_SIDE / MIN_BEAT_BITS_PER_PIXEL (0 disables).`
+    );
+  }
+
   // Cloud offload: bundle every beat (local scout clips are copied as-is; YouTube beats are
   // downloaded on the home IP) and render the whole Match Story on the cloud. Falls through
   // to local on any failure.
@@ -3087,15 +3128,6 @@ export async function processMatchStory(
     }
   }
 
-  const isLocalBeat = (s: StorySegment) => !!(s.localFile && s.localFile.trim());
-  for (let i = 0; i < segs.length; i++) {
-    const s = segs[i]!;
-    if (isLocalBeat(s)) {
-      if (!fs.existsSync(s.localFile!)) throw new Error(`Beat #${i + 1}: downloaded clip is missing — re-scout.`);
-    } else if (!s.youtubeUrl || !s.youtubeUrl.trim()) {
-      throw new Error(`Beat #${i + 1} is missing a source video URL.`);
-    }
-  }
 
   // Pre-flight every YouTube beat's window (durations are cached from the verify step) so a
   // hallucinated timestamp fails in seconds and names the exact beat, not after ~15 min. Local
