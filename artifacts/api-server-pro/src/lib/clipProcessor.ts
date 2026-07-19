@@ -709,18 +709,19 @@ export async function downloadSocialClip(url: string, outPath: string, cookiesFi
   const ytDlp = findYtDlp();
   const args = [
     "--no-playlist", "--no-warnings", "--no-part",
-    // Prefer a REAL HD variant (720-1080) before settling for whatever exists. The old selector
-    // only capped the ceiling, so a post with a 360p variant listed first came back soft — that
-    // was a source of the blurry B-roll. The trailing un-floored fallbacks stay so a genuinely
-    // SD-only clip still downloads; buildBeatsFromUrls' MIN_BEAT_SHORT_SIDE gate is what
-    // actually decides whether it's sharp enough to use.
-    "-f", [
-      "bv*[height<=1080][height>=720]+ba",
-      "b[height<=1080][height>=720]",
-      "bv*[height<=1080]+ba",
-      "b[height<=1080]",
-      "b",
-    ].join("/"),
+    // Take the BEST available variant, sorted by resolution then bitrate.
+    //
+    // The previous selector filtered on `height>=720`, which is wrong for PORTRAIT video: there
+    // height is the LONG side, so a 480x852 phone clip satisfied a "720p+" filter while being
+    // only 480 across. Measured: the pre-download probe reported 1080x1920 for an X post while
+    // the download returned 480x852 — probe and downloader describing different variants — and
+    // the sharpness gate then correctly rejected the file the downloader had chosen.
+    //
+    // Sorting instead of filtering also removes the ceiling problem in one move: `-S res,tbr`
+    // always picks the sharpest variant on offer, and MIN_BEAT_SHORT_SIDE remains the single
+    // place that decides whether the result is good enough to composite.
+    "-S", "res,tbr",
+    "-f", "bv*+ba/b",
     "--merge-output-format", "mp4",
     "-o", outPath,
   ];

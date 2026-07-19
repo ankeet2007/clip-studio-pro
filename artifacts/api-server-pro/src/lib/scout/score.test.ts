@@ -195,3 +195,20 @@ test("claim-safe mode still rejects junk — safety alone is not enough", () => 
   // A claim-safe recap farm must not beat a claim-safe reputable source.
   assert.ok(sourceScore("trusted", "low", true) > sourceScore("suspect", "low", true));
 });
+
+// ─── the two routing/relevance bugs found on 2026-07-19 ─────────────────────────────────
+
+test("⭐ competition names are NOT identifying entities", () => {
+  // The bug: "Lionel Messi Argentina 2026 World Cup" counted `world` and `cup` as entities, so
+  // "Top 20 Scott McTominay Goals | World Cup Reds" scored 2/6 and cleared the floor. A Messi
+  // search came back full of Rashford and Ronaldo posts.
+  const spec = parseTopic("Lionel Messi Argentina 2026 World Cup goal celebration");
+  assert.ok(!spec.entities.includes("world"), "world must not be an entity");
+  assert.ok(!spec.entities.includes("cup"), "cup must not be an entity");
+  assert.ok(spec.entities.includes("messi"), "the player IS the entity");
+
+  const mcTominay = scoreRelevance("Top 20 Scott McTominay Goals | World Cup Reds", spec);
+  const realMessi = scoreRelevance("Lionel Messi scores for Argentina", spec);
+  assert.ok(realMessi.score > mcTominay.score, "a Messi clip must outrank generic World Cup chatter");
+  assert.ok(mcTominay.score < 0.15, `generic chatter must fall under the floor, got ${mcTominay.score}`);
+});

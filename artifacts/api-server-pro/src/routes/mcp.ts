@@ -14,7 +14,7 @@ import { logger } from "../lib/logger";
 import { verifyMoments, type VerifyRequest } from "../lib/verify/verifier";
 import { getReceipt, putReceipt } from "../lib/verify/receipt";
 import { buildSpine, searchSpine, cutBeats, SPINE_MIN_DURATION_SEC } from "../lib/spine";
-import { understandVideo, downloadClipToUploads, extractSegment } from "../lib/videoUnderstand";
+import { understandVideo, downloadClipToUploads, extractSegment, localUploadPath } from "../lib/videoUnderstand";
 
 const SERVER_INFO = { name: "clip-studio-scout", version: "1.3.0" };
 // Protocol versions we understand; we echo the client's if it's one of these, else use the latest.

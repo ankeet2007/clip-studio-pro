@@ -15,12 +15,30 @@ const ACTION_WORDS = ["goal", "highlight", "red card", "save", "assist", "skill"
 
 // Topic keyword → likely subreddits. Falls back to broad sports subs.
 const SUBREDDIT_MAP: { match: RegExp; subs: string[] }[] = [
-  { match: /\b(soccer|football|fifa|messi|ronaldo|neymar|premier|la liga|ucl|world cup)\b/i, subs: ["soccer", "football", "fcbarcelona", "reddevils"] },
+  // Generic football → GENERAL subs only. Club subs are added separately, and ONLY when that
+  // club is actually named — see CLUB_SUBS below.
+  //
+  // Measured bug, 2026-07-19: this line used to append "fcbarcelona" and "reddevils" to ANY
+  // football query, so a search for "Lionel Messi Argentina World Cup" was routed into
+  // Manchester United's subreddit and came back full of Marcus Rashford and Ronaldo posts.
+  // A player's name must not drag in an unrelated club's community.
+  { match: /\b(soccer|football|fifa|messi|ronaldo|neymar|mbappe|mbappé|premier|la liga|ucl|world cup|euros?)\b/i,
+    subs: ["soccer", "football", "worldcup", "sports"] },
   { match: /\b(nba|basketball|lebron|curry|dunk)\b/i, subs: ["nba", "basketball"] },
   { match: /\b(nfl|touchdown|quarterback)\b/i, subs: ["nfl"] },
   { match: /\b(ufc|mma|knockout|octagon)\b/i, subs: ["ufc", "mma"] },
   { match: /\b(cricket|ipl|wicket|batsman)\b/i, subs: ["cricket"] },
   { match: /\b(f1|formula|grand prix|verstappen|hamilton)\b/i, subs: ["formula1"] },
+];
+
+/** Club-specific subs, added ONLY when the club is named in the topic. */
+const CLUB_SUBS: { match: RegExp; subs: string[] }[] = [
+  { match: /\b(barcelona|barca|barça)\b/i, subs: ["fcbarcelona"] },
+  { match: /\b(man\s*utd|manchester united|united)\b/i, subs: ["reddevils"] },
+  { match: /\b(real madrid|madrid)\b/i, subs: ["realmadrid"] },
+  { match: /\b(liverpool)\b/i, subs: ["liverpoolfc"] },
+  { match: /\b(arsenal)\b/i, subs: ["gunners"] },
+  { match: /\b(chelsea)\b/i, subs: ["chelseafc"] },
 ];
 
 const DEFAULT_SUBS = ["sports", "sportsclips", "publicfreakout"];
@@ -47,13 +65,29 @@ export function buildQueryPlan(topic: string, subredditHints?: string[]): QueryP
 
   // Primary query keeps the user's phrasing (better for exact-match search) minus filler.
   const primary = cleaned;
-  // A couple of expansions so we don't miss clips titled around the action rather than the teams.
-  const variants = ACTION_WORDS.slice(0, 3).map((a) => `${primary} ${a}`);
+  // Query EXPANSION. Recall is the binding constraint: a single query string against one
+  // platform returns a few dozen hits at best, and the hard filters downstream then remove most
+  // of them. Several differently-shaped queries find genuinely different clips.
+  //
+  // Measured 2026-07-19: these variants existed but NO adapter ever read them — every platform
+  // fired `primary` alone. Fixing that is the single largest recall lever in the pipeline.
+  const ents = terms.slice(0, 4);
+  const variants = Array.from(new Set([
+    // Entities alone — drops narrative words the poster would never use in a caption.
+    ents.length >= 2 ? ents.join(" ") : "",
+    // The action framings a clip is actually titled with.
+    `${ents.slice(0, 3).join(" ")} goal`,
+    `${ents.slice(0, 3).join(" ")} celebration`,
+    // Just the headline entity, to catch tightly-cropped single-subject clips.
+    ents[0] ?? "",
+  ].filter((v) => v && v !== primary)));
 
   let subreddits = (subredditHints ?? []).map((s) => s.replace(/^r\//i, "").trim()).filter(Boolean);
   if (subreddits.length === 0) {
     const matched = SUBREDDIT_MAP.find((m) => m.match.test(cleaned));
-    subreddits = matched ? matched.subs : DEFAULT_SUBS;
+    subreddits = matched ? [...matched.subs] : [...DEFAULT_SUBS];
+    // Append a club sub only when the topic actually names that club.
+    for (const c of CLUB_SUBS) if (c.match.test(cleaned)) subreddits.push(...c.subs);
   }
 
   return { primary, variants, terms, subreddits };

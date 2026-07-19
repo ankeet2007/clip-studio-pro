@@ -40,6 +40,11 @@ const jobs = new Map<string, ScoutJob>();
  *  has been measured; shallow enough not to hammer one home IP into throttling. */
 const PROBE_TOP_N = 24;
 
+/** How many differently-shaped queries to fire per platform. Recall is the binding constraint
+ *  (see buildQueryPlan), but each query costs a network round trip — gallery-dl on X takes up
+ *  to 90s — so this is the trade between breadth and how long a search takes. */
+const MAX_QUERIES_PER_PLATFORM = 4;
+
 export function listAdapters(): { platform: Platform; configured: boolean }[] {
   return ADAPTERS.map((a) => ({ platform: a.platform, configured: a.isConfigured() }));
 }
@@ -95,13 +100,27 @@ async function runScout(job: ScoutJob): Promise<void> {
     job.status = "searching";
     const cap = job.options.maxCandidates ?? 40;
     const raw: RawCandidate[] = [];
+    // Fire EVERY query shape at every platform and merge. One query per platform was the main
+    // reason searches came back with a couple of dozen candidates: the hard filters downstream
+    // are strict, so recall has to be wide going in or nothing survives.
+    const queries = [plan.primary, ...plan.variants].slice(0, MAX_QUERIES_PER_PLATFORM);
+    const seenUrl = new Set<string>();
     for (let i = 0; i < enabled.length; i++) {
-      try {
-        const hits = await enabled[i]!.search(job.topic, job.options);
-        raw.push(...hits);
-        logger.info({ jobId: job.id, platform: enabled[i]!.platform, hits: hits.length }, "Scout platform searched");
-      } catch (e) {
-        logger.warn({ e, platform: enabled[i]!.platform }, "Scout adapter search failed");
+      for (const q of queries) {
+        try {
+          const hits = await enabled[i]!.search(q, job.options);
+          // De-dup by URL as we merge — the same clip legitimately answers several queries.
+          let added = 0;
+          for (const h of hits) {
+            if (seenUrl.has(h.sourceUrl)) continue;
+            seenUrl.add(h.sourceUrl);
+            raw.push(h);
+            added++;
+          }
+          logger.info({ jobId: job.id, platform: enabled[i]!.platform, query: q.slice(0, 48), hits: hits.length, added }, "Scout query complete");
+        } catch (e) {
+          logger.warn({ e, platform: enabled[i]!.platform, query: q.slice(0, 48) }, "Scout adapter query failed");
+        }
       }
       job.candidates = rankCandidates(raw, plan.terms, job.options, undefined, job.topic).slice(0, cap).map((c) => ({ ...c, status: "candidate" as const }));
       job.progress = 5 + ((i + 1) / enabled.length) * 90;
@@ -121,7 +140,14 @@ async function runScout(job: ScoutJob): Promise<void> {
       job.status = "probing";
       const shortlist = job.candidates.slice(0, PROBE_TOP_N);
       const probes = await probeAll(
-        shortlist.map((c) => ({ url: c.sourceUrl, cookieFile: cookieForPlatform(cfg0, c.platform) })),
+        // Pass the adapter's already-resolved direct url when it has one (Reddit's v.redd.it
+        // HLS): yt-dlp cannot reach the Reddit API from this IP, so ffprobing the manifest is
+        // the ONLY way those candidates get measured at all.
+        shortlist.map((c) => ({
+          url: c.sourceUrl,
+          cookieFile: cookieForPlatform(cfg0, c.platform),
+          directUrl: c.downloadKind === "hls" ? c.downloadUrl : undefined,
+        })),
         findYtDlp(),
       );
       logger.info({ jobId: job.id, shortlist: shortlist.length, probed: probes.size }, "Scout probe pass complete");

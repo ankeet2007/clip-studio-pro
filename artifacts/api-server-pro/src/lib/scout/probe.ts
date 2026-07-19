@@ -114,24 +114,104 @@ export const PROBE_TIMEOUT_MS = 45_000;
 const cache = new Map<string, { at: number; result: ProbeResult }>();
 const CACHE_TTL_MS = 6 * 3600_000;
 
-export async function probeCandidate(url: string, cookieFile?: string, ytDlpPath = "yt-dlp"): Promise<ProbeResult | null> {
+/**
+ * ffprobe a STREAM url (HLS manifest or direct media) without downloading it.
+ *
+ * This exists because yt-dlp's metadata is not enough on the platforms that now matter most:
+ *   • X returns NO fps at all — null at top level AND per-format — so bpp comes out undefined.
+ *   • Reddit cannot be probed by yt-dlp from this IP at all ("unable to access the Reddit API").
+ * ffprobe reads the manifest directly and reports width/height/fps/bitrate. Measured on a real
+ * X clip it returned 60fps where yt-dlp said NA — and assuming 30 there would have DOUBLED the
+ * computed bpp, scoring fan-shot phone footage as premium broadcast.
+ */
+async function ffprobeStream(streamUrl: string): Promise<Partial<ProbeResult> | null> {
+  try {
+    const { stdout } = await execFileAsync("ffprobe", [
+      "-v", "error", "-select_streams", "v:0",
+      "-show_entries", "stream=width,height,avg_frame_rate,bit_rate",
+      "-of", "json", streamUrl,
+    ], { timeout: PROBE_TIMEOUT_MS, maxBuffer: 1024 * 1024 });
+    const st = (JSON.parse(stdout)?.streams ?? [])[0];
+    if (!st) return null;
+    const width = Number(st.width) || undefined;
+    const height = Number(st.height) || undefined;
+    const [fn, fd] = String(st.avg_frame_rate ?? "").split("/").map(Number);
+    const fps = fn && fd ? fn / fd : undefined;
+    const bitrateKbps = Number(st.bit_rate) ? Number(st.bit_rate) / 1000 : undefined;
+    const { bpp, approx } = bitsPerPixel(width, height, fps, bitrateKbps);
+    return { width, height, fps, bitsPerPixel: bpp, bppApprox: bpp == null ? undefined : approx };
+  } catch {
+    return null;
+  }
+}
+
+/** Resolve a page url to its direct media/manifest url (no download). */
+async function resolveStreamUrl(url: string, cookieFile: string | undefined, ytDlpPath: string): Promise<string | null> {
+  try {
+    const args = ["--no-download", "--no-warnings", "-g"];
+    if (cookieFile) args.push("--cookies", cookieFile);
+    args.push(url);
+    const { stdout } = await execFileAsync(ytDlpPath, args, { timeout: PROBE_TIMEOUT_MS, maxBuffer: 1024 * 1024 });
+    const first = stdout.split("\n").map((l) => l.trim()).filter(Boolean)[0];
+    return first && /^https?:\/\//.test(first) ? first : null;
+  } catch {
+    return null;
+  }
+}
+
+export interface ProbeOpts {
+  cookieFile?: string;
+  ytDlpPath?: string;
+  /** A direct media/HLS url the adapter already resolved (Reddit's v.redd.it), which lets us
+   *  skip yt-dlp entirely on platforms where it cannot reach the site's API. */
+  directUrl?: string;
+}
+
+export async function probeCandidate(url: string, optsOrCookie?: ProbeOpts | string, legacyYtDlp = "yt-dlp"): Promise<ProbeResult | null> {
+  const opts: ProbeOpts = typeof optsOrCookie === "string" || optsOrCookie == null
+    ? { cookieFile: optsOrCookie as string | undefined, ytDlpPath: legacyYtDlp }
+    : optsOrCookie;
+  const ytDlpPath = opts.ytDlpPath ?? "yt-dlp";
+
   const hit = cache.get(url);
   if (hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.result;
 
-  const args = ["--no-download", "--no-warnings", "--no-playlist", "--print", PROBE_PRINT_FORMAT];
-  if (cookieFile) args.push("--cookies", cookieFile);
-  args.push(url);
-  try {
-    const { stdout } = await execFileAsync(ytDlpPath, args, { timeout: PROBE_TIMEOUT_MS, maxBuffer: 1024 * 1024 });
-    const result = parseProbeLine(stdout);
-    cache.set(url, { at: Date.now(), result });
+  const finish = (r: ProbeResult): ProbeResult => {
+    cache.set(url, { at: Date.now(), result: r });
     for (const [k, v] of cache) if (Date.now() - v.at > CACHE_TTL_MS) cache.delete(k);
-    return result;
-  } catch {
-    // Timeouts, throttling, geo-blocks, dead links. A failed probe is NOT evidence of low
-    // quality — the caller scores it neutral rather than dropping it.
-    return null;
+    return r;
+  };
+
+  // Fast path when the adapter already has a direct stream url (Reddit).
+  if (opts.directUrl) {
+    const ff = await ffprobeStream(opts.directUrl);
+    if (ff) return finish({ ...ff, uploadedAt: 0 } as ProbeResult);
   }
+
+  let base: ProbeResult | null = null;
+  try {
+    const args = ["--no-download", "--no-warnings", "--no-playlist", "--print", PROBE_PRINT_FORMAT];
+    if (opts.cookieFile) args.push("--cookies", opts.cookieFile);
+    args.push(url);
+    const { stdout } = await execFileAsync(ytDlpPath, args, { timeout: PROBE_TIMEOUT_MS, maxBuffer: 1024 * 1024 });
+    base = parseProbeLine(stdout);
+  } catch {
+    // Timeouts, throttling, geo-blocks, dead links. Not evidence of low quality — fall through
+    // and try to measure the stream itself before giving up.
+    base = null;
+  }
+
+  // yt-dlp gave us a usable measurement (YouTube's normal path).
+  if (base?.bitsPerPixel != null) return finish(base);
+
+  // Otherwise measure the actual stream. This is the X case (no fps) and the Reddit case
+  // (no API access) — i.e. exactly the platforms that are now primary.
+  const stream = await resolveStreamUrl(url, opts.cookieFile, ytDlpPath);
+  if (stream) {
+    const ff = await ffprobeStream(stream);
+    if (ff) return finish({ ...(base ?? { uploadedAt: 0 }), ...ff } as ProbeResult);
+  }
+  return base ? finish(base) : null;
 }
 
 /**
@@ -145,7 +225,7 @@ export async function probeCandidate(url: string, cookieFile?: string, ytDlpPath
  * runs inside the background scout job and never on the request path.
  */
 export async function probeAll(
-  urls: { url: string; cookieFile?: string }[],
+  urls: { url: string; cookieFile?: string; directUrl?: string }[],
   ytDlpPath = "yt-dlp",
   concurrency = 4,
 ): Promise<Map<string, ProbeResult>> {
@@ -154,7 +234,7 @@ export async function probeAll(
   const workers = Array.from({ length: Math.min(concurrency, urls.length) }, async () => {
     while (i < urls.length) {
       const item = urls[i++]!;
-      const r = await probeCandidate(item.url, item.cookieFile, ytDlpPath);
+      const r = await probeCandidate(item.url, { cookieFile: item.cookieFile, ytDlpPath, directUrl: item.directUrl });
       if (r) out.set(item.url, r);
     }
   });

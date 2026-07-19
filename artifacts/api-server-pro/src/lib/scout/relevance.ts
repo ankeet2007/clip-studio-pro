@@ -23,6 +23,14 @@ const STOP = new Set([
   "the", "a", "an", "and", "or", "of", "vs", "v", "in", "on", "at", "to", "for", "with",
   "best", "top", "clip", "clips", "video", "videos", "moment", "moments", "highlight", "highlights",
   "goal", "goals", "full", "hd", "match", "game",
+  // COMPETITION NAMES — measured bug, 2026-07-19. These were counting as identifying entities,
+  // so a search for "Lionel Messi Argentina 2026 World Cup" scored ANY title containing
+  // "World Cup" at 2/6 relevance — comfortably over the floor. A Messi query came back full of
+  // "Top 20 Scott McTominay Goals | World Cup Reds" and Marcus Rashford posts.
+  // A competition name is the LEAST identifying word in a sports search: it is shared by every
+  // candidate. Only players, teams and events distinguish one clip from another.
+  "world", "cup", "worldcup", "fifa", "uefa", "league", "champions", "championship", "final", "finals",
+  "semifinal", "semi", "quarterfinal", "playoff", "playoffs", "tournament", "season", "round",
 ]);
 
 export interface TopicSpec {
