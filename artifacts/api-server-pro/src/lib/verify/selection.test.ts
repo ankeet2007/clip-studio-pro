@@ -97,6 +97,20 @@ test("beatEntities ignores sentence-initial capitals and generic words", () => {
   assert.ok(e.includes("England"));
 });
 
+test("⭐ REGRESSION: possessives and stop-word plurals are NOT treated as entities", () => {
+  // The v5 render was falsely REFUSED because "World Cup's", "World Cups" and "Messi's" each read
+  // as an uncovered entity ("Cup's" / "Cups" / "Messi's"). A possessive must judge on the bare
+  // noun, and a capitalised plural of a stop word must not resurrect it as a name.
+  const e = beatEntities("Mbappe is the top scorer in World Cup's history. Messi needed six World Cups, to Messi's twenty-one.");
+  assert.ok(!e.includes("Cup's") && !e.includes("Cups"), `"Cup" plurals/possessives must not be entities, got ${e}`);
+  assert.ok(!e.includes("Messi's"), `possessive "Messi's" must reduce to "Messi", got ${e}`);
+  assert.ok(e.includes("Mbappe") && e.includes("Messi"), `real names must survive, got ${e}`);
+  // And coverage must PASS when the footage shows those names.
+  const beats: BeatNeed[] = [{ id: 1, narration: "Mbappe overtook Messi's record at the World Cup.", entities: beatEntities("Mbappe overtook Messi's record at the World Cup.") }];
+  const clips: ClipFact[] = [{ id: "a", depicts: "Kylian Mbappe celebrating" }, { id: "b", depicts: "Lionel Messi on the pitch" }];
+  assert.deepEqual(checkCoverage(beats, clips), [], "possessive Messi's must be covered by a Messi clip");
+});
+
 test("⭐ REGRESSION: v3's Messi beats must be reported as gaps", () => {
   // The exact situation that shipped: three beats naming Messi, and a clip pool with none of him.
   const beats: BeatNeed[] = [

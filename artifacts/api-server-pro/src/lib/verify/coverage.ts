@@ -59,7 +59,11 @@ export function beatEntities(narration: string): string[] {
   const words = (narration ?? "").split(/\s+/);
   const out: string[] = [];
   words.forEach((raw, i) => {
-    const w = raw.replace(/[^\p{L}\p{M}'-]/gu, "");
+    let w = raw.replace(/[^\p{L}\p{M}'-]/gu, "");
+    // Strip a trailing possessive so "Cup's"/"Messi's"/"Mbappe's" are judged on the bare noun.
+    // Without this the possessive form never matched a clip description and every "...'s" read as
+    // an uncovered entity — a false REFUSAL that blocked a perfectly-covered render.
+    w = w.replace(/['’]s$/u, "");
     if (w.length < 3) return;
     if (!/^\p{Lu}/u.test(w)) return;             // must be capitalised
     // NOTE: we deliberately do NOT skip sentence-initial words. The first draft did, reasoning
@@ -67,7 +71,10 @@ export function beatEntities(narration: string): string[] {
     // matters ("Messi is sitting one goal behind him."), and that skip silently discarded the
     // exact entities this gate exists to protect. Common sentence-openers are handled by
     // NOT_ENTITIES instead, which is the check that actually distinguishes "But" from "Messi".
-    if (NOT_ENTITIES.has(fold(w))) return;
+    // Plurals of stop words ("Cups", "goals") are stopped by also testing the singular, so a
+    // capitalised "World Cups" does not read as the entity "Cups".
+    const f = fold(w);
+    if (NOT_ENTITIES.has(f) || NOT_ENTITIES.has(f.replace(/s$/, ""))) return;
     out.push(w);
   });
   return Array.from(new Set(out));
