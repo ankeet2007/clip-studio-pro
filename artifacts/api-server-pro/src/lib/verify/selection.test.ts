@@ -49,6 +49,25 @@ test("same source is allowed when far apart AND visually different", () => {
   assert.deepEqual(checkDistinct(ok), []);
 });
 
+test("⭐ REGRESSION: a FILLER reused across two beats is rejected (the v4 t=54 bug)", () => {
+  // v4's worst repeat was one filler asset reused across beats — the cut engine's fillers are
+  // separate files, so a gate that only compared beat BASES sailed past it. The gate builds a
+  // WindowRef per filler too (id `beatN.fillerK`), so the same file in two beats is same-source,
+  // 0s apart → rejected. Different HASHES on purpose: this must fail on FILE identity, not luck.
+  const FILL = "reaction_fancam.mp4";
+  const windows: WindowRef[] = [
+    win("beat1", "beat1_base.mp4", 0, 8, [H64(2)]),
+    win("beat1.filler1", FILL, 0, 3, [H64(7)]),
+    win("beat3", "beat3_base.mp4", 0, 8, [H64(4)]),
+    win("beat3.filler1", FILL, 0, 3, [H64(9)]),   // SAME file as beat1's filler
+  ];
+  const v = checkDistinct(windows);
+  assert.ok(
+    v.some((x) => x.a === "beat1.filler1" && x.b === "beat3.filler1"),
+    `the reused filler pair must be flagged, got ${JSON.stringify(v)}`,
+  );
+});
+
 test("different files that LOOK the same are still rejected", () => {
   // Two different downloads of the same broadcast moment — distinct files, identical footage.
   const dup = [win(1, "a.mp4", 0, 10, [H64(5)]), win(2, "b.mp4", 0, 10, [H64(5)])];
@@ -110,4 +129,23 @@ test("surname-only verifier output still counts as coverage", () => {
   const clips: ClipFact[] = [{ id: "m", depicts: "Mbappe celebrating a goal" }];
   const gaps = checkCoverage(beats, clips);
   assert.ok(!gaps.some((g) => g.missing.includes("Mbappe")), "surname match must count");
+});
+
+test("⭐ REGRESSION: a caption naming a player the footage never shows is a gap (the v4 t=26 bug)", () => {
+  // v4 played a filler of Mbappe on the bench under a caption that said "Bukayo" — the caption named
+  // a player no clip in the pool depicted. The coverage gate must flag exactly that.
+  const beats: BeatNeed[] = [
+    { id: "beat3", narration: "Bukayo Saka answered straight back for England.", entities: [] },
+  ].map((b) => ({ ...b, entities: beatEntities(b.narration) }));
+  const clips: ClipFact[] = [
+    { id: "beat1", depicts: "Mbappe scoring for France" },
+    { id: "beat2", depicts: "Mbappe on the bench watching" },
+    { id: "beat3", depicts: "Mbappe celebrating with teammates" },
+  ];
+  const gaps = checkCoverage(beats, clips);
+  assert.equal(gaps.length, 1, `the Bukayo/Saka beat must be flagged, got ${JSON.stringify(gaps)}`);
+  assert.ok(
+    gaps[0]!.missing.includes("Bukayo") || gaps[0]!.missing.includes("Saka"),
+    `must name the missing player, got ${gaps[0]!.missing}`,
+  );
 });

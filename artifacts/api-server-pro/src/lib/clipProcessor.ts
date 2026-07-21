@@ -11,6 +11,7 @@ import { logger } from "./logger";
 import { parseWhisperWords, planFillerCuts, findWordTime, type Word } from "./cutEngine";
 import { applyPronunciation } from "./pronunciation";
 import { probeFootage, judgeFootage } from "./footageQuality";
+import { enforceMatchStoryGates } from "./verify/gate";
 
 const execFileAsync = promisify(execFile);
 
@@ -2329,6 +2330,11 @@ export interface StorySegment {
   fillerAssets?: string[];                          // uploads paths to rapid-cut TO between spoken words
   punchline?: { word: string; asset: string };      // asset lands on `word` (spoken in this beat), 150ms early
   holdMs?: number;                                   // readable content: suppress filler cuts for this long
+
+  // What a verifier said this beat's footage actually shows. Carried through the cloud bundle (the
+  // `...s` spread in the offload builder) so the coverage gate stays HARD on a render box that has
+  // no vision key — see lib/verify/gate.ts. Optional; the gate falls back to the vision verifier.
+  depicts?: string;
 }
 
 // Pro-only: one ranked moment of a TOP 5 countdown (jobType "top5"). Superset of
@@ -3114,6 +3120,17 @@ export async function processMatchStory(
       + `To override for a topic that genuinely has no sharp footage, set MIN_BEAT_SHORT_SIDE / MIN_BEAT_BITS_PER_PIXEL (0 disables).`
     );
   }
+
+  // SELECTION GATES — repetition (distinctness) + script coverage, enforced HERE at the renderer
+  // for the SAME reason the sharpness gate is: this is the one chokepoint every path shares (app
+  // route, connector, and the hand-built cloud bundle that actually shipped v4). The checks existed
+  // as tested library code with ZERO callers, so v2/v3/v4 all shipped visible repetition and a
+  // caption/footage mismatch — this call is the missing wiring. Distinctness is pure-local and
+  // ALWAYS hard; coverage is hard when clip descriptions exist (bundle `depicts` or a vision key)
+  // and a loud warning otherwise. Runs BEFORE the cloud offload so a violation fails in seconds and
+  // names every offending beat/filler, and runs again on the render box (bundle localizes every
+  // file) so even a pure-URL story is covered. SKIP_SELECTION_GATES=1 disables for a genuine edge.
+  await enforceMatchStoryGates(segs, { geminiKey: process.env.GEMINI_API_KEY });
 
   // Cloud offload: bundle every beat (local scout clips are copied as-is; YouTube beats are
   // downloaded on the home IP) and render the whole Match Story on the cloud. Falls through

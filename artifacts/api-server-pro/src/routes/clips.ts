@@ -197,6 +197,10 @@ function sanitizeCutFields(seg: Record<string, unknown>, uploadsDir: string): Pa
   }
   const h = Number(seg.holdMs);
   if (Number.isFinite(h) && h > 0) out.holdMs = Math.min(10000, h);
+  // Verifier description for the coverage gate — carried through so a keyless render box still
+  // enforces coverage (see lib/verify/gate.ts). Plain text, no path, so no confinement needed.
+  const dep = String(seg.depicts ?? "").trim();
+  if (dep) out.depicts = dep.slice(0, 300);
   return out;
 }
 
