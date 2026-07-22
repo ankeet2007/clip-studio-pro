@@ -245,6 +245,62 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // POST /worker/ffmpeg-job -> body = a tar bundle { job.json + every input asset }. Runs an
+  // ARBITRARY ffmpeg command (job.args, cwd = the extracted bundle) so CUSTOM montages — mixed
+  // video + image stills + edge-tts narration, i.e. anything the Match Story ENGINE can't express —
+  // render on Colab instead of the weak phone/tablet. Async: returns { jobId } immediately; poll
+  // /worker/job/<id> then GET .../result (the shared handlers above). job.json = { args:[..ffmpeg
+  // args, paths RELATIVE to the bundle..], output:"out.mp4" }.
+  if (req.method === "POST" && url === "/worker/ffmpeg-job") {
+    if (!SECRET || req.headers["x-worker-secret"] !== SECRET) {
+      res.writeHead(401, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "unauthorized" })); req.resume(); return;
+    }
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "ffjob_"));
+    const tarPath = path.join(workDir, "bundle.tar");
+    const ws = fs.createWriteStream(tarPath);
+    req.pipe(ws);
+    ws.on("error", () => { try { res.writeHead(500); res.end("upload error"); } catch { /* */ } });
+    ws.on("finish", async () => {
+      const extractDir = path.join(workDir, "x");
+      try {
+        fs.mkdirSync(extractDir, { recursive: true });
+        await extractTar(tarPath, extractDir);
+        const job = JSON.parse(fs.readFileSync(path.join(extractDir, "job.json"), "utf8"));
+        const args = (Array.isArray(job.args) ? job.args : []).map(String);
+        const outName = String(job.output || "out.mp4");
+        if (!args.length) throw new Error("job.args (ffmpeg arguments) required");
+        const jobId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+        jobs.set(jobId, { status: "rendering", mode: "ffmpeg" });
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ jobId }));
+        const started = Date.now();
+        execFile("ffmpeg", args, { cwd: extractDir, timeout: 20 * 60 * 1000, maxBuffer: 16 * 1024 * 1024 }, (err) => {
+          const rec = jobs.get(jobId);
+          if (!rec) { try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { /* */ } return; }
+          const produced = path.join(extractDir, outName);
+          if (!err && fs.existsSync(produced)) {
+            const finalOut = path.join(getOutputDir(), `ff_${jobId}.mp4`);
+            try {
+              fs.copyFileSync(produced, finalOut);
+              rec.status = "done"; rec.outPath = finalOut; rec.seconds = (Date.now() - started) / 1000;
+              console.log(`[worker] ffmpeg ${jobId} done in ${rec.seconds.toFixed(1)}s`);
+            } catch (e: any) { rec.status = "error"; rec.error = String(e?.message || e); }
+          } else {
+            rec.status = "error"; rec.error = String(err?.message || err || "ffmpeg produced no output");
+            console.error(`[worker] ffmpeg ${jobId} failed:`, err?.message || err);
+          }
+          try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { /* */ }
+        });
+      } catch (e: any) {
+        console.error("[worker] ffmpeg-job submit failed:", e?.message || e);
+        try { res.writeHead(500, { "content-type": "application/json" }); res.end(JSON.stringify({ error: String(e?.message || e) })); } catch { /* */ }
+        try { fs.rmSync(workDir, { recursive: true, force: true }); } catch { /* */ }
+      }
+    });
+    return;
+  }
+
   // POST /worker/transcribe-job -> body = raw 16kHz-mono WAV ; returns { jobId } immediately and runs
   // whisper medium.en in the BACKGROUND (far sharper than the phone's tiny.en). ASYNC on purpose: a
   // full minute of audio on medium.en can take minutes, which would blow a proxy's ~100s response
