@@ -4,6 +4,7 @@
 import { Router, type IRouter } from "express";
 import fs from "fs";
 import { startScout, getScoutJob, setCandidateStatus, buildBeatsFromJob, buildBeatsFromUrls, listAdapters } from "../lib/scout";
+import { fetchTrending } from "../lib/scout/trending";
 import type { Platform, ScoutJob, ScoutOptions } from "../lib/scout/types";
 import { logger } from "../lib/logger";
 
@@ -70,6 +71,17 @@ router.post("/scout", (req, res): void => {
 // GET /scout/adapters — which platforms are usable right now.
 router.get("/scout/adapters", (_req, res): void => {
   res.json({ adapters: listAdapters() });
+});
+
+// GET /scout/trending — "what's going on right now" from PUBLIC trend sources (Google Trends +
+// trends24.in), NOT the operator's logged-in X account (which would risk a ban). Returns
+// { google, x, all } topic lists; pick any and run a normal /scout on it to find clips.
+router.get("/scout/trending", async (_req, res): Promise<void> => {
+  try {
+    res.json(await fetchTrending());
+  } catch {
+    res.status(500).json({ error: "Couldn't fetch trends right now — try again in a moment." });
+  }
 });
 
 // GET /scout/:id — poll a scout job.
