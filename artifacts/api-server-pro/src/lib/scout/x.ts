@@ -152,7 +152,9 @@ function parseTimelineReposts(json: string): RepostItem[] {
     if (!Array.isArray(e) || e.length < 3 || e[0] !== 3) continue;
     const mediaUrl = String(e[1] ?? "");
     const isVideo = mediaUrl.includes("video.twimg.com");
-    const isImage = mediaUrl.includes("pbs.twimg.com/media");
+    // `pbs.twimg.com/media` = a native photo; `/card_img` = an article/link-card preview image
+    // (only surfaced when gallery-dl runs with cards=true — see fetchUserReposts).
+    const isImage = mediaUrl.includes("pbs.twimg.com/media") || mediaUrl.includes("pbs.twimg.com/card_img");
     if (!isVideo && !isImage) continue;
     const m = (e[2] ?? {}) as Record<string, any>;
     const tweetId = String(m.tweet_id ?? m.retweet_id ?? "");
@@ -186,7 +188,10 @@ export async function fetchUserReposts(handle: string, limit = 60): Promise<Repo
   if (!cookie || !h || !/^[A-Za-z0-9_]{1,15}$/.test(h)) return [];
   const gdl = findGalleryDl();
   const json = await new Promise<string>((resolve) => {
-    execFile(gdl, ["--cookies", cookie, "-o", "retweets=true", "-j", "--range", `1-${limit}`, `https://x.com/${h}/with_replies`],
+    // cards=true → also grab article / link-CARD reposts (their preview image lives in the tweet
+    // card, not as native media, so they're invisible without this). This is why plain gallery-dl
+    // "couldn't" see the Kimi/marketwatch reposts.
+    execFile(gdl, ["--cookies", cookie, "-o", "retweets=true", "-o", "cards=true", "-j", "--range", `1-${limit}`, `https://x.com/${h}/with_replies`],
       { timeout: 90_000, maxBuffer: 48 * 1024 * 1024 }, (_err, stdout) => resolve(stdout || "[]"));
   });
   const items = parseTimelineReposts(json);
