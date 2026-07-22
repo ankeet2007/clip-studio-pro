@@ -59,6 +59,26 @@ async function enrichThumbnails(cands: RawCandidate[]): Promise<void> {
   }
 }
 
+// X's native-video search is SPARSE. A long AND-query ("argentina spain world cup final brawl
+// fight") matches ZERO videos on X, while the same story as a short human-style query
+// ("argentina brawl") returns 6-8. Reddit tolerates long queries; X does not — so search X the
+// way a person actually types: keep only the ~3 most salient terms (drop stopwords / short words
+// / bare numbers). Measured 2026-07-22: long scout query → 0 hits; every 2-3 word query → 6-8.
+const X_STOP = new Set([
+  "the","a","an","and","or","of","in","on","at","to","for","with","after","before","as","is","are",
+  "was","were","by","from","this","that","new","latest","live","today","video","footage","clip",
+  "clips","news","update","breaking","vs","amid","over","into","out",
+]);
+function shortenForX(topic: string): string {
+  const terms = topic.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").split(/\s+/)
+    .filter((w) => w.length > 2 && !X_STOP.has(w) && !/^\d+$/.test(w));
+  // Dedup preserving order, keep the first 3 — X's sweet spot is 2-3 words.
+  const seen = new Set<string>();
+  const kept: string[] = [];
+  for (const w of terms) { if (!seen.has(w)) { seen.add(w); kept.push(w); } if (kept.length >= 3) break; }
+  return kept.join(" ") || topic.trim();
+}
+
 export const xAdapter: ScoutAdapter = {
   platform: "x" as Platform,
   isConfigured() {
@@ -67,56 +87,72 @@ export const xAdapter: ScoutAdapter = {
   async search(topic: string, opts: ScoutOptions): Promise<RawCandidate[]> {
     const cookie = cookieFileFor("x");
     if (!cookie) return [];
-    const limit = Math.min(100, opts.maxPerPlatform ?? 100);
-    const q = encodeURIComponent(`${topic} filter:native_video`);
-    // f=live = "Latest" (freshest-first) for a day-of montage; f=top = most-engaged otherwise.
-    const feed = opts.maxAgeHours ? "live" : "top";
-    const url = `https://x.com/search?q=${q}&f=${feed}`;
+    const limit = Math.min(100, opts.maxPerPlatform ?? 100); // per feed; gallery-dl paginates to reach it
+    const q = encodeURIComponent(`${shortenForX(topic)} filter:native_video`);
     const gdl = findGalleryDl();
 
-    const json = await new Promise<string>((resolve) => {
-      execFile(gdl, ["--cookies", cookie, "-j", "--range", `1-${limit}`, url], { timeout: 90_000, maxBuffer: 32 * 1024 * 1024 }, (_err, stdout) => {
-        resolve(stdout || "[]"); // stderr carries only "media unavailable" warnings — ignore
-      });
-    });
-
-    // Tweet IDs are 19-digit ints that exceed JS's safe-integer range; JSON.parse rounds them
-    // and the resulting /status/<id> URL 404s. Quote those big ints so they survive as strings.
-    const safe = json.replace(/"(tweet_id|retweet_id|conversation_id|quote_id)":\s*(\d{16,})/g, '"$1":"$2"');
-    let entries: unknown[] = [];
-    try { entries = JSON.parse(safe); } catch { entries = []; }
-
-    const out: RawCandidate[] = [];
-    const seen = new Set<string>();
-    for (const e of entries) {
-      if (!Array.isArray(e) || e.length < 3 || e[0] !== 3) continue;
-      const mediaUrl = String(e[1] ?? "");
-      if (!mediaUrl.includes("video.twimg.com")) continue;
-      const m = (e[2] ?? {}) as Record<string, any>;
-      const tweetId = String(m.tweet_id ?? m.retweet_id ?? "");
-      if (!tweetId || seen.has(tweetId)) continue;
-      seen.add(tweetId);
-      const fav = Number(m.favorite_count ?? 0);
-      const rt = Number(m.retweet_count ?? 0);
-      const views = Number(m.view_count ?? 0);
-      const author = m.author?.name ? `@${m.author.name}` : "x";
-      const avatar = typeof m.author?.profile_image === "string" ? m.author.profile_image : undefined;
-      out.push({
-        platform: "x",
-        sourceUrl: `https://x.com/i/status/${tweetId}`,
-        title: String(m.content ?? "").replace(/\s+/g, " ").slice(0, 300),
-        author,
-        // Blend likes/retweets/views into one raw signal; the ranker percentile-normalizes it.
-        engagement: fav * 3 + rt * 5 + Math.round(views / 20),
-        createdAt: m.date ? Math.floor(Date.parse(String(m.date).replace(" ", "T") + "Z") / 1000) || 0 : 0,
-        durationSec: typeof m.duration === "number" ? m.duration : undefined,
-        thumbnail: avatar, // baseline; upgraded to the real video poster below
-        downloadUrl: mediaUrl,
-        downloadKind: "hls", // direct video.twimg.com URL → ffmpeg stream-copy
-      });
+    // Browse X the way a human does: check BOTH "Top" (f=top, most-engaged) AND "Latest"
+    // (f=live, freshest) and merge — roughly doubles recall vs a single feed, deduped by tweet
+    // id across feeds. (A person flips both tabs; the scout should too.)
+    const feeds = opts.maxAgeHours ? ["live", "top"] : ["top", "live"];
+    const byId = new Map<string, RawCandidate>();
+    for (const feed of feeds) {
+      const url = `https://x.com/search?q=${q}&f=${feed}`;
+      const json = await runGalleryDl(gdl, cookie, url, limit);
+      for (const c of parseXEntries(json)) {
+        const id = c.sourceUrl.split("/status/")[1] ?? c.sourceUrl;
+        if (!byId.has(id)) byId.set(id, c);
+      }
     }
+    const out = [...byId.values()];
     await enrichThumbnails(out);
-    logger.info({ platform: "x", hits: out.length, withPoster: out.filter((c) => c.thumbnail?.includes("video_thumb")).length }, "X search complete");
+    logger.info({ platform: "x", query: shortenForX(topic), feeds: feeds.length, hits: out.length, withPoster: out.filter((c) => c.thumbnail?.includes("video_thumb")).length }, "X search complete");
     return out;
   },
 };
+
+function runGalleryDl(gdl: string, cookie: string, url: string, limit: number): Promise<string> {
+  return new Promise<string>((resolve) => {
+    execFile(gdl, ["--cookies", cookie, "-j", "--range", `1-${limit}`, url], { timeout: 90_000, maxBuffer: 48 * 1024 * 1024 }, (_err, stdout) => {
+      resolve(stdout || "[]"); // stderr carries only "media unavailable" warnings — ignore
+    });
+  });
+}
+
+function parseXEntries(json: string): RawCandidate[] {
+  // Tweet IDs are 19-digit ints that exceed JS's safe-integer range; JSON.parse rounds them
+  // and the resulting /status/<id> URL 404s. Quote those big ints so they survive as strings.
+  const safe = json.replace(/"(tweet_id|retweet_id|conversation_id|quote_id)":\s*(\d{16,})/g, '"$1":"$2"');
+  let entries: unknown[] = [];
+  try { entries = JSON.parse(safe); } catch { entries = []; }
+  const out: RawCandidate[] = [];
+  const seen = new Set<string>();
+  for (const e of entries) {
+    if (!Array.isArray(e) || e.length < 3 || e[0] !== 3) continue;
+    const mediaUrl = String(e[1] ?? "");
+    if (!mediaUrl.includes("video.twimg.com")) continue;
+    const m = (e[2] ?? {}) as Record<string, any>;
+    const tweetId = String(m.tweet_id ?? m.retweet_id ?? "");
+    if (!tweetId || seen.has(tweetId)) continue;
+    seen.add(tweetId);
+    const fav = Number(m.favorite_count ?? 0);
+    const rt = Number(m.retweet_count ?? 0);
+    const views = Number(m.view_count ?? 0);
+    const author = m.author?.name ? `@${m.author.name}` : "x";
+    const avatar = typeof m.author?.profile_image === "string" ? m.author.profile_image : undefined;
+    out.push({
+      platform: "x",
+      sourceUrl: `https://x.com/i/status/${tweetId}`,
+      title: String(m.content ?? "").replace(/\s+/g, " ").slice(0, 300),
+      author,
+      // Blend likes/retweets/views into one raw signal; the ranker percentile-normalizes it.
+      engagement: fav * 3 + rt * 5 + Math.round(views / 20),
+      createdAt: m.date ? Math.floor(Date.parse(String(m.date).replace(" ", "T") + "Z") / 1000) || 0 : 0,
+      durationSec: typeof m.duration === "number" ? m.duration : undefined,
+      thumbnail: avatar, // baseline; upgraded to the real video poster in enrichThumbnails
+      downloadUrl: mediaUrl,
+      downloadKind: "hls", // direct video.twimg.com URL → ffmpeg stream-copy
+    });
+  }
+  return out;
+}
