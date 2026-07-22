@@ -93,13 +93,16 @@ router.get("/scout/my-reposts", async (req, res): Promise<void> => {
   const handle = String((req.query.handle as string) ?? "").trim();
   if (!handle) { res.status(400).json({ error: "Pass ?handle=<your X handle>." }); return; }
   try {
-    const clips = await fetchUserReposts(handle);
+    const items = await fetchUserReposts(handle);
     res.json({
       handle: handle.replace(/^@/, ""),
-      count: clips.length,
-      clips: clips.map((c) => ({
-        platform: c.platform, sourceUrl: c.sourceUrl, title: c.title, author: c.author,
-        durationSec: c.durationSec ?? null, engagement: c.engagement, thumbUrl: c.thumbnail ?? null,
+      count: items.length,
+      videos: items.filter((i) => i.kind === "video").length,
+      images: items.filter((i) => i.kind === "image").length,
+      reposts: items.map((i) => ({
+        kind: i.kind, sourceUrl: i.sourceUrl, text: i.text, author: i.author,
+        mediaUrl: i.mediaUrl, thumbUrl: i.thumbnail ?? null,
+        durationSec: i.durationSec ?? null, engagement: i.engagement,
       })),
     });
   } catch {

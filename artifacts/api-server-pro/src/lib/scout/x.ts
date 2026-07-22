@@ -126,21 +126,72 @@ function runGalleryDl(gdl: string, cookie: string, url: string, limit: number): 
  * gallery-dl is low-volume and safe — nothing like the mass/private-API harvest we refused. Pass
  * the user's own handle (from ?handle= or a stored setting).
  */
-export async function fetchUserReposts(handle: string, limit = 60): Promise<RawCandidate[]> {
+export interface RepostItem {
+  kind: "video" | "image";  // VIDEO reposts = footage; IMAGE reposts = a still / article visual
+  sourceUrl: string;         // x.com/i/status/<id>
+  text: string;              // the tweet "message" — render as a card via scripts/render_tweet_card.py
+  author: string;
+  mediaUrl: string;          // video.twimg (download as clip) or pbs.twimg image
+  thumbnail?: string;
+  engagement: number;
+  createdAt: number;
+  durationSec?: number;
+}
+
+// Parse the operator's timeline into reposts of ANY usable kind — VIDEO (footage), IMAGE (still /
+// article visual) — each carrying the tweet TEXT (the "message"). One item per tweet (video wins
+// if a tweet has both). NOTE: gallery-dl only sees NATIVE media (video.twimg / pbs.twimg); pure
+// link/article CARDS (e.g. an "X Article" or a marketwatch link preview) are NOT native media, so
+// they don't appear here — grabbing those needs the private timeline API (the account-ban path).
+function parseTimelineReposts(json: string): RepostItem[] {
+  const safe = json.replace(/"(tweet_id|retweet_id|conversation_id|quote_id)":\s*(\d{16,})/g, '"$1":"$2"');
+  let entries: unknown[] = [];
+  try { entries = JSON.parse(safe); } catch { entries = []; }
+  const byId = new Map<string, RepostItem>();
+  for (const e of entries) {
+    if (!Array.isArray(e) || e.length < 3 || e[0] !== 3) continue;
+    const mediaUrl = String(e[1] ?? "");
+    const isVideo = mediaUrl.includes("video.twimg.com");
+    const isImage = mediaUrl.includes("pbs.twimg.com/media");
+    if (!isVideo && !isImage) continue;
+    const m = (e[2] ?? {}) as Record<string, any>;
+    const tweetId = String(m.tweet_id ?? m.retweet_id ?? "");
+    if (!tweetId) continue;
+    const item: RepostItem = {
+      kind: isVideo ? "video" : "image",
+      sourceUrl: `https://x.com/i/status/${tweetId}`,
+      text: String(m.content ?? "").replace(/\s+/g, " ").trim().slice(0, 500),
+      author: m.author?.name ? `@${m.author.name}` : "x",
+      mediaUrl,
+      thumbnail: (m.video && m.video.poster) || (isImage ? mediaUrl : (typeof m.author?.profile_image === "string" ? m.author.profile_image : undefined)),
+      engagement: Number(m.favorite_count ?? 0) * 3 + Number(m.retweet_count ?? 0) * 5 + Math.round(Number(m.view_count ?? 0) / 20),
+      createdAt: m.date ? Math.floor(Date.parse(String(m.date).replace(" ", "T") + "Z") / 1000) || 0 : 0,
+      durationSec: typeof m.duration === "number" ? m.duration : undefined,
+    };
+    const prev = byId.get(tweetId);
+    if (!prev || (prev.kind === "image" && item.kind === "video")) byId.set(tweetId, item);
+  }
+  return [...byId.values()].sort((a, b) => b.createdAt - a.createdAt);
+}
+
+/**
+ * The operator's OWN reposts (video + image + text), newest first. `/with_replies` captures more
+ * of the timeline than `/timeline` (which under `-j` often returns only the latest). Video reposts
+ * are footage; image reposts are stills; every item carries the tweet text so it can be rendered
+ * as a "message" card. Safe — reads ONE public profile (theirs).
+ */
+export async function fetchUserReposts(handle: string, limit = 60): Promise<RepostItem[]> {
   const cookie = cookieFileFor("x");
   const h = (handle || "").replace(/^@/, "").trim();
   if (!cookie || !h || !/^[A-Za-z0-9_]{1,15}$/.test(h)) return [];
   const gdl = findGalleryDl();
-  // Hit the `/timeline` extractor DIRECTLY — the bare `x.com/<user>` extractor only emits a queue
-  // marker under `-j` (never expands to tweets). `-o retweets=true` includes reposts (default omits).
   const json = await new Promise<string>((resolve) => {
-    execFile(gdl, ["--cookies", cookie, "-o", "retweets=true", "-j", "--range", `1-${limit}`, `https://x.com/${h}/timeline`],
+    execFile(gdl, ["--cookies", cookie, "-o", "retweets=true", "-j", "--range", `1-${limit}`, `https://x.com/${h}/with_replies`],
       { timeout: 90_000, maxBuffer: 48 * 1024 * 1024 }, (_err, stdout) => resolve(stdout || "[]"));
   });
-  const out = parseXEntries(json);
-  await enrichThumbnails(out);
-  logger.info({ platform: "x", handle: h, reposts: out.length }, "Fetched operator reposts (curated pool)");
-  return out;
+  const items = parseTimelineReposts(json);
+  logger.info({ platform: "x", handle: h, video: items.filter((i) => i.kind === "video").length, image: items.filter((i) => i.kind === "image").length }, "Fetched operator reposts (video+image+text)");
+  return items;
 }
 
 function parseXEntries(json: string): RawCandidate[] {
