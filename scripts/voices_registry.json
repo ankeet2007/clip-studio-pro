@@ -1,0 +1,20 @@
+{
+  "newsclub_default": { "engine": "edge", "voice": "en-IN-NeerjaNeural", "speed": 1.2 },
+  "engines": {
+    "edge": {
+      "helper": "scripts/generate_voiceover_edge.sh",
+      "speed_control": "multiplier 1.0=normal, 1.2=20% faster (maps to edge-tts --rate); clamp [0.5,2.0]",
+      "requires": "internet",
+      "voices": [
+        { "id": "en-IN-NeerjaNeural", "gender": "female", "accent": "Indian English", "note": "NewsClub default; native Indian name pronunciation" },
+        { "id": "en-IN-PrabhatNeural", "gender": "male", "accent": "Indian English" },
+        { "id": "en-IN-NeerjaExpressiveNeural", "gender": "female", "accent": "Indian English", "note": "expressive" }
+      ]
+    },
+    "piper": {
+      "helper": "scripts/generate_voiceover.sh",
+      "speed_control": "length_scale (1.0 normal; >1 slower). Offline. Anglicizes Indian names.",
+      "voices": ["en_GB-alan-medium","en_US-norman-medium","en_US-ryan-medium","en_US-joe-medium","en_US-hfc_male-medium","en_GB-northern_english_male-medium","en_US-lessac-medium"]
+    }
+  }
+}

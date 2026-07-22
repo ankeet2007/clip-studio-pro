@@ -102,8 +102,17 @@ export function scoreOne(
   probe?: ProbeResult,
 ): { total: number; parts: { relevance: number; sharpness: number; reputation: number; recency: number; engagement: number }; reasons: string[]; drop?: string } {
   const rel = scoreRelevance(c.title, spec);
-  if (rel.hardDrop) return { total: 0, parts: { relevance: 0, sharpness: 0, reputation: 0, recency: 0, engagement: 0 }, reasons: [], drop: rel.reason };
-  if (rel.score < RELEVANCE_FLOOR) return { total: 0, parts: { relevance: rel.score, sharpness: 0, reputation: 0, recency: 0, engagement: 0 }, reasons: [], drop: "off-topic" };
+  // X/Twitter video tweets carry little or no descriptive text, so the title-based relevance
+  // gate drops almost every one as "off-topic" before the user ever sees it. Per operator
+  // request, DISABLE the relevance ranking for X ONLY: keep every X clip (still subject to the
+  // uploader + sharpness gates below) and give it a neutral relevance so it ranks on
+  // sharpness/recency/engagement instead. All other platforms are unchanged.
+  const relaxRelevanceForX = c.platform === "x";
+  if (!relaxRelevanceForX) {
+    if (rel.hardDrop) return { total: 0, parts: { relevance: 0, sharpness: 0, reputation: 0, recency: 0, engagement: 0 }, reasons: [], drop: rel.reason };
+    if (rel.score < RELEVANCE_FLOOR) return { total: 0, parts: { relevance: rel.score, sharpness: 0, reputation: 0, recency: 0, engagement: 0 }, reasons: [], drop: "off-topic" };
+  }
+  const relScore = relaxRelevanceForX ? Math.max(rel.score, 0.5) : rel.score;
 
   const tier = classifyUploader(probe?.uploader ?? c.author, c.platform);
   if (tier === "deny") return { total: 0, parts: { relevance: rel.score, sharpness: 0, reputation: 0, recency: 0, engagement: 0 }, reasons: [], drop: "denylisted uploader" };
@@ -122,7 +131,7 @@ export function scoreOne(
   // "reputation" quietly mean only one of the two.
   const risk = claimRisk(probe?.uploader ?? c.author, c.title, probe?.width, probe?.height);
   const parts = {
-    relevance: rel.score,
+    relevance: relScore,
     sharpness: sharpnessScore(probe?.bitsPerPixel, shortSide),
     reputation: sourceScore(tier, risk, PREFER_CLAIM_SAFE),
     recency: recencyScore(probe?.uploadedAt || c.createdAt),
