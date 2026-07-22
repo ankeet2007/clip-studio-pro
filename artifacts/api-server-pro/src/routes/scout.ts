@@ -5,6 +5,7 @@ import { Router, type IRouter } from "express";
 import fs from "fs";
 import { startScout, getScoutJob, setCandidateStatus, buildBeatsFromJob, buildBeatsFromUrls, listAdapters } from "../lib/scout";
 import { fetchTrending } from "../lib/scout/trending";
+import { fetchUserReposts } from "../lib/scout/x";
 import type { Platform, ScoutJob, ScoutOptions } from "../lib/scout/types";
 import { logger } from "../lib/logger";
 
@@ -81,6 +82,28 @@ router.get("/scout/trending", async (_req, res): Promise<void> => {
     res.json(await fetchTrending());
   } catch {
     res.status(500).json({ error: "Couldn't fetch trends right now — try again in a moment." });
+  }
+});
+
+// GET /scout/my-reposts?handle=<yourHandle> — the OPERATOR'S OWN reposts + video posts as a
+// curated clip pool. Safe: reads ONE public profile (theirs). Use when the scout can't find a
+// better clip — the user reposts the good one, then picks it from here. Downloadable via the same
+// /scout/fetch-urls path (each clip carries its x.com/i/status/<id> URL).
+router.get("/scout/my-reposts", async (req, res): Promise<void> => {
+  const handle = String((req.query.handle as string) ?? "").trim();
+  if (!handle) { res.status(400).json({ error: "Pass ?handle=<your X handle>." }); return; }
+  try {
+    const clips = await fetchUserReposts(handle);
+    res.json({
+      handle: handle.replace(/^@/, ""),
+      count: clips.length,
+      clips: clips.map((c) => ({
+        platform: c.platform, sourceUrl: c.sourceUrl, title: c.title, author: c.author,
+        durationSec: c.durationSec ?? null, engagement: c.engagement, thumbUrl: c.thumbnail ?? null,
+      })),
+    });
+  } catch {
+    res.status(500).json({ error: "Couldn't fetch your reposts — check the handle and the X cookie." });
   }
 });
 

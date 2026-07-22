@@ -119,6 +119,30 @@ function runGalleryDl(gdl: string, cookie: string, url: string, limit: number): 
   });
 }
 
+/**
+ * The OPERATOR'S OWN reposts (retweets) + video posts, as a CURATED clip pool. Workflow: when the
+ * scout can't find a good clip for a story, the user hand-searches X, reposts the best clip on
+ * their account, and the scout picks it from here. Reading ONE public profile (the user's own) via
+ * gallery-dl is low-volume and safe — nothing like the mass/private-API harvest we refused. Pass
+ * the user's own handle (from ?handle= or a stored setting).
+ */
+export async function fetchUserReposts(handle: string, limit = 60): Promise<RawCandidate[]> {
+  const cookie = cookieFileFor("x");
+  const h = (handle || "").replace(/^@/, "").trim();
+  if (!cookie || !h || !/^[A-Za-z0-9_]{1,15}$/.test(h)) return [];
+  const gdl = findGalleryDl();
+  // Hit the `/timeline` extractor DIRECTLY — the bare `x.com/<user>` extractor only emits a queue
+  // marker under `-j` (never expands to tweets). `-o retweets=true` includes reposts (default omits).
+  const json = await new Promise<string>((resolve) => {
+    execFile(gdl, ["--cookies", cookie, "-o", "retweets=true", "-j", "--range", `1-${limit}`, `https://x.com/${h}/timeline`],
+      { timeout: 90_000, maxBuffer: 48 * 1024 * 1024 }, (_err, stdout) => resolve(stdout || "[]"));
+  });
+  const out = parseXEntries(json);
+  await enrichThumbnails(out);
+  logger.info({ platform: "x", handle: h, reposts: out.length }, "Fetched operator reposts (curated pool)");
+  return out;
+}
+
 function parseXEntries(json: string): RawCandidate[] {
   // Tweet IDs are 19-digit ints that exceed JS's safe-integer range; JSON.parse rounds them
   // and the resulting /status/<id> URL 404s. Quote those big ints so they survive as strings.
